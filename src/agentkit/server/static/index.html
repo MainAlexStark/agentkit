@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Агент</title>
+<link rel="stylesheet" href="/static/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%23007aff'/><circle cx='11' cy='14' r='2.5' fill='white'/><circle cx='21' cy='14' r='2.5' fill='white'/></svg>">
+</head>
+<body>
+<div id="login" class="login" hidden>
+  <form id="login-form" class="login-card">
+    <h1 id="login-title">Агент</h1>
+    <p class="muted">Введите токен доступа</p>
+    <input id="token-input" type="password" autocomplete="current-password" placeholder="Токен" required>
+    <button class="btn primary" type="submit">Войти</button>
+    <p id="login-error" class="error-text"></p>
+  </form>
+</div>
+
+<div id="app" class="app" hidden>
+  <aside id="sidebar" class="sidebar">
+    <div class="side-head">
+      <span id="app-name" class="app-name">Агент</span>
+      <button id="new-chat" class="icon-btn" title="Новый разговор" aria-label="Новый разговор">
+        <svg viewBox="0 0 24 24" width="20" height="20"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+    <nav id="sessions" class="sessions"></nav>
+    <div class="side-foot">
+      <button class="link-btn" data-panel="memory">Память</button>
+      <button class="link-btn" data-panel="tools">Инструменты</button>
+      <button class="link-btn" data-panel="schedules">Расписание</button>
+      <button class="link-btn" data-panel="usage">Расход</button>
+      <div class="me"><span id="me-name"></span><button id="logout" class="link-btn small">выйти</button></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="top">
+      <button id="menu" class="icon-btn only-mobile" aria-label="Меню">
+        <svg viewBox="0 0 24 24" width="20" height="20"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+      <h2 id="chat-title" class="chat-title">Новый разговор</h2>
+      <div class="controls">
+        <select id="model" title="Модель"></select>
+        <select id="mode" title="Права">
+        </select>
+        <span id="cost" class="cost" title="Расход разговора"></span>
+        <button id="toggle-tasks" class="icon-btn" title="Задачи" aria-label="Задачи">
+          <svg viewBox="0 0 24 24" width="20" height="20"><path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <section id="messages" class="messages" aria-live="polite">
+      <div class="empty" id="empty">
+        <h3>Чем помочь?</h3>
+        <p class="muted">Агент сам вызывает инструменты. Изменения — через карточку подтверждения.</p>
+      </div>
+    </section>
+
+    <form id="composer" class="composer">
+      <textarea id="input" rows="1" placeholder="Сообщение…" title="Enter — отправить, Shift+Enter — новая строка"></textarea>
+      <button id="send" class="send" type="submit" aria-label="Отправить">
+        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 19V5M5 12l7-7 7 7" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button id="stop" class="send stop" type="button" aria-label="Остановить" hidden>
+        <svg viewBox="0 0 24 24" width="14" height="14"><rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor"/></svg>
+      </button>
+    </form>
+  </main>
+
+  <aside id="tasks" class="tasks" hidden>
+    <h4>Задачи</h4>
+    <ol id="todo-list" class="todo-list"><li class="muted">Пока нет</li></ol>
+  </aside>
+</div>
+
+<div id="panel" class="panel" hidden>
+  <div class="panel-card">
+    <div class="panel-head"><h3 id="panel-title"></h3><button id="panel-close" class="icon-btn" aria-label="Закрыть">✕</button></div>
+    <div id="panel-body" class="panel-body"></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

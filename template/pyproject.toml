@@ -1,0 +1,19 @@
+[project]
+name = "agent-service"
+version = "0.1.0"
+description = "Агент на agentkit"
+requires-python = ">=3.11"
+# Зависимости — в requirements.txt (ядро agentkit: копия в vendor/ или git-тег).
+dependencies = []
+
+[tool.uv.sources]
+# Только внутри репозитория agentkit: шаблон смотрит на ядро рядом. `agentkit new` убирает этот блок.
+agentkit = { path = "..", editable = true }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"

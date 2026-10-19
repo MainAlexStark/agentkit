@@ -1,0 +1,61 @@
+# Развёртывание на VPS: агент, база и TLS одной командой.
+#
+#   ./deploy.sh agent.example.com
+#
+
+name: agent-service
+
+services:
+  agent-service:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-docker}
+    container_name: agent-service
+    restart: unless-stopped
+    env_file:
+      - ./deploy/agent-service.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      # Рабочие папки сессий, файлы агента, трейсы. База — отдельно, в postgres.
+      - data:/srv/data
+    # Наружу не выставлен: снаружи виден только общий Caddy по mcp-network.
+    expose:
+      - "8080"
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks:
+      - mcp-network
+      - internal
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: agent-service-postgres
+    restart: unless-stopped
+    # Отдельный env: базе незачем видеть ключи моделей и токены.
+    env_file:
+      - ./deploy/postgres.env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks:
+      - internal
+
+volumes:
+  data:
+  pgdata:
+
+networks:
+  mcp-network:
+    external: true
+  internal:

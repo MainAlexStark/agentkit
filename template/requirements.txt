@@ -1,0 +1,1 @@
+-e ..[service]  # внутри репозитория agentkit; `agentkit new` заменит на vendor/ или git-тег

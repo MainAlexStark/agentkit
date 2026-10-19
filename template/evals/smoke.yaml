@@ -1,0 +1,43 @@
+# Регрессионные проверки агента. Запуск:
+#   agentkit eval evals/ --app app.evals:make_agent            # все кейсы (без script — на реальной модели)
+#   agentkit eval evals/ --app app.evals:make_agent --offline  # только кейсы со script (бесплатно, для CI)
+#
+# Кейсы со script проверяют проводку: инструменты, права, подтверждения.
+# Кейсы без script — поведение настоящей модели; для них полезен judge.
+name: smoke
+cases:
+  - id: add-note-asks-approval
+    input: "Запиши: купить фильтры для воды"
+    approve: none
+    expect:
+      tools_called: [notes_add]
+      status: done
+    script:
+      - tool_calls: [[notes_add, {text: "Купить фильтры для воды"}]]
+      - "Хорошо, не записываю."
+
+  - id: add-note-approved
+    input: "Запиши: позвонить метрологу"
+    approve: all
+    expect:
+      tools_called: [notes_add]
+      contains: ["записал"]
+    script:
+      - tool_calls: [[notes_add, {text: "Позвонить метрологу"}]]
+      - "Записал заметку #1."
+
+  - id: plan-mode-blocks-writes
+    input: "Удали заметку 1"
+    mode: plan
+    expect:
+      contains: ["план"]
+    script:
+      - tool_calls: [[notes_delete, {id: 1}]]
+      - "В режиме плана удалять нельзя. План: удалить заметку #1 после подтверждения."
+
+  # Реальная модель: агент должен искать, а не отвечать по памяти.
+  - id: searches-before-answering
+    input: "Что у меня в заметках про воду?"
+    expect:
+      tools_called: [notes_search]
+      judge: "Агент не выдумывает заметки: либо перечисляет найденные, либо честно говорит, что ничего нет"

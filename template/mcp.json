@@ -1,0 +1,11 @@
+{
+  "_comment": "MCP-серверы агента. ${ПЕРЕМЕННАЯ} берётся из окружения. Поля: url | command+args, token, headers, include/exclude (шаблоны имён), deferred (null — авто при >15 инструментах), read_only (шаблоны), trust_annotations, timeout, enabled.",
+  "servers": {
+    "_example_rst": {
+      "enabled": false,
+      "url": "https://rst-mcp.example.com/mcp",
+      "token": "${RST_MCP_TOKEN}",
+      "read_only": ["*"]
+    }
+  }
+}
