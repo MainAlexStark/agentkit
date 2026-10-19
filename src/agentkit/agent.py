@@ -27,6 +27,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from agentkit.attachments import expand_parts, is_vision
 from agentkit.context import (
     PromptParts,
     build_system_prompt,
@@ -80,6 +81,7 @@ class AgentConfig:
     loop_guard: int = 3  # одинаковый вызов N раз подряд → предупреждение модели
     max_stop_continues: int = 3  # сколько раз stop-хук может не дать закончить
     persist_thinking: bool = False
+    vision_models: list[str] | None = None  # шаблоны моделей, которым отдавать картинки; None — по умолчанию
 
 
 @dataclass
@@ -181,7 +183,7 @@ class Agent:
                     await self.store.append_message(
                         session_id, Message.user(started.add_context, kind="hook_context", hidden=True), run_id)
             if input is not None:
-                text = input if isinstance(input, str) else json.dumps(input, ensure_ascii=False)
+                text = _plain_text(input)
                 hooked = fold(await self.hooks.run(HookEvent.USER_PROMPT_SUBMIT,
                                                    {"prompt": text, "session_id": session_id, "user": user}, self))
                 if hooked.decision == Decision.DENY:
@@ -191,8 +193,10 @@ class Agent:
                 if hooked.add_context:
                     await self.store.append_message(
                         session_id, Message.user(hooked.add_context, kind="hook_context", hidden=True), run_id)
-                if not session.title and isinstance(input, str):
-                    await self.store.update_session(session_id, title=input.strip().splitlines()[0][:80])
+                if not session.title:
+                    title = _plain_text(input).strip()
+                    if title:
+                        await self.store.update_session(session_id, title=title.splitlines()[0][:80])
             return await self._loop(session_id, user, run_id, emit, model=model, mode=mode)
 
         async for ev in self._drive(session_id, body, model=model, trigger=trigger):
@@ -211,8 +215,9 @@ class Agent:
         rec = await self.store.get_approval(approval_id)
         if rec is None:
             raise ValueError("нет такого подтверждения")
-        if rec.status != "pending":
-            raise ValueError(f"подтверждение уже {rec.status}")
+        # Атомарно: двойной клик или два процесса не выполнят действие дважды.
+        if rec.status != "pending" or not await self.store.claim_approval(approval_id):
+            raise ValueError(f"подтверждение уже {rec.status if rec.status != 'pending' else 'решается'}")
         session = await self.store.get_session(rec.session_id)
         assert session is not None
         state = session.state or {}
@@ -242,7 +247,8 @@ class Agent:
             await emit(Event(EventType.APPROVAL_RESOLVED, {"approval_id": approval_id, "approved": approve,
                                                            "tool_call_id": rec.tool_call_id}))
             await self._record_result(rec.session_id, run_id, emit, rec.tool_call_id, rec.tool_name, result)
-            still = await self.store.list_approvals(rec.session_id, status="pending")
+            still = [a for a in await self.store.list_approvals(rec.session_id)
+                     if a.status in ("pending", "resolving") and a.id != approval_id]
             if still:
                 return RunStatus.WAITING_APPROVAL
             return await self._loop(rec.session_id, user, run_id, emit, model=model, mode=mode)
@@ -382,13 +388,17 @@ class Agent:
         for step in range(spec.max_steps):
             if cancel.is_set():
                 return RunStatus.CANCELLED
+            # Сообщения, присланные во время работы, — между шагами: здесь все
+            # вызовы предыдущего шага уже закрыты результатами, и сообщение
+            # пользователя не разорвёт пару «вызов — результат».
+            await self._take_inbox(session_id, run_id, emit)
             state = await self.store.get_state(session_id)
             loaded = set(state.get(LOADED_KEY, []))
             history = effective_history(await self.store.list_messages(session_id))
             system = await self._system_prompt(user, loaded, mode)
             visible = self.tools.visible(loaded)
             schemas = [t.schema() for t in visible]
-            msgs = [Message.system(system), *_for_model(history)]
+            msgs = [Message.system(system), *self._prepare(history, session_id, model)]
 
             # Сжатие: не чаще раза за шаг и только если есть что сжимать.
             if (not compacted_once and estimate_tokens(msgs, schemas)
@@ -408,7 +418,7 @@ class Agent:
                     await emit(Event(EventType.COMPACTED, {"tokens_before": res.tokens_before,
                                                            "covers_upto": res.covers_upto}))
                     history = effective_history(await self.store.list_messages(session_id))
-                    msgs = [Message.system(system), *_for_model(history)]
+                    msgs = [Message.system(system), *self._prepare(history, session_id, model)]
 
             last_step = step == spec.max_steps - 1
             if last_step:
@@ -452,6 +462,8 @@ class Agent:
                     await self.store.append_message(
                         session_id, Message.user(hooked.continue_with, kind="hook_context", hidden=True), run_id)
                     continue
+                if await self.store.inbox_count(session_id):
+                    continue  # пока отвечали, человек дописал — отвечаем и на это
                 return RunStatus.DONE
 
             pending, stop = await self._execute(session_id, user, run_id, emit, msg.tool_calls, perms, seq, seen_calls)
@@ -460,6 +472,33 @@ class Agent:
             if stop == "waiting_input":
                 return RunStatus.WAITING_INPUT
         return RunStatus.MAX_STEPS
+
+    def _prepare(self, history: list[tuple[int, Message]], session_id: str, model: str) -> list[Message]:
+        msgs = _for_model(history)
+        if not any(isinstance(m.content, list) for m in msgs):
+            return msgs
+        ws = self.workspace_for(session_id)
+        vision = is_vision(self.router.resolve(model), self.config.vision_models)
+        return [replace(m, content=expand_parts(m.content, ws, vision=vision)) if isinstance(m.content, list) else m
+                for m in msgs]
+
+    async def _take_inbox(self, session_id: str, run_id: str, emit) -> int:
+        items = await self.store.inbox_pop(session_id)
+        taken = 0
+        for it in items:
+            # Те же хуки, что у обычного сообщения: иначе фильтр обходился бы отправкой «на ходу».
+            hooked = fold(await self.hooks.run(HookEvent.USER_PROMPT_SUBMIT, {
+                "prompt": _plain_text(it["content"]), "session_id": session_id, "user": it.get("user")}, self))
+            if hooked.decision == Decision.DENY:
+                await emit(Event(EventType.ERROR, {"message": hooked.reason or "сообщение отклонено"}))
+                continue
+            seq = await self.store.append_message(session_id, Message.user(it["content"], steered=True), run_id)
+            if hooked.add_context:
+                await self.store.append_message(
+                    session_id, Message.user(hooked.add_context, kind="hook_context", hidden=True), run_id)
+            await emit(Event(EventType.USER_MESSAGE, {"seq": seq, "content": it["content"]}))
+            taken += 1
+        return taken
 
     async def _execute(self, session_id, user, run_id, emit, calls: list[ToolCall], perms: Permissions,
                        seq: int, seen: dict[str, int]) -> tuple[int, str | None]:
@@ -700,3 +739,11 @@ def _jsonable(v: Any) -> Any:
         return v
     except (TypeError, ValueError):
         return json.loads(json.dumps(v, default=str))
+
+
+def _plain_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+    return json.dumps(content, ensure_ascii=False)

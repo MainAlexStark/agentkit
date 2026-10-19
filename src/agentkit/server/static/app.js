@@ -32,6 +32,9 @@ const S = {
   subs: new Map(),   // id дочерней сессии → контейнер в блоке task
   cards: new Map(),  // approval_id → карточка
   cost: 0,
+  attachments: [],   // загруженные файлы для следующего сообщения
+  uploading: 0,
+  queued: [],        // пузыри сообщений, отправленных во время работы агента
 };
 
 // ── API ─────────────────────────────────────────────────────────────
@@ -100,11 +103,48 @@ function scroll(force) {
 }
 function add(el) { $("#empty")?.remove(); box().append(el); scroll(); return el; }
 
-function userMsg(text, seq) {
+function splitContent(content) {
+  if (typeof content === "string") return { text: content, files: [] };
+  const parts = Array.isArray(content) ? content : [];
+  return { text: parts.filter(p => p.type === "text").map(p => p.text).join("\n"), files: parts.filter(p => p.type === "file") };
+}
+
+function userMsg(content, seq, { queued = false } = {}) {
+  const { text, files } = splitContent(content);
   const rewind = seq ? h("button", { class: "link-btn small", title: "Откатить разговор и файлы к моменту до этого сообщения",
     onclick: () => doRewind(seq, text) }, "↺ изменить") : null;
-  return add(h("div", { class: "msg user" }, h("div", { class: "bubble" }, text), h("div", { class: "tools-row" }, rewind)));
+  const badge = queued ? h("span", { class: "badge queued" }, "агент прочтёт после текущего шага") : null;
+  const el = add(h("div", { class: "msg user" + (queued ? " queued" : "") },
+    files.length ? h("div", { class: "files" }, files.map(fileView)) : null,
+    text ? h("div", { class: "bubble" }, text) : null,
+    h("div", { class: "tools-row" }, badge, rewind)));
+  el._badge = badge;
+  return el;
 }
+
+function fileView(f) {
+  if (f.kind === "image") {
+    const img = h("img", { class: "thumb", alt: f.name, title: f.name });
+    blobURL(f.path).then(u => { img.src = u; }).catch(() => {});
+    img.addEventListener("click", () => blobURL(f.path).then(u => window.open(u)));
+    return img;
+  }
+  return h("button", { class: "file-chip", title: "Скачать", onclick: () => blobURL(f.path).then(u => {
+    const a = h("a", { href: u, download: f.name }); document.body.append(a); a.click(); a.remove(); }) },
+    "📄 ", f.name, h("small", {}, " " + humanSize(f.size)));
+}
+
+const blobCache = new Map();
+async function blobURL(path) {
+  const key = S.sessionId + path;
+  if (blobCache.has(key)) return blobCache.get(key);
+  const r = await fetch(`/api/sessions/${S.sessionId}/files?path=${encodeURIComponent(path)}`, { headers: { Authorization: `Bearer ${S.token}` } });
+  if (!r.ok) throw new Error("файл недоступен");
+  const u = URL.createObjectURL(await r.blob());
+  blobCache.set(key, u);
+  return u;
+}
+function humanSize(n) { return !n ? "" : n < 1024 ? `${n} Б` : n < 1048576 ? `${(n / 1024).toFixed(0)} КБ` : `${(n / 1048576).toFixed(1)} МБ`; }
 
 function assistantBubble() {
   const b = h("div", { class: "bubble md streaming" });
@@ -209,6 +249,12 @@ function onEvent(ev) {
   const d = ev.data || {};
   switch (ev.type) {
     case "run_started": setRunning(true); break;
+    case "user_message": {
+      const el = S.queued.shift();
+      if (el) { el.classList.remove("queued"); el._badge?.remove(); }
+      else userMsg(d.content, d.seq);
+      break;
+    }
     case "text_delta":
       if (ev.agent) break;
       if (!S.bubble) { S.bubble = assistantBubble(); S.bubbleText = ""; }
@@ -284,8 +330,10 @@ async function follow() {
 }
 
 function setRunning(on) {
+  // Отправка доступна и во время работы: сообщение встанет в очередь, агент прочтёт его между шагами.
   S.running = on;
-  $("#send").hidden = on; $("#stop").hidden = !on;
+  $("#stop").hidden = !on;
+  $("#input").placeholder = on ? "Дописать агенту на ходу…" : "Сообщение…";
 }
 
 // ── действия ────────────────────────────────────────────────────────
@@ -298,17 +346,49 @@ async function ensureSession() {
 }
 
 async function send(text) {
+  const fromInput = text == null;
   text = (text ?? $("#input").value).trim();
-  if (!text || S.running) return;
-  $("#input").value = ""; autosize();
+  if (S.uploading) { note("Дождитесь окончания загрузки файлов"); return; }
+  const files = fromInput ? S.attachments.slice() : [];
+  if (!text && !files.length) return;
+  if (fromInput) { $("#input").value = ""; autosize(); S.attachments = []; renderAttachments(); }
   const sid = await ensureSession();
-  userMsg(text);
-  setRunning(true);
+  const wasRunning = S.running;
+  const content = files.length ? [...(text ? [{ type: "text", text }] : []), ...files] : text;
+  const el = userMsg(content, null, { queued: wasRunning });
+  if (wasRunning) S.queued.push(el);
   try {
-    await api(`/api/sessions/${sid}/messages`, { method: "POST", body: { text, model: $("#model").value, mode: $("#mode").value } });
-    follow();
-  } catch (e) { setRunning(false); note(e.message, true); }
+    const r = await api(`/api/sessions/${sid}/messages`, { method: "POST", body: { text, files, model: $("#model").value, mode: $("#mode").value } });
+    if (!r.queued) { setRunning(true); follow(); }
+    else if (!wasRunning) { S.queued.push(el); el.classList.add("queued"); setRunning(true); follow(); }
+  } catch (e) { note(e.message, true); }
   loadSessions();
+}
+
+// ── вложения ────────────────────────────────────────────────────────
+async function attach(fileList) {
+  const list = [...fileList];
+  if (!list.length) return;
+  const sid = await ensureSession();
+  S.uploading++; renderAttachments();
+  try {
+    for (const f of list) {
+      const fd = new FormData(); fd.append("file", f, f.name || "image.png");
+      const r = await fetch(`/api/sessions/${sid}/files`, { method: "POST", headers: { Authorization: `Bearer ${S.token}` }, body: fd });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { note(`${f.name}: ${d.detail || r.statusText}`, true); continue; }
+      S.attachments.push(d);
+    }
+  } finally { S.uploading--; renderAttachments(); }
+}
+
+function renderAttachments() {
+  const box = $("#attachments");
+  box.replaceChildren(...S.attachments.map((a, i) => h("span", { class: "chip" }, a.kind === "image" ? "🖼 " : "📄 ", a.name,
+    a.note ? h("small", { class: "muted" }, " — " + a.note) : null,
+    h("button", { class: "chip-x", "aria-label": "Убрать", onclick: () => { S.attachments.splice(i, 1); renderAttachments(); } }, "×"))),
+    S.uploading ? h("span", { class: "chip muted" }, "загрузка…") : null);
+  box.hidden = !S.attachments.length && !S.uploading;
 }
 
 async function decide(id, approve, comment, card) {
@@ -343,6 +423,7 @@ function resetView() {
   box().replaceChildren(h("div", { class: "empty", id: "empty" }, h("h3", {}, "Чем помочь?"),
     h("p", { class: "muted" }, "Агент сам вызывает инструменты. Изменения — через карточку подтверждения.")));
   renderTodos([]); $("#tasks").hidden = true; setRunning(false);
+  S.queued = []; S.attachments = []; renderAttachments();
 }
 
 async function openSession(id) {
@@ -356,7 +437,7 @@ async function openSession(id) {
   if (s.state?.mode) $("#mode").value = s.state.mode;
   for (const m of s.messages) {
     if (m.meta?.hidden) continue;
-    if (m.role === "user") userMsg(typeof m.content === "string" ? m.content : "[вложение]", m.seq);
+    if (m.role === "user") userMsg(m.content, m.seq);
     else if (m.role === "assistant") {
       if (m.content) { const b = assistantBubble(); b.classList.remove("streaming"); b.innerHTML = md(m.content); }
       for (const tc of m.tool_calls || []) toolBlock(tc.id, tc.function.name, safeJSON(tc.function.arguments));
@@ -389,8 +470,17 @@ const panels = {
   },
   async tools(body) {
     const d = await api("/api/tools");
-    for (const s of d.mcp) body.append(h("div", { class: "row" }, h("div", { class: "grow" }, h("strong", {}, "MCP · " + s.name), s.error ? h("div", { class: "muted" }, s.error) : null),
-      h("span", { class: "badge " + (s.ok ? "ok" : "err") }, s.ok ? `${s.tools} инстр.` : "нет связи")));
+    for (const s of d.mcp) {
+      let action = null;
+      if (S.config.is_admin && s.needs_auth) action = h("button", { class: "btn primary small", onclick: () => mcpConnect(s.name) }, "Подключить");
+      else if (S.config.is_admin && s.oauth) action = h("button", { class: "link-btn small", onclick: async () => {
+        if (!confirm(`Отключить ${s.name}? Токены будут отозваны.`)) return;
+        await api(`/api/mcp/${encodeURIComponent(s.name)}/connect`, { method: "DELETE" }); openPanel("tools"); } }, "отключить");
+      body.append(h("div", { class: "row" }, h("div", { class: "grow" }, h("strong", {}, "MCP · " + s.name),
+        s.oauth ? h("span", { class: "badge ok" }, " OAuth") : null, s.error && !s.ok ? h("div", { class: "muted" }, s.error) : null),
+        h("span", { class: "badge " + (s.ok ? "ok" : s.needs_auth ? "warn" : "err") }, s.ok ? `${s.tools} инстр.` : s.needs_auth ? "нужен вход" : "нет связи"),
+        action));
+    }
     for (const k of d.skills) body.append(h("div", { class: "row" }, h("div", { class: "grow" }, h("strong", {}, "skill · " + k.name), h("div", { class: "muted" }, k.description))));
     for (const t of d.tools) body.append(h("div", { class: "row" }, h("div", { class: "grow" }, h("code", {}, prettyName(t.name)), h("div", { class: "muted" }, t.description)),
       h("span", { class: "badge " + (t.read_only ? "ok" : t.destructive ? "err" : "warn") }, t.read_only ? "чтение" : t.destructive ? "опасно" : "запись"),
@@ -463,4 +553,30 @@ $("#panel-close").addEventListener("click", () => ($("#panel").hidden = true));
 $("#panel").addEventListener("click", e => { if (e.target.id === "panel") $("#panel").hidden = true; });
 document.querySelectorAll("[data-panel]").forEach(b => b.addEventListener("click", () => openPanel(b.dataset.panel)));
 for (const id of ["model", "mode"]) $("#" + id).addEventListener("change", () => S.sessionId && api(`/api/sessions/${S.sessionId}`, { method: "PATCH", body: { [id]: $("#" + id).value } }));
+async function mcpConnect(name) {
+  // Окно открываем сразу по клику — иначе браузер сочтёт его всплывающим и заблокирует.
+  const w = window.open("about:blank", "oauth", "width=520,height=720");
+  try {
+    const r = await api(`/api/mcp/${encodeURIComponent(name)}/connect`, { method: "POST" });
+    if (w) w.location = r.url; else location.href = r.url;
+  } catch (e) { w?.close(); alert(e.message); }
+}
+window.addEventListener("message", e => {
+  if (e.data?.type !== "agentkit-oauth") return;
+  if (!$("#panel").hidden) openPanel("tools");
+  note(e.data.ok ? `Подключено: ${e.data.text}` : `Не удалось подключить: ${e.data.text}`, !e.data.ok);
+});
+
+$("#attach").addEventListener("click", () => $("#file").click());
+$("#file").addEventListener("change", e => { attach(e.target.files); e.target.value = ""; });
+$("#input").addEventListener("paste", e => {
+  const files = [...(e.clipboardData?.files || [])];
+  if (files.length) { e.preventDefault(); attach(files); }
+});
+for (const ev of ["dragover", "dragenter"]) document.addEventListener(ev, e => { if (e.dataTransfer?.types?.includes("Files")) { e.preventDefault(); document.body.classList.add("dragging"); } });
+document.addEventListener("dragleave", e => { if (!e.relatedTarget) document.body.classList.remove("dragging"); });
+document.addEventListener("drop", e => {
+  if (!e.dataTransfer?.files?.length) return;
+  e.preventDefault(); document.body.classList.remove("dragging"); attach(e.dataTransfer.files);
+});
 boot();

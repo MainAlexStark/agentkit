@@ -16,17 +16,22 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from agentkit.agent import Agent, AgentConfig, AgentSpec
+from agentkit.agent import Agent, AgentConfig, AgentSpec, RunOutcome
 from agentkit.builder import make_router, standard_tools
+from agentkit.bus import Bus, make_bus
+from agentkit.events import EventType, RunStatus
 from agentkit.hooks import Hooks
 from agentkit.llm.router import ModelRouter
 from agentkit.mcp import MCPManager, MCPServerConfig
+from agentkit.messages import Usage
+from agentkit.oauth import OAuthBroker
 from agentkit.permissions import Mode, Permissions
-from agentkit.runs import RunManager
+from agentkit.runs import Busy, RunManager
 from agentkit.scheduler import Scheduler
 from agentkit.server.auth import Auth
 from agentkit.server.settings import Settings, split_rules
 from agentkit.skills import SkillLibrary
+from agentkit.store.base import ScheduleRec
 from agentkit.store.sql import SQLStore
 from agentkit.subagents import DEFAULT_SUBAGENTS, task_tool
 from agentkit.tools.base import Tool, User
@@ -73,6 +78,8 @@ class AgentService:
         self.domain = domain
         self.auth = Auth(settings.tokens, settings.service_token)
         self.store: SQLStore | None = None
+        self.bus: Bus | None = None
+        self.oauth: OAuthBroker | None = None
         self.mcp: MCPManager | None = None
         self.agent: Agent | None = None
         self.runs: RunManager | None = None
@@ -81,24 +88,49 @@ class AgentService:
 
     async def start(self) -> None:
         s = self.settings
+        if s.workers > 1 and not s.redis_url:
+            # Без общей шины каждый процесс думал бы, что он один: два прогона в одной
+            # сессии, отмена «мимо», SSE без живых событий. Лучше не стартовать.
+            raise RuntimeError("AGENT_WORKERS > 1 требует AGENT_REDIS_URL")
         s.data_dir.mkdir(parents=True, exist_ok=True)
         self.store = await SQLStore(s.database_url).init()
-        if n := await self.store.fail_stale_runs():
-            log.warning("помечено прерванными прогонов: %d (сервис перезапускался во время работы)", n)
-        self.runs = RunManager(self.store)
+        self.bus = make_bus(s.redis_url)
+        await self.bus.start()
+        self.bus.on_broadcast(self._on_broadcast)
+        self.oauth = OAuthBroker(self.store, s.public_url.rstrip("/") + "/oauth/callback", bus=self.bus,
+                                 client_name=s.name)
+        self.runs = RunManager(self.store, self.bus)
+        self.runs.on_idle = self._drain_inbox
+        await self._fail_orphans()
         await self._build_agent()
         if s.scheduler:
-            self.scheduler = Scheduler(self.store, lambda name: self.agent, self.user_for, tz=s.tz)
+            self.scheduler = Scheduler(self.store, lambda name: self.agent, self.user_for, tz=s.tz,
+                                       runner=self._scheduled_run)
             self.scheduler.start()
         if self.domain.on_start:
             res = self.domain.on_start(self)
             if hasattr(res, "__await__"):
                 await res
 
+    async def _fail_orphans(self) -> None:
+        """«running» без живой блокировки — прогон умер вместе с процессом.
+
+        Смотрим именно на блокировку, а не просто на статус: при нескольких
+        процессах перезапуск одного не должен ронять прогоны соседей.
+        """
+        orphans = [r.id for r in await self.store.list_running_runs()
+                   if await self.bus.active(r.session_id) != r.id]
+        if n := await self.store.fail_runs(orphans, "прогон прерван перезапуском сервиса"):
+            log.warning("помечено прерванными прогонов: %d", n)
+
+    async def _on_broadcast(self, msg: dict[str, Any]) -> None:
+        if msg.get("cmd") == "reload":
+            await self._build_agent()
+
     async def _build_agent(self) -> None:
         if self.mcp:
             await self.mcp.close()
-        self.mcp = MCPManager(load_mcp_config(self.settings.mcp_config))
+        self.mcp = MCPManager(load_mcp_config(self.settings.mcp_config), oauth=self.oauth)
         mcp_tools = await self.mcp.connect()
         self.agent = assemble_agent(self.settings, self.domain, self.store, router=self._router,
                                     mcp_tools=mcp_tools, mcp_instructions=self.mcp.instructions)
@@ -107,8 +139,59 @@ class AgentService:
                  ", ".join(f"{k}={'ok' if v.ok else 'ошибка'}" for k, v in self.mcp.status.items()) or "нет")
 
     async def reload(self) -> None:
-        """Перечитать mcp.json и skills без перезапуска процесса."""
-        await self._build_agent()
+        """Перечитать mcp.json и skills без перезапуска — во всех процессах сервиса."""
+        await self.bus.broadcast({"cmd": "reload"})
+
+    # ── сообщения ────────────────────────────────────────────────────
+    async def send(self, session_id: str, user: User, content: Any, *, model: str | None = None,
+                   mode: str | None = None) -> dict[str, Any]:
+        """Новое сообщение: запустить прогон или, если агент занят, поставить в очередь входящих.
+
+        Сообщение из очереди агент подхватит между шагами текущего прогона, а
+        если тот уже заканчивается — сразу после него (on_idle).
+        """
+        try:
+            run_id = await self.runs.start(
+                session_id, lambda: self.agent.run(session_id, user, content, model=model, mode=mode),
+                cancel=self.agent.cancel)
+            return {"run_id": run_id, "queued": False}
+        except Busy:
+            pass
+        await self.store.inbox_push(session_id, content, _user_dict(user))
+        # Прогон мог закончиться между попыткой запуска и записью в очередь — тогда
+        # on_idle уже отработал и сообщение никто не заберёт. Проверяем ещё раз.
+        if not await self.runs.active_run(session_id):
+            await self._drain_inbox(session_id)
+        return {"run_id": await self.runs.active_run(session_id), "queued": True}
+
+    async def _drain_inbox(self, session_id: str) -> None:
+        items = await self.store.inbox_pop(session_id)
+        if not items:
+            return
+        # Возвращаем в очередь в том же порядке: прогон без input заберёт её сам
+        # на первом шаге — с хуками и событием user_message, как и на ходу.
+        for it in items:
+            await self.store.inbox_push(session_id, it["content"], it["user"])
+        user = _user_from(items[-1]["user"])
+        try:
+            await self.runs.start(session_id, lambda: self.agent.run(session_id, user, None),
+                                  cancel=self.agent.cancel)
+        except Busy:
+            pass  # кто-то успел запустить прогон — он и заберёт очередь
+
+    async def _scheduled_run(self, rec: ScheduleRec, session_id: str, user: User) -> RunOutcome:
+        """Запуск по расписанию — через RunManager: виден в чате, его можно остановить."""
+        result = await self.send(session_id, user, rec.prompt)
+        await self.runs.wait(session_id, timeout=3600)
+        run = await self.store.get_run(result["run_id"]) if result.get("run_id") else None
+        text = ""
+        if run:
+            for e in reversed(await self.store.list_events(run_id=run.id)):
+                if e.type == EventType.MESSAGE and not e.agent and e.data.get("content"):
+                    text = e.data["content"]
+                    break
+        return RunOutcome(run_id=run.id if run else "", status=RunStatus(run.status) if run else RunStatus.ERROR,
+                          text=text, usage=Usage(**(run.usage or {})) if run else Usage(), events=[])
 
     def user_for(self, user_id: str) -> User:
         for u in self.auth.users.values():
@@ -123,8 +206,18 @@ class AgentService:
             await self.runs.shutdown()
         if self.mcp:
             await self.mcp.close()
+        if self.bus:
+            await self.bus.close()
         if self.store:
             await self.store.close()
+
+
+def _user_dict(u: User) -> dict[str, Any]:
+    return {"id": u.id, "name": u.name, "roles": list(u.roles), "extra": u.extra}
+
+
+def _user_from(d: dict[str, Any]) -> User:
+    return User(id=d["id"], name=d.get("name", ""), roles=d.get("roles") or [], extra=d.get("extra") or {})
 
 
 def assemble_agent(
@@ -175,7 +268,8 @@ def assemble_agent(
         hooks=domain.hooks,
         skills=SkillLibrary.from_dirs(s.skills_dir),
         mcp_instructions=mcp_instructions,
-        config=AgentConfig(context_window=s.context_window, tz=s.tz, max_output_chars=s.max_output_chars),
+        config=AgentConfig(context_window=s.context_window, tz=s.tz, max_output_chars=s.max_output_chars,
+                           vision_models=[x.strip() for x in s.vision_models.split(",") if x.strip()] or None),
         deps=domain.deps,
         workspace=workspace if s.enable_files or s.enable_shell else None,
         rules=domain.rules,

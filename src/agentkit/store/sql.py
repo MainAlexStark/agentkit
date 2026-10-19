@@ -133,6 +133,25 @@ schedules = Table(
     Column("next_run_at", Float, nullable=True),
 )
 
+# Сообщения, присланные, пока агент работал: агент подхватывает их между шагами.
+inbox = Table(
+    "ak_inbox", md,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("session_id", String(40), ForeignKey("ak_sessions.id", ondelete="CASCADE"), index=True),
+    Column("content", JSON, nullable=False),
+    Column("user", JSON, nullable=False),
+    Column("created_at", Float, nullable=False),
+)
+
+# Ключ-значение для служебного состояния (OAuth-клиенты и токены MCP-серверов и т. п.).
+kv = Table(
+    "ak_kv", md,
+    Column("ns", String(60), primary_key=True),
+    Column("key", String(200), primary_key=True),
+    Column("value", JSON, nullable=False),
+    Column("updated_at", Float, nullable=False),
+)
+
 
 def _url(url: str) -> str:
     # Привычные DSN «postgres://…» из docker-окружения → асинхронный драйвер.
@@ -197,7 +216,7 @@ class SQLStore(Store):
         async with self.engine.begin() as c:
             if self.engine.dialect.name == "sqlite":
                 await c.exec_driver_sql("PRAGMA foreign_keys=ON")
-            for t in (messages, runs, approvals):
+            for t in (messages, runs, approvals, inbox):
                 await c.execute(delete(t).where(t.c.session_id == session_id))
             await c.execute(delete(events).where(events.c.session_id == session_id))
             await c.execute(delete(blobs).where(blobs.c.session_id == session_id))
@@ -257,6 +276,18 @@ class SQLStore(Store):
                                 .values(status="error", error=reason, finished_at=time.time()))
             return r.rowcount or 0
 
+    async def list_running_runs(self):
+        async with self.engine.connect() as c:
+            return [RunRec(**r) for r in (await c.execute(select(runs).where(runs.c.status == "running"))).mappings()]
+
+    async def fail_runs(self, run_ids, reason: str) -> int:
+        if not run_ids:
+            return 0
+        async with self.engine.begin() as c:
+            r = await c.execute(update(runs).where(runs.c.id.in_(run_ids), runs.c.status == "running")
+                                .values(status="error", error=reason, finished_at=time.time()))
+            return r.rowcount or 0
+
     async def list_runs(self, session_id, *, limit=50):
         q = select(runs).where(runs.c.session_id == session_id).order_by(runs.c.started_at.desc()).limit(limit)
         async with self.engine.connect() as c:
@@ -306,6 +337,13 @@ class SQLStore(Store):
         async with self.engine.connect() as c:
             return [ApprovalRec(**r) for r in (await c.execute(q.order_by(approvals.c.created_at))).mappings()]
 
+    async def claim_approval(self, approval_id):
+        """pending → resolving одним UPDATE: двойной клик или два процесса не выполнят действие дважды."""
+        async with self.engine.begin() as c:
+            r = await c.execute(update(approvals).where(approvals.c.id == approval_id, approvals.c.status == "pending")
+                                .values(status="resolving"))
+            return bool(r.rowcount)
+
     async def update_approval(self, approval_id, **fields):
         async with self.engine.begin() as c:
             await c.execute(update(approvals).where(approvals.c.id == approval_id).values(**fields))
@@ -349,6 +387,55 @@ class SQLStore(Store):
             return [(r.id, r.meta or {}) for r in await c.execute(q.order_by(blobs.c.created_at))]
 
     # ── расписание ───────────────────────────────────────────────────
+    async def claim_schedule(self, schedule_id, expected_next, new_next, now):
+        """Запуск достаётся одному процессу: сдвигаем next_run_at, только если он не сдвинут другим."""
+        async with self.engine.begin() as c:
+            r = await c.execute(update(schedules)
+                                .where(schedules.c.id == schedule_id, schedules.c.next_run_at == expected_next)
+                                .values(next_run_at=new_next, last_run_at=now))
+            return bool(r.rowcount)
+
+    # ── входящие во время прогона ────────────────────────────────────
+    async def inbox_push(self, session_id, content, user):
+        async with self.engine.begin() as c:
+            r = await c.execute(insert(inbox).values(session_id=session_id, content=content, user=user,
+                                                     created_at=time.time()))
+            return int(r.inserted_primary_key[0])
+
+    async def inbox_pop(self, session_id):
+        async with self.engine.begin() as c:
+            rows = (await c.execute(select(inbox).where(inbox.c.session_id == session_id)
+                                    .order_by(inbox.c.id))).mappings().all()
+            if not rows:
+                return []
+            # Удаляем ровно прочитанные id: сообщение, пришедшее между SELECT и DELETE, не теряется.
+            await c.execute(delete(inbox).where(inbox.c.id.in_([r["id"] for r in rows])))
+            return [{"content": r["content"], "user": r["user"], "created_at": r["created_at"]} for r in rows]
+
+    async def inbox_count(self, session_id):
+        async with self.engine.connect() as c:
+            return int((await c.execute(select(func.count()).select_from(inbox)
+                                        .where(inbox.c.session_id == session_id))).scalar_one())
+
+    # ── ключ-значение ────────────────────────────────────────────────
+    async def kv_get(self, ns, key):
+        async with self.engine.connect() as c:
+            r = (await c.execute(select(kv.c.value).where(kv.c.ns == ns, kv.c.key == key))).first()
+        return r.value if r else None
+
+    async def kv_set(self, ns, key, value):
+        async with self.engine.begin() as c:
+            exists = (await c.execute(select(kv.c.key).where(kv.c.ns == ns, kv.c.key == key))).first()
+            if exists:
+                await c.execute(update(kv).where(kv.c.ns == ns, kv.c.key == key)
+                                .values(value=value, updated_at=time.time()))
+            else:
+                await c.execute(insert(kv).values(ns=ns, key=key, value=value, updated_at=time.time()))
+
+    async def kv_delete(self, ns, key):
+        async with self.engine.begin() as c:
+            await c.execute(delete(kv).where(kv.c.ns == ns, kv.c.key == key))
+
     async def schedule_upsert(self, rec):
         async with self.engine.begin() as c:
             exists = (await c.execute(select(schedules.c.id).where(schedules.c.id == rec.id))).first()

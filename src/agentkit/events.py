@@ -15,6 +15,7 @@ from typing import Any
 
 class EventType(StrEnum):
     RUN_STARTED = "run_started"
+    USER_MESSAGE = "user_message"  # сообщение, присланное во время работы, принято агентом
     TEXT_DELTA = "text_delta"  # кусок текста ответа (стриминг)
     THINKING_DELTA = "thinking_delta"  # кусок рассуждений, если модель их отдаёт
     MESSAGE = "message"  # готовое сообщение assistant (после стрима)

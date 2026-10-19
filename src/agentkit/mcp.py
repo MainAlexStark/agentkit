@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,11 +29,18 @@ from agentkit.tools.registry import match_any
 log = logging.getLogger("agentkit.mcp")
 
 PROTOCOL_VERSION = "2025-06-18"
-CLIENT_INFO = {"name": "agentkit", "version": "0.1.0"}
+CLIENT_INFO = {"name": "agentkit", "version": "0.2.0"}
 
 
 class MCPError(Exception):
     pass
+
+
+class MCPAuthRequired(MCPError):
+    """Сервер ответил 401: нужен токен или вход по OAuth."""
+
+
+TokenProvider = Callable[[], Awaitable[str | None]]
 
 
 @dataclass
@@ -55,24 +63,47 @@ class MCPServerConfig:
     trust_annotations: bool = True
     timeout: float = 120.0
     enabled: bool = True
+    # OAuth 2.1: true или {"scope": …, "client_id": …, "client_secret": …, "auth_params": {…}}.
+    # Без этого поля OAuth всё равно предложится, если сервер ответил 401.
+    oauth: Any = None
 
 
 class _HTTPTransport:
-    def __init__(self, cfg: MCPServerConfig, client: httpx.AsyncClient | None = None):
+    def __init__(self, cfg: MCPServerConfig, client: httpx.AsyncClient | None = None,
+                 token_provider: TokenProvider | None = None, on_unauthorized: TokenProvider | None = None):
         self.cfg = cfg
+        self.token_provider = token_provider
+        self.on_unauthorized = on_unauthorized
         self._own = client is None
         self.client = client or httpx.AsyncClient(timeout=httpx.Timeout(cfg.timeout, connect=10.0))
         self.session_id: str | None = None
         self.protocol: str | None = None
 
     async def request(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        try:
+            return await self._request(payload, await self._token())
+        except MCPAuthRequired:
+            # Токен могли отозвать раньше срока: обновляем один раз и повторяем.
+            if self.on_unauthorized is None:
+                raise
+            token = await self.on_unauthorized()
+            if not token:
+                raise
+            return await self._request(payload, token)
+
+    async def _token(self) -> str | None:
+        if self.token_provider is not None:
+            return await self.token_provider()
+        return self.cfg.token
+
+    async def _request(self, payload: dict[str, Any], token: str | None) -> dict[str, Any] | None:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
             **self.cfg.headers,
         }
-        if self.cfg.token:
-            headers["Authorization"] = f"Bearer {self.cfg.token}"
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
         if self.protocol:
@@ -81,7 +112,7 @@ class _HTTPTransport:
             if sid := r.headers.get("mcp-session-id"):
                 self.session_id = sid
             if r.status_code == 401:
-                raise MCPError(f"{self.cfg.name}: 401 — нужен токен (Authorization) или OAuth")
+                raise MCPAuthRequired(f"{self.cfg.name}: 401 — нужен вход (OAuth) или токен")
             if r.status_code >= 400:
                 body = (await r.aread()).decode("utf-8", "replace")[:500]
                 raise MCPError(f"{self.cfg.name}: HTTP {r.status_code}: {body}")
@@ -160,10 +191,12 @@ class _StdioTransport:
 
 
 class MCPClient:
-    def __init__(self, cfg: MCPServerConfig, http_client: httpx.AsyncClient | None = None):
+    def __init__(self, cfg: MCPServerConfig, http_client: httpx.AsyncClient | None = None,
+                 token_provider: TokenProvider | None = None, on_unauthorized: TokenProvider | None = None):
         self.cfg = cfg
         if cfg.url:
-            self.t: _HTTPTransport | _StdioTransport = _HTTPTransport(cfg, http_client)
+            self.t: _HTTPTransport | _StdioTransport = _HTTPTransport(cfg, http_client, token_provider,
+                                                                      on_unauthorized)
         elif cfg.command:
             self.t = _StdioTransport(cfg)
         else:
@@ -264,6 +297,8 @@ class ServerStatus:
     error: str = ""
     server_info: dict[str, Any] = field(default_factory=dict)
     instructions: str = ""
+    needs_auth: bool = False  # можно подключить по OAuth (кнопка «Подключить»)
+    oauth: bool = False  # подключён по OAuth
 
 
 class MCPManager:
@@ -271,9 +306,11 @@ class MCPManager:
 
     AUTO_DEFER_THRESHOLD = 15  # больше инструментов на сервере — отложенные
 
-    def __init__(self, configs: list[MCPServerConfig], http_client: httpx.AsyncClient | None = None):
+    def __init__(self, configs: list[MCPServerConfig], http_client: httpx.AsyncClient | None = None,
+                 oauth: Any = None):
         self.configs = [c for c in configs if c.enabled]
         self.http_client = http_client
+        self.oauth = oauth  # OAuthBroker: токены серверов, подключённых через вход
         self.clients: dict[str, MCPClient] = {}
         self.status: dict[str, ServerStatus] = {}
 
@@ -282,9 +319,29 @@ class MCPManager:
         return [t for tools in results for t in tools]
 
     async def _connect_one(self, cfg: MCPServerConfig) -> list[Tool]:
+        provider = refresh = None
+        use_oauth = False
+        if self.oauth is not None and cfg.url and not cfg.token:
+            use_oauth = bool(await self.oauth.token(cfg.name)) or bool(cfg.oauth)
+            if use_oauth:
+                async def provider(name=cfg.name):
+                    return await self.oauth.token(name)
+
+                async def refresh(name=cfg.name):
+                    return await self.oauth.force_refresh(name)
+
+                if not await provider():
+                    self.status[cfg.name] = ServerStatus(cfg.name, ok=False, needs_auth=True,
+                                                         error="нужно подключить: войдите через OAuth")
+                    return []
         try:
-            client = MCPClient(cfg, self.http_client)
+            client = MCPClient(cfg, self.http_client, provider, refresh)
             raw = await asyncio.wait_for(client.list_tools(), cfg.timeout)
+        except MCPAuthRequired as e:
+            log.warning("MCP %s: %s", cfg.name, e)
+            self.status[cfg.name] = ServerStatus(cfg.name, ok=False, error=str(e),
+                                                 needs_auth=self.oauth is not None and bool(cfg.url))
+            return []
         except Exception as e:  # noqa: BLE001 — один упавший сервер не должен ронять агента
             log.warning("MCP %s: %s", cfg.name, e)
             self.status[cfg.name] = ServerStatus(cfg.name, ok=False, error=str(e))
@@ -295,7 +352,7 @@ class MCPManager:
         deferred = cfg.deferred if cfg.deferred is not None else len(raw) > self.AUTO_DEFER_THRESHOLD
         tools = [self._wrap(cfg, client, t, deferred) for t in raw]
         self.status[cfg.name] = ServerStatus(cfg.name, ok=True, tools=len(tools), server_info=client.server_info,
-                                             instructions=client.instructions)
+                                             instructions=client.instructions, oauth=use_oauth)
         return tools
 
     def _wrap(self, cfg: MCPServerConfig, client: MCPClient, spec: dict[str, Any], deferred: bool) -> Tool:
@@ -327,6 +384,9 @@ class MCPManager:
             group=f"mcp:{cfg.name}",
             source="mcp",
         )
+
+    def config(self, name: str) -> MCPServerConfig | None:
+        return next((c for c in self.configs if c.name == name), None)
 
     def instructions(self) -> str:
         parts = [f"### {s.name}\n{s.instructions.strip()}" for s in self.status.values() if s.ok and s.instructions]

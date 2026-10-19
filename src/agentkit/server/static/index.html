@@ -60,7 +60,12 @@
       </div>
     </section>
 
+    <div id="attachments" class="attachments" hidden></div>
     <form id="composer" class="composer">
+      <input id="file" type="file" multiple hidden>
+      <button id="attach" class="icon-btn attach" type="button" title="Прикрепить файл или картинку (можно перетащить или вставить)" aria-label="Прикрепить">
+        <svg viewBox="0 0 24 24" width="20" height="20"><path d="M21 11.5l-8.6 8.6a5 5 0 01-7.1-7.1l8.6-8.6a3.3 3.3 0 014.7 4.7l-8.6 8.6a1.7 1.7 0 01-2.4-2.4l7.9-7.9" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
       <textarea id="input" rows="1" placeholder="Сообщение…" title="Enter — отправить, Shift+Enter — новая строка"></textarea>
       <button id="send" class="send" type="submit" aria-label="Отправить">
         <svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 19V5M5 12l7-7 7 7" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>

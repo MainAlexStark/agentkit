@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -36,6 +37,8 @@ class FakeLLM:
             raise LLMError("FakeLLM: сценарий закончился")
         if callable(item):
             item = item(req)
+            if inspect.isawaitable(item):
+                item = await item  # асинхронный сценарий: можно «думать» долго, не блокируя цикл
         if isinstance(item, Exception):
             raise item
         if isinstance(item, str):

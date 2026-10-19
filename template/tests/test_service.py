@@ -107,3 +107,55 @@ def test_busy_session_conflict(client):
     r = client.post(f"/api/sessions/{sid}/messages", json={"text": "b"}, headers=H)
     assert r.status_code in (200, 409)  # 409, если первый ещё идёт
     wait_idle(client, sid)
+
+
+def test_message_while_running_is_queued_and_answered(client):
+    import asyncio
+
+    async def slow(req):
+        await asyncio.sleep(0.5)  # первый шаг «думает» — второе сообщение приходит во время работы
+        return "Ответ на первое"
+
+    client.fake.push(slow, "Ответ на второе")
+    sid = client.post("/api/sessions", json={}, headers=H).json()["id"]
+    r1 = client.post(f"/api/sessions/{sid}/messages", json={"text": "первое"}, headers=H).json()
+    r2 = client.post(f"/api/sessions/{sid}/messages", json={"text": "второе"}, headers=H).json()
+    assert r1["queued"] is False and r2["queued"] is True
+    for _ in range(500):
+        s = client.get(f"/api/sessions/{sid}", headers=H).json()
+        if not s["running_run"] and not s["queued"] and s["messages"] and s["messages"][-1]["role"] == "assistant" \
+                and sum(m["role"] == "user" for m in s["messages"]) == 2:
+            break
+        time.sleep(0.02)
+    texts = [(m["role"], m["content"]) for m in s["messages"]]
+    # Второе сообщение агент прочёл либо после первого ответа (отдельный шаг), либо — если оно
+    # успело до первого запроса к модели — вместе с первым. Главное: прочитано и отвечено.
+    users = [c for r, c in texts if r == "user"]
+    assert users == ["первое", "второе"] and texts[-1][0] == "assistant"
+    assert texts.index(("user", "второе")) < len(texts) - 1
+
+
+def test_upload_and_send_file(client):
+    sid = client.post("/api/sessions", json={}, headers=H).json()["id"]
+    r = client.post(f"/api/sessions/{sid}/files", files={"file": ("счёт.txt", "Итого: 1500 ₽".encode(), "text/plain")},
+                    headers=H)
+    assert r.status_code == 200
+    info = r.json()
+    assert info["path"].startswith("uploads/") and info["kind"] == "text"
+    client.fake.push("Сумма 1500 ₽")
+    client.post(f"/api/sessions/{sid}/messages", json={"text": "сколько?", "files": [info]}, headers=H)
+    wait_idle(client, sid)
+    sent = client.fake.requests[-1].messages[1].content
+    assert any("1500" in p.get("text", "") for p in sent)
+    got = client.get(f"/api/sessions/{sid}/files", params={"path": info["path"]}, headers=H)
+    assert got.status_code == 200 and "1500" in got.text
+    # чужой путь не пролезет ни в сообщение, ни в скачивание
+    bad = {**info, "path": "../../a.db"}
+    assert client.post(f"/api/sessions/{sid}/messages", json={"text": "x", "files": [bad]}, headers=H).status_code == 400
+    assert client.get(f"/api/sessions/{sid}/files", params={"path": "../a.db"}, headers=H).status_code == 404
+
+
+def test_oauth_callback_rejects_unknown_state(client):
+    r = client.get("/oauth/callback", params={"state": "nope", "code": "x"})
+    assert r.status_code == 200 and "устарела" in r.text
+    assert client.post("/api/mcp/none/connect", headers={"Authorization": "Bearer t-bob"}).status_code == 403

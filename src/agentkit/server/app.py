@@ -7,19 +7,22 @@
 
 from __future__ import annotations
 
+import html
 import json
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from agentkit.attachments import UPLOADS, save_upload
 from agentkit.events import EventType
+from agentkit.oauth import OAuthError, OAuthOptions
 from agentkit.permissions import Mode
 from agentkit.runs import Busy
 from agentkit.scheduler import next_run, validate_cron
@@ -44,7 +47,8 @@ class PatchSession(BaseModel):
 
 
 class SendMessage(BaseModel):
-    text: str
+    text: str = ""
+    files: list[dict[str, Any]] = []  # то, что вернул POST /files
     model: str | None = None
     mode: str | None = None
 
@@ -120,7 +124,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
     async def list_sessions(user: User = Depends(auth)):
         items = await svc.store.list_sessions(user.id, limit=100)
         return [{"id": s.id, "title": s.title or "Новый разговор", "updated_at": s.updated_at,
-                 "running": svc.runs.active_run(s.id) is not None} for s in items]
+                 "running": await svc.runs.active_run(s.id) is not None} for s in items]
 
     @api.post("/sessions")
     async def create_session(body: NewSession, user: User = Depends(auth)):
@@ -137,7 +141,8 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
             "id": s.id, "title": s.title, "state": s.state,
             "messages": [{"seq": seq, **m.to_dict()} for seq, m in msgs],
             "approvals": [a.__dict__ for a in pending],
-            "running_run": svc.runs.active_run(session_id),
+            "running_run": await svc.runs.active_run(session_id),
+            "queued": await svc.store.inbox_count(session_id),
             "last_seq": await svc.store.last_event_seq(session_id),
             "runs": [r.__dict__ for r in await svc.store.list_runs(session_id, limit=20)],
         }
@@ -159,32 +164,30 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
     @api.delete("/sessions/{session_id}")
     async def delete_session(session_id: str, user: User = Depends(auth)):
         await own_session(session_id, user)
-        if svc.runs.active_run(session_id):
+        if await svc.runs.active_run(session_id):
             raise HTTPException(409, "сначала остановите прогон")
         await svc.store.delete_session(session_id)
         return {"ok": True}
 
     @api.post("/sessions/{session_id}/messages")
     async def send(session_id: str, body: SendMessage, user: User = Depends(auth)):
+        """Если агент занят — сообщение встаёт в очередь, и он подхватит его между шагами (queued: true)."""
         await own_session(session_id, user)
         mode = _check_mode(body.mode, user)
-        try:
-            run_id = await svc.runs.start(
-                session_id, lambda: svc.agent.run(session_id, user, body.text, model=body.model, mode=mode),
-                cancel=svc.agent.cancel)
-        except Busy:
-            raise HTTPException(409, "агент ещё работает в этом разговоре — дождитесь или остановите") from None
-        return {"run_id": run_id}
+        content = _content(session_id, body)
+        if not content:
+            raise HTTPException(400, "пустое сообщение")
+        return await svc.send(session_id, user, content, model=body.model, mode=mode)
 
     @api.post("/sessions/{session_id}/cancel")
     async def cancel(session_id: str, user: User = Depends(auth)):
         await own_session(session_id, user)
-        return {"ok": svc.runs.cancel(session_id)}
+        return {"ok": await svc.runs.cancel(session_id)}
 
     @api.post("/sessions/{session_id}/rewind")
     async def rewind(session_id: str, body: Rewind, user: User = Depends(auth)):
         await own_session(session_id, user)
-        if svc.runs.active_run(session_id):
+        if await svc.runs.active_run(session_id):
             raise HTTPException(409, "сначала остановите прогон")
         return await svc.agent.rewind(session_id, body.seq)
 
@@ -195,7 +198,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         async def gen():
             yield ": ok\n\n"
             async for ev in svc.runs.subscribe(session_id, after):
-                yield f"id: {ev.seq}\nevent: {ev.type}\ndata: {json.dumps(ev.to_dict(), ensure_ascii=False, default=str)}\n\n"
+                yield f"id: {ev.get('seq', 0)}\nevent: {ev['type']}\ndata: {json.dumps(ev, ensure_ascii=False, default=str)}\n\n"
             yield "event: idle\ndata: {}\n\n"
 
         return StreamingResponse(gen(), media_type="text/event-stream",
@@ -205,7 +208,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
     async def poll(session_id: str, after: int = 0, user: User = Depends(auth)):
         await own_session(session_id, user)
         evs = await svc.store.list_events(session_id=session_id, after_seq=after, limit=500)
-        return {"events": [e.to_dict() for e in evs], "running": svc.runs.active_run(session_id) is not None}
+        return {"events": [e.to_dict() for e in evs], "running": await svc.runs.active_run(session_id) is not None}
 
     # ── подтверждения ────────────────────────────────────────────────
     @api.post("/approvals/{approval_id}")
@@ -281,7 +284,8 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
             "tools": [{"name": t.name, "description": t.description.split("\n")[0], "read_only": t.read_only,
                        "destructive": t.destructive, "deferred": t.deferred, "group": t.group, "source": t.source}
                       for t in svc.registry.all()],
-            "mcp": [{"name": s.name, "ok": s.ok, "tools": s.tools, "error": s.error} for s in svc.mcp.status.values()],
+            "mcp": [{"name": s.name, "ok": s.ok, "tools": s.tools, "error": s.error, "needs_auth": s.needs_auth,
+                     "oauth": s.oauth} for s in svc.mcp.status.values()],
             "skills": [{"name": k.name, "description": k.description} for k in (svc.agent.skills.skills.values()
                                                                                if svc.agent.skills else [])],
         }
@@ -325,6 +329,77 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         await svc.store.schedule_delete(schedule_id)
         return {"ok": True}
 
+    # ── файлы ────────────────────────────────────────────────────────
+    def _workspace(session_id: str) -> Path:
+        ws = svc.agent.workspace_for(session_id)
+        if ws is None:
+            raise HTTPException(400, "у агента нет рабочей папки (AGENT_ENABLE_FILES=false)")
+        return ws
+
+    def _content(session_id: str, body: SendMessage) -> Any:
+        if not body.files:
+            return body.text.strip()
+        ws = _workspace(session_id)
+        parts: list[dict[str, Any]] = [{"type": "text", "text": body.text}] if body.text.strip() else []
+        for f in body.files:
+            path = str(f.get("path", ""))
+            target = (ws / path).resolve()
+            # Ссылку присылает клиент — проверяем, что это действительно загруженный файл этой сессии.
+            if not path.startswith(UPLOADS + "/") or ws.resolve() not in target.parents or not target.is_file():
+                raise HTTPException(400, f"нет загруженного файла {path}")
+            parts.append({k: f[k] for k in ("type", "path", "name", "kind", "size", "mime") if k in f} | {"type": "file"})
+        return parts
+
+    @api.post("/sessions/{session_id}/files")
+    async def upload(session_id: str, file: UploadFile, user: User = Depends(auth)):
+        await own_session(session_id, user)
+        data = await file.read(svc.settings.max_upload_mb * 1024 * 1024 + 1)
+        if len(data) > svc.settings.max_upload_mb * 1024 * 1024:
+            raise HTTPException(413, f"файл больше {svc.settings.max_upload_mb} МБ")
+        return save_upload(_workspace(session_id), file.filename or "file", data, file.content_type or "")
+
+    @api.get("/sessions/{session_id}/files")
+    async def download(session_id: str, path: str, user: User = Depends(auth)):
+        await own_session(session_id, user)
+        ws = _workspace(session_id).resolve()
+        target = (ws / path).resolve()
+        if ws not in target.parents or not target.is_file():
+            raise HTTPException(404, "нет такого файла")
+        return FileResponse(target, filename=target.name)
+
+    # ── OAuth MCP-серверов ───────────────────────────────────────────
+    @api.post("/mcp/{name}/connect")
+    async def mcp_connect(name: str, user: User = Depends(auth)):
+        require_admin(user)
+        cfg = svc.mcp.config(name)
+        if cfg is None or not cfg.url:
+            raise HTTPException(404, f"нет HTTP MCP-сервера {name} в mcp.json")
+        try:
+            url = await svc.oauth.start(name, cfg.url, OAuthOptions.from_config(cfg.oauth), user_id=user.id)
+        except OAuthError as e:
+            raise HTTPException(400, str(e)) from None
+        return {"url": url, "redirect_uri": svc.oauth.redirect_uri}
+
+    @api.delete("/mcp/{name}/connect")
+    async def mcp_disconnect(name: str, user: User = Depends(auth)):
+        require_admin(user)
+        await svc.oauth.disconnect(name)
+        await svc.reload()
+        return {"ok": True}
+
+    @app.get("/oauth/callback", response_class=HTMLResponse)
+    async def oauth_callback(state: str = "", code: str = "", error: str = "", error_description: str = ""):
+        # Без авторизации по токену: сюда возвращает браузер с сервера OAuth.
+        # Защита — одноразовый state, выданный только администратору.
+        if error:
+            return _oauth_page(False, f"{error}: {error_description}")
+        try:
+            server = await svc.oauth.finish(state, code)
+        except OAuthError as e:
+            return _oauth_page(False, str(e))
+        await svc.reload()
+        return _oauth_page(True, f"{server} подключён")
+
     app.include_router(api)
     for r in extra_routers or []:
         app.include_router(r)
@@ -342,6 +417,15 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         return JSONResponse({"detail": str(exc)}, status_code=400)
 
     return app
+
+
+def _oauth_page(ok: bool, text: str) -> str:
+    # Окно согласия открывалось из чата — сообщаем ему результат и закрываемся.
+    payload = json.dumps({"type": "agentkit-oauth", "ok": ok, "text": text}, ensure_ascii=False)
+    return f"""<!doctype html><meta charset="utf-8"><title>{'Готово' if ok else 'Ошибка'}</title>
+<body style="font:16px system-ui;padding:40px;text-align:center">
+<p>{'✓' if ok else '✕'} {html.escape(text)}</p><p style="color:#888">Окно можно закрыть.</p>
+<script>try{{window.opener&&window.opener.postMessage({payload},"*");setTimeout(()=>window.close(),1200)}}catch(e){{}}</script>"""
 
 
 def _check_mode(mode: str | None, user: User) -> str | None:

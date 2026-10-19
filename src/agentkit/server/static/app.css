@@ -168,3 +168,17 @@ button, input, select, textarea { font: inherit; color: inherit; }
   .controls select { max-width: 110px; }
   .bubble { max-width: 92%; }
 }
+
+.attachments { display: flex; flex-wrap: wrap; gap: 6px; max-width: 800px; width: calc(100% - 32px); margin: 0 auto; padding: 6px 0 0; }
+.chip { display: inline-flex; align-items: center; gap: 4px; background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 4px 6px 4px 10px; font-size: 13px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip-x { border: 0; background: var(--surface-2); color: var(--muted); border-radius: 50%; width: 20px; height: 20px; cursor: pointer; line-height: 1; }
+.attach { align-self: center; }
+.msg .files { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; margin-bottom: 4px; max-width: 85%; }
+.thumb { max-width: 220px; max-height: 180px; border-radius: 12px; border: 1px solid var(--line); cursor: zoom-in; object-fit: cover; background: var(--surface-2); min-width: 60px; min-height: 40px; }
+.file-chip { border: 1px solid var(--line); background: var(--surface); border-radius: 12px; padding: 8px 12px; cursor: pointer; font-size: 13px; text-align: left; }
+.file-chip small { color: var(--muted); }
+.msg.queued .bubble { opacity: .6; }
+.badge.queued { margin-right: 6px; }
+.msg.queued .tools-row { opacity: 1; }
+.btn.small { padding: 4px 10px; font-size: 13px; }
+body.dragging .main::after { content: "Отпустите, чтобы прикрепить"; position: fixed; inset: 12px; border: 2px dashed var(--accent); border-radius: 18px; display: grid; place-items: center; background: color-mix(in srgb, var(--bg) 80%, transparent); font-size: 18px; color: var(--accent); pointer-events: none; z-index: 30; }

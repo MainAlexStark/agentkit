@@ -42,7 +42,10 @@ class Scheduler:
         tz: str = "Europe/Moscow",
         interval: float = 30.0,
         on_done: Callable[[ScheduleRec, RunOutcome], Awaitable[None]] | None = None,
+        # Как запускать: по умолчанию agent.run_to_end; сервис подставляет запуск через RunManager.
+        runner: Callable[[ScheduleRec, str, User], Awaitable[RunOutcome]] | None = None,
     ):
+        self.runner = runner
         self.store = store
         self.agent_for = agent_for
         self.user_for = user_for
@@ -78,10 +81,13 @@ class Scheduler:
                 await self.store.schedule_upsert(s)
                 continue
             if s.next_run_at <= now:
+                new_next = next_run(s.cron, self.tz, now)  # от «сейчас»: пропуски не догоняем
+                # Процессов сервиса может быть несколько, и каждый тикает сам:
+                # запуск достаётся тому, кто первым сдвинул next_run_at.
+                if not await self.store.claim_schedule(s.id, s.next_run_at, new_next, now):
+                    continue
+                s.last_run_at, s.next_run_at = now, new_next
                 fired.append(s.id)
-                s.last_run_at = now
-                s.next_run_at = next_run(s.cron, self.tz, now)  # от «сейчас»: пропуски не догоняем
-                await self.store.schedule_upsert(s)
                 self._running.add(s.id)
                 asyncio.create_task(self._fire(s))
         return fired
@@ -96,7 +102,10 @@ class Scheduler:
             if not sid or await self.store.get_session(sid) is None:
                 sess = await self.store.create_session(s.user_id, title=f"⏰ {s.name}", agent=s.agent)
                 sid = sess.id
-            outcome = await agent.run_to_end(sid, user, s.prompt, trigger="schedule")
+            if self.runner is not None:
+                outcome = await self.runner(s, sid, user)
+            else:
+                outcome = await agent.run_to_end(sid, user, s.prompt, trigger="schedule")
             if self.on_done:
                 await self.on_done(s, outcome)
         except Exception:  # noqa: BLE001

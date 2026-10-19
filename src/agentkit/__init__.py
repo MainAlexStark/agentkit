@@ -32,7 +32,7 @@ from agentkit.subagents import DEFAULT_SUBAGENTS, EXPLORE, GENERAL, PLAN, task_t
 from agentkit.tools.base import Tool, ToolContext, ToolDenied, ToolResult, User, tool
 from agentkit.tools.registry import ToolRegistry
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "DEFAULT_SUBAGENTS",

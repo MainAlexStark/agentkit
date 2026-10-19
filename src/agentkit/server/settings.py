@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     allowed_origins: str = ""
 
     trace_dir: Path | None = None
+    # Несколько процессов (uvicorn --workers N или несколько контейнеров) — только с Redis.
+    redis_url: str = ""
+    workers: int = 1
+    # Модели, которым отдавать картинки (шаблоны через запятую); пусто — встроенный список.
+    vision_models: str = ""
+    max_upload_mb: int = 25
     scheduler: bool = True
     max_output_chars: int = 30_000
 
