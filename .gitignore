@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+data/
+*.db
+dist/
+.pytest_cache/
+.ruff_cache/
+template/data/
+template/deploy/*.env
+!template/deploy/*.env.example
