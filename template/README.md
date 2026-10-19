@@ -30,6 +30,16 @@ agentkit eval evals/ --app app.evals:make_agent             # на настоя�
 ./deploy.sh secrets | logs | status | backup | restart | down
 ```
 
+## Что умеет чат
+
+* Файлы и картинки — скрепкой, перетаскиванием или вставкой из буфера. Картинки уходят моделям со зрением, текст PDF/DOCX/XLSX извлекается сам.
+* Писать, пока агент работает: сообщение встаёт в очередь, агент прочтёт его после текущего шага.
+* MCP-сервер с OAuth: «Инструменты» → «Подключить» (только admin). Адрес возврата для консоли провайдера — `https://<домен>/oauth/callback`.
+
+## Несколько процессов
+
+`AGENT_WORKERS=2` и `AGENT_REDIS_URL=redis://redis:6379/0` — `deploy.sh` ставит их сам, Redis поднимается в том же compose. Без Redis больше одного процесса сервис не запустит.
+
 ## API для других сервисов
 
 ```
@@ -43,7 +53,7 @@ X-Agent-Roles: worker
 → {"session_id": "...", "status": "done", "text": "...", "usage": {...}, "approvals": [...]}
 ```
 
-Живой чат: `POST /api/sessions` → `POST /api/sessions/{id}/messages` → `GET /api/sessions/{id}/events` (SSE) или `/poll?after=<seq>`; подтверждения — `POST /api/approvals/{id}` `{"approve": true}`.
+Живой чат: `POST /api/sessions` → `POST /api/sessions/{id}/messages` `{"text", "files"}` (ответ `queued: true`, если агент занят) → `GET /api/sessions/{id}/events` (SSE) или `/poll?after=<seq>`; файлы — `POST /api/sessions/{id}/files` (multipart); подтверждения — `POST /api/approvals/{id}` `{"approve": true}`.
 
 ## Структура
 

@@ -53,6 +53,9 @@ prepare_extra() {
   # Пересобирается каждый раз — не может разойтись с postgres.env.
   env_set "${PREFIX}_DATABASE_URL" "postgresql://${pg_user}:${pg_password}@postgres:5432/${pg_db}"
   env_set "${PREFIX}_DATA_DIR" "/srv/data"
+  # Redis поднимается вместе с сервисом (docker-compose.yaml) — шина между процессами.
+  env_set "${PREFIX}_REDIS_URL" "redis://redis:6379/0"
+  [ -n "$(env_get "${PREFIX}_WORKERS")" ] || env_set "${PREFIX}_WORKERS" "2"
 
   # Токены придумываются один раз: перевыпуск выкинул бы всех из чата
   # и сломал бы интеграции, которые ходят с сервисным токеном.

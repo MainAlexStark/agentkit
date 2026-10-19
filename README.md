@@ -15,14 +15,17 @@ agentkit new ei-assistant        # готовый проект: сервис, в
 | `agent.py` | Цикл: модель → инструменты → права/хуки → результат. Параллельные read-only вызовы, подтверждение без висящего процесса, отмена, лимит шагов с обязательным итогом, защита от зацикливания |
 | `llm/` | OpenAI-совместимый клиент (OpenRouter, Yandex AI Studio, OpenAI, Ollama), «провайдер:модель», роли main/small, повторы, запасные модели, prompt caching для Claude, стоимость |
 | `tools/` | `@tool` из сигнатуры функции; базовые: задачи, вопрос человеку, файлы, shell, web, память; реестр с отложенной загрузкой (`tool_search`) |
-| `mcp.py` | Клиент MCP без SDK: Streamable HTTP и stdio; инструменты сервера → `mcp__<сервер>__<имя>` с read-only/destructive из аннотаций |
+| `mcp.py` | Клиент MCP без SDK: Streamable HTTP и stdio, Bearer или OAuth; инструменты сервера → `mcp__<сервер>__<имя>` с read-only/destructive из аннотаций |
 | `permissions.py` | Режимы (default / accept_edits / plan / readonly / auto / bypass) и правила `allow/ask/deny` вида `shell(git status*)` |
 | `hooks.py` | session_start, user_prompt_submit, pre/post_tool_use, stop, pre_compact |
 | `context.py` | Системный промпт слоями под кэш, сжатие истории, обрезка вывода |
 | `skills.py` | SKILL.md-пакеты: в промпте оглавление, текст — по запросу |
 | `subagents.py` | `task`: explore / plan / general в своих сессиях, параллельно |
 | `store/` | SQLite / PostgreSQL: сессии, сообщения, прогоны, события, подтверждения, память, расписание |
-| `runs.py` | Прогоны в фоне, SSE с курсором, один прогон на сессию |
+| `runs.py` | Прогоны в фоне, SSE с курсором, один прогон на сессию, сообщения на ходу |
+| `bus.py` | Шина между процессами (Redis): блокировки, живые события, отмена, общие команды |
+| `oauth.py` | Вход в MCP-серверы по OAuth 2.1: DCR, PKCE, обновление и отзыв токенов |
+| `attachments.py` | Файлы и картинки в сообщениях: загрузка, текст из PDF/DOCX/XLSX, картинки для моделей со зрением |
 | `scheduler.py` | Задачи по cron из базы |
 | `evals.py` | YAML-кейсы: офлайн-сценарии для CI и проверки на живой модели с судьёй |
 | `tracing.py` | Лог, JSONL, OpenTelemetry |

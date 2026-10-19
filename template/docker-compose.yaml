@@ -18,6 +18,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       # Рабочие папки сессий, файлы агента, трейсы. База — отдельно, в postgres.
       - data:/srv/data
@@ -44,6 +46,24 @@ services:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 3s
       timeout: 5s
+      retries: 20
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks:
+      - internal
+
+  # Шина между процессами агента (AGENT_WORKERS > 1): блокировки прогонов,
+  # живые события, отмена. Данные не хранит — после перезапуска ей нечего терять.
+  redis:
+    image: redis:7-alpine
+    container_name: agent-service-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
       retries: 20
     logging:
       driver: json-file
