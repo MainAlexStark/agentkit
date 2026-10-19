@@ -16,6 +16,12 @@ class Settings(BaseSettings):
     name: str = "Агент"
     description: str = ""  # одна строка под приветствием на пустом экране
     suggestions: str = ""  # примеры запросов на пустом экране, через «|»
+    # Подписка по умолчанию (меню пользователя → «Подписка»). Настоящий биллинг —
+    # Domain.plan в проекте (ЮKassa и т. п., как в OpenSeller).
+    plan_name: str = ""
+    monthly_budget_usd: float = 0  # 0 — без лимита; иначе полоса расхода в «Подписке»
+    billing_url: str = ""  # «Управлять подпиской» — страница оплаты хост-приложения
+    help_url: str = ""  # пункт «Помощь» в меню пользователя
     public_url: str = "http://localhost:8080"
     host: str = "0.0.0.0"
     port: int = 8080

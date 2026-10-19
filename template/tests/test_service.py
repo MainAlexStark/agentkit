@@ -44,7 +44,7 @@ def test_auth(client):
     assert client.get("/api/me", headers={"Authorization": "Bearer nope"}).status_code == 401
     assert client.get("/api/me", headers=H).json()["roles"] == ["admin"]
     r = client.get("/api/me", headers={"Authorization": "Bearer svc", "X-Agent-User-Id": "ei-42", "X-Agent-Roles": "metrolog"})
-    assert r.json() == {"id": "ei-42", "name": "ei-42", "roles": ["metrolog"]}
+    assert r.json() == {"id": "ei-42", "name": "ei-42", "call_me": "", "roles": ["metrolog"]}
     assert client.get("/healthz").json()["ok"]
 
 
@@ -159,3 +159,21 @@ def test_oauth_callback_rejects_unknown_state(client):
     r = client.get("/oauth/callback", params={"state": "nope", "code": "x"})
     assert r.status_code == 200 and "устарела" in r.text
     assert client.post("/api/mcp/none/connect", headers={"Authorization": "Bearer t-bob"}).status_code == 403
+
+
+def test_profile_and_plan(client):
+    assert client.get("/api/profile", headers=H).json()["name"] == "alex"
+    r = client.put("/api/profile", json={"name": "Алексей", "call_me": "Алекс", "work": "метролог", "instructions": "Коротко"},
+                   headers=H)
+    assert r.status_code == 200
+    me = client.get("/api/me", headers=H).json()
+    assert me["name"] == "Алексей" and me["call_me"] == "Алекс"
+    # профиль попадает в системный промпт
+    client.fake.push("ок")
+    sid = client.post("/api/sessions", json={}, headers=H).json()["id"]
+    client.post(f"/api/sessions/{sid}/messages", json={"text": "привет"}, headers=H)
+    wait_idle(client, sid)
+    system = client.fake.requests[-1].messages[0].text
+    assert "Обращаться: Алекс" in system and "Коротко" in system
+    plan = client.get("/api/plan", headers=H).json()
+    assert plan["name"] and "usage" in plan

@@ -70,6 +70,9 @@ class Domain:
     # Пустой экран чата: что умеет агент и примеры запросов (кнопками).
     description: str = ""
     suggestions: list[str] = field(default_factory=list)
+    # Подписка пользователя: (user, расход за месяц) → {"name", "status", "renews_at", "limit_usd",
+    # "features": [...], "manage_url"}. None — из настроек AGENT_PLAN_NAME / AGENT_MONTHLY_BUDGET_USD.
+    plan: Callable[[User, dict[str, Any]], Any] | None = None
     # Вызывается после старта: подключить БД хоста, прогреть кэш и т. п.
     on_start: Callable[[AgentService], Any] | None = None
 

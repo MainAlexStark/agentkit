@@ -63,6 +63,13 @@ class Rewind(BaseModel):
     seq: int
 
 
+class ProfileIn(BaseModel):
+    name: str = ""  # полное имя
+    call_me: str = ""  # как обращаться
+    work: str = ""  # чем занимается
+    instructions: str = ""  # пожелания к ответам — уходят в системный промпт
+
+
 class MemoryIn(BaseModel):
     text: str
     scope: str = "user"  # user | global
@@ -110,7 +117,36 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
 
     @api.get("/me")
     async def me(user: User = Depends(auth)):
-        return {"id": user.id, "name": user.name, "roles": user.roles}
+        prof = await svc.store.kv_get("profile", user.id) or {}
+        return {"id": user.id, "name": prof.get("name") or user.name, "call_me": prof.get("call_me", ""),
+                "roles": user.roles}
+
+    @api.get("/profile")
+    async def profile(user: User = Depends(auth)):
+        return {"name": user.name, "call_me": "", "work": "", "instructions": "",
+                **(await svc.store.kv_get("profile", user.id) or {})}
+
+    @api.put("/profile")
+    async def save_profile(body: ProfileIn, user: User = Depends(auth)):
+        data = {k: v.strip()[:4000] for k, v in body.model_dump().items()}
+        await svc.store.kv_set("profile", user.id, data)
+        return data
+
+    @api.get("/plan")
+    async def plan(user: User = Depends(auth)):
+        now = time.localtime()
+        month_start = time.mktime((now.tm_year, now.tm_mon, 1, 0, 0, 0, 0, 0, -1))
+        usage = await svc.store.usage_summary(user_id=user.id, since=month_start)
+        s = svc.settings
+        info: dict[str, Any] = {"name": s.plan_name or "Без ограничений", "status": "active",
+                                "limit_usd": s.monthly_budget_usd or None, "manage_url": s.billing_url or None,
+                                "features": []}
+        if svc.domain.plan is not None:
+            res = svc.domain.plan(user, usage)
+            if hasattr(res, "__await__"):
+                res = await res
+            info.update(res or {})
+        return {**info, "usage": usage, "period_start": month_start}
 
     @api.get("/config")
     async def config(user: User = Depends(auth)):
@@ -120,7 +156,8 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
                 "default_mode": s.default_mode, "is_admin": user.has_role("admin"),
                 "description": svc.domain.description or s.description,
                 "suggestions": svc.domain.suggestions or [x.strip() for x in s.suggestions.split("|") if x.strip()],
-                "titles": {t.name: t.title for t in svc.registry.all() if t.title}}
+                "titles": {t.name: t.title for t in svc.registry.all() if t.title},
+                "help_url": s.help_url or None, "plan_name": s.plan_name or None}
 
     # ── сессии ───────────────────────────────────────────────────────
     @api.get("/sessions")

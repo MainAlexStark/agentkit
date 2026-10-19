@@ -548,10 +548,16 @@ function renderSessions() {
     if (!g.length) continue;
     g.forEach(s => used.add(s.id));
     out.push(h("div", { class: "group-label" }, label));
-    for (const s of g) out.push(h("button", {
-      class: "session" + (s.id === S.sessionId ? " active" : ""), type: "button", title: s.title,
-      onclick: () => { openSession(s.id); toggleSidebar(false); },
-    }, h("span", {}, s.title), s.running ? h("i", { class: "dot", title: "Агент работает" }) : null));
+    for (const s of g) {
+      const more = h("button", { class: "icon-btn more", type: "button", title: "Ещё", "aria-haspopup": "menu", "aria-label": "Действия с разговором" }, icon("dots"));
+      const item = h("div", {
+        class: "session" + (s.id === S.sessionId ? " active" : ""), role: "button", tabindex: "0", title: s.title,
+        onclick: e => { if (!e.target.closest(".more, input")) { openSession(s.id); toggleSidebar(false); } },
+        onkeydown: e => { if (e.key === "Enter" && e.target === item) openSession(s.id); },
+      }, h("span", {}, s.title), s.running ? h("i", { class: "dot", title: "Агент работает" }) : null, more);
+      more.addEventListener("click", e => { e.stopPropagation(); sessionMenu(s, item, more); });
+      out.push(item);
+    }
   }
   if (!out.length) out.push(h("div", { class: "group-label" }, q ? "Ничего не найдено" : "Разговоров пока нет"));
   $("#sessions").replaceChildren(...out);
@@ -560,7 +566,7 @@ function renderSessions() {
 function greeting() {
   const hr = new Date().getHours();
   const part = hr < 5 ? "Доброй ночи" : hr < 12 ? "Доброе утро" : hr < 18 ? "Добрый день" : "Добрый вечер";
-  const name = (S.me?.name || "").split(/\s+/)[0];
+  const name = S.me?.call_me || (S.me?.name || "").split(/\s+/)[0];
   return name && name !== S.me?.id ? `${part}, ${name}` : part;
 }
 function emptyState() {
@@ -625,17 +631,17 @@ const panels = {
     const input = h("textarea", { rows: 2, placeholder: "Правило или факт, например: «отчёты присылай по пятницам»" });
     const scope = S.config.is_admin ? h("select", {}, h("option", { value: "user" }, "Только для меня"), h("option", { value: "global" }, "Для всех")) : null;
     body.append(h("div", { class: "form" }, input, h("div", { class: "actions" }, scope,
-      h("button", { class: "btn primary", onclick: async () => { if (!input.value.trim()) return; await api("/api/memory", { method: "POST", body: { text: input.value, scope: scope?.value || "user" } }); openPanel("memory"); } }, "Добавить"))));
+      h("button", { class: "btn primary", onclick: async () => { if (!input.value.trim()) return; await api("/api/memory", { method: "POST", body: { text: input.value, scope: scope?.value || "user" } }); openSettings("memory"); } }, "Добавить"))));
     if (!items.length) body.append(h("p", { class: "muted" }, "Пока пусто. Скажите агенту «запомни: …» — правило появится здесь и будет учитываться в каждом разговоре."));
     for (const m of items) body.append(row(m.text,
       h("span", { class: "badge" }, m.scope === "global" ? "для всех" : "моё"),
-      h("button", { class: "icon-btn", title: "Удалить", onclick: async () => { await api(`/api/memory/${m.id}`, { method: "DELETE" }); openPanel("memory"); } }, icon("x"))));
+      h("button", { class: "icon-btn", title: "Удалить", onclick: async () => { await api(`/api/memory/${m.id}`, { method: "DELETE" }); openSettings("memory"); } }, icon("x"))));
   },
   async tools(body) {
     const d = await api("/api/tools");
     if (S.config.is_admin) body.append(h("div", { class: "form" }, h("div", { class: "actions" },
       h("span", { class: "muted", style: "flex:1;font-size:12.5px" }, "mcp.json и skills читаются при старте"),
-      h("button", { class: "btn sm", onclick: async () => { await api("/api/reload", { method: "POST" }); openPanel("tools"); } }, "Перечитать"))));
+      h("button", { class: "btn sm", onclick: async () => { await api("/api/reload", { method: "POST" }); openSettings("tools"); } }, "Перечитать"))));
     if (d.mcp.length) {
       body.append(h("div", { class: "section-title" }, "MCP-серверы"));
       for (const s of d.mcp) {
@@ -643,7 +649,7 @@ const panels = {
         if (S.config.is_admin && s.needs_auth) action = h("button", { class: "btn primary sm", onclick: () => mcpConnect(s.name) }, "Подключить");
         else if (S.config.is_admin && s.oauth) action = h("button", { class: "btn ghost sm", onclick: async () => {
           if (!confirm(`Отключить ${s.name}? Токены будут отозваны.`)) return;
-          await api(`/api/mcp/${encodeURIComponent(s.name)}/connect`, { method: "DELETE" }); openPanel("tools"); } }, "Отключить");
+          await api(`/api/mcp/${encodeURIComponent(s.name)}/connect`, { method: "DELETE" }); openSettings("tools"); } }, "Отключить");
         body.append(row([h("div", {}, h("b", {}, s.name), s.oauth ? h("span", { class: "muted" }, " · OAuth") : null),
           !s.ok && s.error ? h("div", { class: "sub-text" }, s.error) : null],
           h("span", { class: "badge " + (s.ok ? "ok" : s.needs_auth ? "warn" : "err") }, s.ok ? `${s.tools} ${plural(s.tools, "инструмент", "инструмента", "инструментов")}` : s.needs_auth ? "нужен вход" : "нет связи"),
@@ -673,12 +679,12 @@ const panels = {
     const cron = h("input", { placeholder: "Когда: cron, например 45 8 * * 1-5 — по будням в 8:45" });
     const prompt = h("textarea", { rows: 3, placeholder: "Что сделать агенту" });
     body.append(h("div", { class: "form" }, name, cron, prompt, h("div", { class: "actions" }, h("button", { class: "btn primary", onclick: async () => {
-      try { await api("/api/schedules", { method: "POST", body: { name: name.value, cron: cron.value, prompt: prompt.value } }); openPanel("schedules"); }
+      try { await api("/api/schedules", { method: "POST", body: { name: name.value, cron: cron.value, prompt: prompt.value } }); openSettings("schedules"); }
       catch (e) { alert(e.message); } } }, "Добавить"))));
     if (!items.length) body.append(h("p", { class: "muted" }, "Задач по расписанию нет. Результат каждого запуска появится отдельным разговором."));
     for (const s of items) body.append(row([h("b", {}, s.name), h("div", { class: "sub-text" }, s.prompt),
       h("div", { class: "sub-text" }, h("code", {}, s.cron), s.next_run_at ? " · следующий запуск " + new Date(s.next_run_at * 1000).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" }) : "")],
-      h("button", { class: "icon-btn", title: "Удалить", onclick: async () => { await api(`/api/schedules/${s.id}`, { method: "DELETE" }); openPanel("schedules"); } }, icon("x"))));
+      h("button", { class: "icon-btn", title: "Удалить", onclick: async () => { await api(`/api/schedules/${s.id}`, { method: "DELETE" }); openSettings("schedules"); } }, icon("x"))));
   },
   async usage(body) {
     const u = await api("/api/usage?days=30");
@@ -697,34 +703,196 @@ const panels = {
     }
   },
 };
-const titles = { memory: "Память", tools: "Инструменты", schedules: "Расписание", usage: "Расход" };
-async function openPanel(name) {
-  $("#panel").hidden = false; $("#panel-title").textContent = titles[name];
-  const body = $("#panel-body");
-  const fresh = h("div", { style: "display:contents" });
-  if (!body.childElementCount || body.dataset.panel !== name) body.replaceChildren(h("p", { class: "muted" }, "Загрузка…"));
-  body.dataset.panel = name;
-  try { await panels[name](fresh); body.replaceChildren(...fresh.childNodes); } catch (e) { body.replaceChildren(h("p", { class: "error-text" }, e.message)); }
+
+// ── всплывающие меню ────────────────────────────────────────────────
+function closeMenus() {
+  $("#user-menu").hidden = true; $("#user-btn").setAttribute("aria-expanded", "false");
+  const pop = $("#popover");
+  if (!pop.hidden) { pop.hidden = true; pop._owner?.setAttribute("aria-expanded", "false"); }
 }
-function closePanel() { $("#panel").hidden = true; }
+function toggleUserMenu() {
+  const open = $("#user-menu").hidden;
+  closeMenus();
+  if (!open) return;
+  $("#user-menu").hidden = false; $("#user-btn").setAttribute("aria-expanded", "true");
+  for (const b of document.querySelectorAll("[data-theme-set]")) b.classList.toggle("on", b.dataset.themeSet === (store.get("agent_theme") || "auto"));
+  $("#user-menu .menu-item")?.focus();
+}
+function sessionMenu(s, item, btn) {
+  closeMenus();
+  const pop = $("#popover");
+  pop.replaceChildren(
+    h("button", { class: "menu-item", role: "menuitem", onclick: () => { closeMenus(); renameSession(s, item); } }, icon("pen"), "Переименовать"),
+    h("button", { class: "menu-item danger", role: "menuitem", onclick: async () => {
+      closeMenus();
+      if (!confirm(`Удалить разговор «${s.title}»?`)) return;
+      try { await api(`/api/sessions/${s.id}`, { method: "DELETE" }); } catch (e) { alert(e.message); return; }
+      if (s.id === S.sessionId) newChat();
+      loadSessions();
+    } }, icon("trash"), "Удалить"));
+  const r = btn.getBoundingClientRect();
+  pop.style.left = `${Math.min(r.left, innerWidth - 200)}px`; pop.style.top = `${r.bottom + 4}px`;
+  pop.hidden = false; pop._owner = btn; btn.setAttribute("aria-expanded", "true");
+}
+function renameSession(s, item) {
+  const input = h("input", { class: "rename", value: s.title });
+  const span = item.querySelector("span");
+  span.replaceWith(input); input.focus(); input.select();
+  const done = async save => {
+    if (save && input.value.trim() && input.value.trim() !== s.title) {
+      await api(`/api/sessions/${s.id}`, { method: "PATCH", body: { title: input.value.trim() } });
+    }
+    loadSessions();
+  };
+  input.addEventListener("keydown", e => { if (e.key === "Enter") done(true); if (e.key === "Escape") done(false); });
+  input.addEventListener("blur", () => done(true), { once: true });
+}
+
+// ── настройки ───────────────────────────────────────────────────────
+const fieldRow = (label, control, help) => h("div", { class: "field-row" }, h("label", {}, label), control, help ? h("div", { class: "help" }, help) : null);
+const group = (title, lead, ...kids) => h("div", { class: "group" }, title ? h("h4", {}, title) : null, lead ? h("p", { class: "lead-text" }, lead) : null, ...kids);
+function segmented(options, value, onChange) {
+  const el = h("div", { class: "segmented", role: "radiogroup" });
+  for (const [v, label] of options) {
+    const b = h("button", { type: "button", role: "radio", class: v === value ? "on" : "", "aria-checked": String(v === value),
+      onclick: () => { el.querySelectorAll("button").forEach(x => { x.classList.remove("on"); x.setAttribute("aria-checked", "false"); });
+        b.classList.add("on"); b.setAttribute("aria-checked", "true"); onChange(v); } }, label);
+    el.append(b);
+  }
+  return el;
+}
+const prefs = {
+  get size() { return store.get("agent_text_size") || "normal"; },
+  get send() { return store.get("agent_send_key") || "enter"; },
+};
+function applyPrefs() {
+  document.documentElement.style.setProperty("--chat-size", prefs.size === "large" ? "16px" : prefs.size === "small" ? "13.5px" : "14.5px");
+  $("#hint").textContent = prefs.send === "ctrl" ? "Ctrl+Enter — отправить · Enter — перенос" : "Enter — отправить · Shift+Enter — перенос";
+}
+
+const tabs = {
+  async general(body) {
+    const p = await api("/api/profile");
+    const name = h("input", { value: p.name || "", placeholder: "Иван Петров" });
+    const call = h("input", { value: p.call_me || "", placeholder: "Иван" });
+    const work = h("input", { value: p.work || "", placeholder: "например: поверитель, выезды по Кирову и области" });
+    const instr = h("textarea", { rows: 4, placeholder: "например: отвечай коротко, суммы — в рублях, даты — ДД.ММ.ГГГГ" });
+    instr.value = p.instructions || "";
+    const saved = h("span", { class: "saved" });
+    const save = h("button", { class: "btn primary", type: "button", onclick: async () => {
+      save.disabled = true;
+      try {
+        await api("/api/profile", { method: "PUT", body: { name: name.value, call_me: call.value, work: work.value, instructions: instr.value } });
+        S.me = await api("/api/me"); renderMe();
+        saved.textContent = "Сохранено"; setTimeout(() => (saved.textContent = ""), 1800);
+      } catch (e) { alert(e.message); } finally { save.disabled = false; }
+    } }, "Сохранить");
+    body.append(
+      group("Профиль", null,
+        h("div", { class: "two" }, fieldRow("Полное имя", name), fieldRow("Как к вам обращаться", call)),
+        fieldRow("Чем вы занимаетесь", work, "Агент учитывает это, чтобы отвечать по делу"),
+        fieldRow("Пожелания к ответам", instr, "Учитываются в каждом разговоре"),
+        h("div", { class: "save-bar" }, saved, save)),
+      group("Внешний вид", null,
+        h("div", { class: "field-row" }, h("label", {}, "Тема"), themeCards()),
+        h("div", { class: "field-row" }, h("label", {}, "Размер текста в чате"),
+          segmented([["small", "Мельче"], ["normal", "Обычный"], ["large", "Крупнее"]], prefs.size, v => { store.set("agent_text_size", v); applyPrefs(); }))),
+      group("Ввод", null,
+        h("div", { class: "field-row" }, h("label", {}, "Отправка сообщения"),
+          segmented([["enter", "Enter"], ["ctrl", "Ctrl + Enter"]], prefs.send, v => { store.set("agent_send_key", v); applyPrefs(); }),
+          h("div", { class: "help" }, "Ctrl + Enter удобнее, если часто пишете в несколько строк"))));
+  },
+  memory: (b) => panels.memory(b),
+  tools: (b) => panels.tools(b),
+  schedules: (b) => panels.schedules(b),
+  usage: (b) => panels.usage(b),
+  async plan(body) {
+    const p = await api("/api/plan");
+    const spent = p.usage?.cost || 0;
+    const limit = p.limit_usd;
+    const pct = limit ? Math.min(100, (spent / limit) * 100) : 0;
+    const month = new Date(p.period_start * 1000).toLocaleDateString("ru-RU", { month: "long" });
+    body.append(
+      h("div", { class: "plan-card" },
+        h("div", { class: "muted", style: "font-size:12px" }, "Текущий тариф"),
+        h("div", { class: "plan-name" }, p.name),
+        p.renews_at ? h("div", { class: "muted" }, "Продлится " + new Date(p.renews_at * 1000).toLocaleDateString("ru-RU")) : null,
+        p.features?.length ? h("ul", {}, p.features.map(f => h("li", {}, f))) : null,
+        p.manage_url ? h("div", {}, h("a", { class: "btn primary", href: p.manage_url, target: "_blank", rel: "noopener" }, "Управлять подпиской")) : null),
+      group(`Расход за ${month}`, null,
+        h("div", { style: "display:flex;justify-content:space-between;font-size:13px" }, h("span", {}, `$${spent.toFixed(2)}`),
+          h("span", { class: "muted" }, limit ? `из $${Number(limit).toFixed(2)}` : "без лимита")),
+        limit ? h("div", { class: "meter" + (pct >= 100 ? " over" : pct >= 80 ? " warn" : "") }, h("i", { style: `width:${pct}%` })) : null,
+        h("div", { class: "muted", style: "font-size:12.5px" }, `${p.usage?.runs || 0} ${plural(p.usage?.runs || 0, "запуск", "запуска", "запусков")} агента`)));
+  },
+  async account(body) {
+    const sessions = S.sessions.length;
+    body.append(
+      group("Аккаунт", null, h("dl", { class: "kv" },
+        h("dt", {}, "Имя"), h("dd", {}, S.me.name),
+        h("dt", {}, "Идентификатор"), h("dd", {}, h("code", {}, S.me.id)),
+        h("dt", {}, "Роли"), h("dd", {}, S.me.roles?.length ? S.me.roles.join(", ") : "—"))),
+      group("Сеанс", null, h("div", { class: "save-bar", style: "justify-content:flex-start" },
+        h("button", { class: "btn", type: "button", onclick: logout }, icon("logout"), "Выйти на этом устройстве"))),
+      group("Опасная зона", null, h("div", { class: "danger-zone" },
+        h("div", {}, h("b", {}, "Удалить все разговоры"), h("p", {}, `${sessions} ${plural(sessions, "разговор", "разговора", "разговоров")} вместе с файлами. Память и настройки останутся.`)),
+        h("button", { class: "btn danger", type: "button", onclick: async () => {
+          if (!confirm("Удалить все разговоры без возможности восстановления?")) return;
+          for (const x of S.sessions) { try { await api(`/api/sessions/${x.id}`, { method: "DELETE" }); } catch { /* идёт прогон — пропускаем */ } }
+          newChat(); await loadSessions(); openSettings("account");
+        } }, "Удалить"))));
+  },
+};
+const TAB_TITLES = { general: "Общие", memory: "Память", tools: "Инструменты", schedules: "Расписание", usage: "Расход", plan: "Подписка", account: "Аккаунт" };
+
+function themeCards() {
+  const cur = store.get("agent_theme") || "auto";
+  const el = h("div", { class: "choice-cards" });
+  for (const [v, label] of [["auto", "Как в системе"], ["light", "Светлая"], ["dark", "Тёмная"]]) {
+    el.append(h("button", { type: "button", class: "choice-card" + (v === cur ? " on" : ""), onclick: () => {
+      store.set("agent_theme", v); applyTheme(v); el.querySelectorAll(".choice-card").forEach(c => c.classList.toggle("on", c.dataset.v === v));
+    }, "data-v": v }, h("div", { class: "preview pv-" + v }), h("span", {}, label)));
+  }
+  return el;
+}
+
+let lastFocus = null;
+async function openSettings(tab = "general") {
+  closeMenus(); toggleSidebar(false);
+  if ($("#settings").hidden) lastFocus = document.activeElement;
+  $("#settings").hidden = false;
+  for (const b of document.querySelectorAll("#settings-nav [data-tab]")) b.classList.toggle("on", b.dataset.tab === tab);
+  $("#tab-title").textContent = TAB_TITLES[tab];
+  const body = $("#tab-body");
+  if (body.dataset.tab !== tab) body.replaceChildren(h("p", { class: "muted" }, "Загрузка…"));
+  body.dataset.tab = tab;
+  const fresh = h("div", { style: "display:contents" });
+  try { await tabs[tab](fresh); body.replaceChildren(...fresh.childNodes); } catch (e) { body.replaceChildren(h("p", { class: "error-text" }, e.message)); }
+  $("#settings .modal-card").focus({ preventScroll: true });
+}
+function closeSettings() { $("#settings").hidden = true; lastFocus?.focus?.(); }
+const openPanel = openSettings; // совместимость с кодом панелей
 
 // ── тема ────────────────────────────────────────────────────────────
-const THEMES = ["auto", "light", "dark"];
-const THEME_NAMES = { auto: "Тема: как в системе", light: "Тема: светлая", dark: "Тема: тёмная" };
 function applyTheme(t) {
   if (t === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
-  $("#theme").replaceChildren(icon(t === "light" ? "sun" : t === "dark" ? "moon" : "auto"));
-  $("#theme").title = THEME_NAMES[t];
+  for (const b of document.querySelectorAll("[data-theme-set]")) b.classList.toggle("on", b.dataset.themeSet === t);
 }
 
 // ── старт ───────────────────────────────────────────────────────────
 function autosize() { const t = $("#input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, innerHeight * 0.4) + "px"; updateSend(); }
-function logout() { store.set("agent_token", null); S.token = null; $("#app").hidden = true; $("#login").hidden = false; }
+function logout() { store.set("agent_token", null); S.token = null; closeSettings(); closeMenus(); $("#app").hidden = true; $("#login").hidden = false; }
 function toggleSidebar(open) { $("#sidebar").classList.toggle("open", open); $("#scrim").hidden = !open; }
 function newChat() { S.sessionId = null; history.replaceState(null, "", "#"); resetView(); $("#chat-title").textContent = "Новый разговор"; renderSessions(); toggleSidebar(false); $("#input").focus(); }
+function renderMe() {
+  $("#me-name").textContent = S.me.name;
+  $("#me-avatar").textContent = (S.me.name || "?").trim().charAt(0).toUpperCase();
+  $("#menu-id").textContent = S.me.id;
+}
 
 async function boot() {
   applyTheme(store.get("agent_theme") || "auto");
+  applyPrefs();
   if (!S.token) { $("#login").hidden = false; return; }
   try { S.config = await api("/api/config"); } catch { return; }
   S.me = await api("/api/me");
@@ -732,8 +900,9 @@ async function boot() {
   document.title = name;
   $("#app-name").textContent = name; $("#login-title").textContent = name;
   for (const el of document.querySelectorAll(".logo-mark")) el.textContent = name.trim().charAt(0).toUpperCase();
-  $("#me-name").textContent = S.me.name;
-  $("#me-avatar").textContent = (S.me.name || "?").trim().charAt(0).toUpperCase();
+  renderMe();
+  api("/api/plan").then(p => { $("#me-plan").textContent = p.name; $("#menu-plan").textContent = p.name; }).catch(() => {});
+  if (S.config.help_url) { $("#menu-help").href = S.config.help_url; $("#menu-help").hidden = false; }
   $("#model").replaceChildren(...S.config.models.map(m => h("option", { value: m }, m.replace(/^[^:]+:/, "").replace(/^[^/]+\//, ""))));
   $("#model").value = S.config.default_model;
   const modeNames = { default: "Спрашивать", accept_edits: "Правки без вопросов", plan: "Только план", readonly: "Только чтение", auto: "Авто", bypass: "Без вопросов" };
@@ -755,26 +924,37 @@ $("#login-form").addEventListener("submit", async e => {
   try { await api("/api/me"); boot(); } catch { $("#login-error").textContent = "Токен не подошёл"; logout(); }
 });
 $("#composer").addEventListener("submit", e => { e.preventDefault(); send(); });
-$("#input").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
+$("#input").addEventListener("keydown", e => {
+  if (e.key !== "Enter" || e.isComposing) return;
+  const ctrl = e.ctrlKey || e.metaKey;
+  if (prefs.send === "ctrl" ? ctrl : !e.shiftKey && !ctrl) { e.preventDefault(); send(); }
+});
 $("#input").addEventListener("input", autosize);
 $("#stop").addEventListener("click", () => S.sessionId && api(`/api/sessions/${S.sessionId}/cancel`, { method: "POST" }));
 $("#new-chat").addEventListener("click", newChat);
 $("#logout").addEventListener("click", logout);
-$("#theme").addEventListener("click", () => {
-  const next = THEMES[(THEMES.indexOf(store.get("agent_theme") || "auto") + 1) % THEMES.length];
-  store.set("agent_theme", next); applyTheme(next);
-});
+$("#user-btn").addEventListener("click", e => { e.stopPropagation(); toggleUserMenu(); });
+document.querySelectorAll("[data-settings]").forEach(b => b.addEventListener("click", () => openSettings(b.dataset.settings)));
+document.querySelectorAll("[data-theme-set]").forEach(b => b.addEventListener("click", e => {
+  e.stopPropagation(); store.set("agent_theme", b.dataset.themeSet); applyTheme(b.dataset.themeSet);
+}));
+document.querySelectorAll("#settings-nav [data-tab]").forEach(b => b.addEventListener("click", () => openSettings(b.dataset.tab)));
+$("#settings-close").addEventListener("click", closeSettings);
+$("#settings").addEventListener("mousedown", e => { if (e.target.id === "settings") closeSettings(); });
+document.addEventListener("click", e => { if (!e.target.closest(".menu, #user-btn, .more")) closeMenus(); });
 $("#menu").addEventListener("click", () => toggleSidebar(true));
 $("#scrim").addEventListener("click", () => toggleSidebar(false));
 $("#session-filter").addEventListener("input", renderSessions);
 $("#toggle-tasks").addEventListener("click", () => ($("#tasks").hidden = !$("#tasks").hidden));
-$("#panel-close").addEventListener("click", closePanel);
-$("#panel").addEventListener("click", e => { if (e.target.id === "panel") closePanel(); });
-document.querySelectorAll("[data-panel]").forEach(b => b.addEventListener("click", () => { toggleSidebar(false); openPanel(b.dataset.panel); }));
 for (const id of ["model", "mode"]) $("#" + id).addEventListener("change", () => S.sessionId && api(`/api/sessions/${S.sessionId}`, { method: "PATCH", body: { [id]: $("#" + id).value } }));
 document.addEventListener("keydown", e => {
-  if (e.key === "Escape") { if (!$("#panel").hidden) closePanel(); else toggleSidebar(false); }
+  if (e.key === "Escape") {
+    if (!$("#user-menu").hidden || !$("#popover").hidden) closeMenus();
+    else if (!$("#settings").hidden) closeSettings();
+    else toggleSidebar(false);
+  }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); newChat(); }
+  if ((e.ctrlKey || e.metaKey) && e.key === ",") { e.preventDefault(); openSettings("general"); }
 });
 
 async function mcpConnect(name) {
@@ -787,7 +967,7 @@ async function mcpConnect(name) {
 }
 window.addEventListener("message", e => {
   if (e.data?.type !== "agentkit-oauth") return;
-  if (!$("#panel").hidden) openPanel("tools");
+  if (!$("#settings").hidden && $("#tab-body").dataset.tab === "tools") openSettings("tools");
   if (e.data.ok) note(`Подключено: ${e.data.text}`); else alertMsg(`Не удалось подключить: ${e.data.text}`);
 });
 

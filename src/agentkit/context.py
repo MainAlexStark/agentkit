@@ -58,6 +58,8 @@ class PromptParts:
     memory: list[str] = field(default_factory=list)
     user_name: str = ""
     user_roles: list[str] = field(default_factory=list)
+    # Профиль из настроек пользователя: как обращаться, чем занимается, как отвечать.
+    profile: dict[str, str] = field(default_factory=dict)
     mode: str = "default"
     tz: str = "Europe/Moscow"
     extra: list[str] = field(default_factory=list)  # контекст от хуков session_start
@@ -90,6 +92,12 @@ def build_system_prompt(p: PromptParts) -> str:
         env.append(f"Пользователь: {p.user_name or '—'}" + (f", роли: {', '.join(p.user_roles)}" if p.user_roles else ""))
     env.append("Права: " + MODE_TEXT.get(p.mode, p.mode))
     out.append("# Окружение\n" + "\n".join(env))
+    prof = p.profile or {}
+    about = [f"Обращаться: {prof['call_me']}" if prof.get("call_me") else "",
+             f"Чем занимается: {prof['work']}" if prof.get("work") else "",
+             f"Пожелания к ответам (заданы пользователем в настройках):\n{prof['instructions']}" if prof.get("instructions") else ""]
+    if any(about):
+        out.append("# О пользователе\n" + "\n".join(a for a in about if a))
     if p.memory:
         out.append("# Память\nТо, что просили запомнить раньше:\n" + "\n".join(f"- {m}" for m in p.memory))
     out.extend(p.extra)

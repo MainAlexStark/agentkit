@@ -368,6 +368,7 @@ class Agent:
             memory=[f"[{m.id}] {m.text}" for m in mem],
             user_name=user.name,
             user_roles=user.roles,
+            profile=await self.store.kv_get("profile", user.id) or {},
             mode=str(mode),
             tz=self.config.tz,
             include_core_rules=self.spec.include_core_rules,

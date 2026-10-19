@@ -44,4 +44,5 @@ def build_domain(settings: Settings) -> Domain:
             "Сделай еженедельный обзор заметок",
             "Найди похожие заметки и предложи, что объединить",
         ],
+        # plan=lambda user, usage: {"name": "Бизнес", "limit_usd": 50, "features": ["…"], "manage_url": "…"},
     )
