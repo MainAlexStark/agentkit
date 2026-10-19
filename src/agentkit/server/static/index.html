@@ -3,89 +3,116 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
 <title>Агент</title>
+<script>
+  // Тема до первой отрисовки — иначе тёмная тема мигает светлой при загрузке.
+  try { const t = localStorage.getItem("agent_theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch {}
+</script>
 <link rel="stylesheet" href="/static/app.css">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%23007aff'/><circle cx='11' cy='14' r='2.5' fill='white'/><circle cx='21' cy='14' r='2.5' fill='white'/></svg>">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%23111'/><path d='M9 21l7-11 7 11' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+  <symbol id="i-memory" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0-6 6c0 2.2 1.2 3.6 2.2 4.6.6.6.8 1.2.8 1.9V17h6v-1.5c0-.7.2-1.3.8-1.9 1-1 2.2-2.4 2.2-4.6a6 6 0 0 0-6-6zM9.5 20.5h5"/></symbol>
+  <symbol id="i-tools" viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.2L4 16.8V20h3.2l5.3-5.3a4 4 0 0 0 5.2-5.4l-2.4 2.4-2.3-.6-.6-2.3z"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 20h16M7 16v-4M12 16V8M17 16v-7"/></symbol>
+  <symbol id="i-tasks" viewBox="0 0 24 24"><path d="M10 6h10M10 12h10M10 18h10M4 6l1.2 1.2L7.5 5M4 12l1.2 1.2 2.3-2.2M4 18l1.2 1.2 2.3-2.2"/></symbol>
+  <symbol id="i-clip" viewBox="0 0 24 24"><path d="M20 11.5l-8.2 8.2a5 5 0 0 1-7.1-7.1l8.2-8.2a3.3 3.3 0 0 1 4.7 4.7l-8.2 8.2a1.7 1.7 0 0 1-2.4-2.4l7.6-7.6"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M4.6 4.6 6 6M18 18l1.4 1.4M2.5 12h2M19.5 12h2M4.6 19.4 6 18M18 6l1.4-1.4"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></symbol>
+  <symbol id="i-auto" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17A8.5 8.5 0 0 0 12 3.5z" fill="currentColor"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 6v12M15 6v12"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v5.5c0 4.4-3 8-7 9.5-4-1.5-7-5.1-7-9.5V6z"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8zM14 3v5h5"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/></symbol>
+  <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 14 4 9l5-5M4 9h10a6 6 0 0 1 0 12h-3"/></symbol>
+  <symbol id="i-logout" viewBox="0 0 24 24"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l5-5-5-5M15 12H4"/></symbol>
+</svg>
+
 <div id="login" class="login" hidden>
   <form id="login-form" class="login-card">
+    <div class="logo-mark" aria-hidden="true"></div>
     <h1 id="login-title">Агент</h1>
-    <p class="muted">Введите токен доступа</p>
+    <p class="muted">Войдите по токену доступа</p>
     <input id="token-input" type="password" autocomplete="current-password" placeholder="Токен" required>
-    <button class="btn primary" type="submit">Войти</button>
-    <p id="login-error" class="error-text"></p>
+    <button class="btn primary block" type="submit">Войти</button>
+    <p id="login-error" class="error-text" role="alert"></p>
   </form>
 </div>
 
 <div id="app" class="app" hidden>
   <aside id="sidebar" class="sidebar">
     <div class="side-head">
-      <span id="app-name" class="app-name">Агент</span>
-      <button id="new-chat" class="icon-btn" title="Новый разговор" aria-label="Новый разговор">
-        <svg viewBox="0 0 24 24" width="20" height="20"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-      </button>
+      <div class="brand"><span class="logo-mark sm" aria-hidden="true"></span><span id="app-name">Агент</span></div>
+      <button id="new-chat" class="icon-btn" title="Новый разговор (Ctrl+K)" aria-label="Новый разговор"><svg><use href="#i-plus"/></svg></button>
     </div>
-    <nav id="sessions" class="sessions"></nav>
-    <div class="side-foot">
-      <button class="link-btn" data-panel="memory">Память</button>
-      <button class="link-btn" data-panel="tools">Инструменты</button>
-      <button class="link-btn" data-panel="schedules">Расписание</button>
-      <button class="link-btn" data-panel="usage">Расход</button>
-      <div class="me"><span id="me-name"></span><button id="logout" class="link-btn small">выйти</button></div>
+    <label class="search"><svg><use href="#i-search"/></svg><input id="session-filter" placeholder="Поиск по разговорам"></label>
+    <nav id="sessions" class="sessions" aria-label="Разговоры"></nav>
+    <div class="side-nav">
+      <button class="nav-item" data-panel="memory"><svg><use href="#i-memory"/></svg>Память</button>
+      <button class="nav-item" data-panel="tools"><svg><use href="#i-tools"/></svg>Инструменты</button>
+      <button class="nav-item" data-panel="schedules"><svg><use href="#i-clock"/></svg>Расписание</button>
+      <button class="nav-item" data-panel="usage"><svg><use href="#i-chart"/></svg>Расход</button>
+    </div>
+    <div class="me">
+      <span class="avatar" id="me-avatar"></span>
+      <span id="me-name" class="me-name"></span>
+      <button id="theme" class="icon-btn" title="Тема" aria-label="Тема"><svg><use href="#i-auto"/></svg></button>
+      <button id="logout" class="icon-btn" title="Выйти" aria-label="Выйти"><svg><use href="#i-logout"/></svg></button>
     </div>
   </aside>
+  <div id="scrim" class="scrim" hidden></div>
 
   <main class="main">
     <header class="top">
-      <button id="menu" class="icon-btn only-mobile" aria-label="Меню">
-        <svg viewBox="0 0 24 24" width="20" height="20"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-      </button>
+      <button id="menu" class="icon-btn only-mobile" aria-label="Меню"><svg><use href="#i-menu"/></svg></button>
       <h2 id="chat-title" class="chat-title">Новый разговор</h2>
       <div class="controls">
-        <select id="model" title="Модель"></select>
-        <select id="mode" title="Права">
-        </select>
-        <span id="cost" class="cost" title="Расход разговора"></span>
-        <button id="toggle-tasks" class="icon-btn" title="Задачи" aria-label="Задачи">
-          <svg viewBox="0 0 24 24" width="20" height="20"><path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
+        <span id="cost" class="cost" title="Стоимость разговора"></span>
+        <button id="toggle-tasks" class="icon-btn" title="Задачи агента" aria-label="Задачи"><svg><use href="#i-tasks"/></svg><span id="tasks-count" class="count" hidden></span></button>
       </div>
     </header>
 
-    <section id="messages" class="messages" aria-live="polite">
-      <div class="empty" id="empty">
-        <h3>Чем помочь?</h3>
-        <p class="muted">Агент сам вызывает инструменты. Изменения — через карточку подтверждения.</p>
-      </div>
-    </section>
+    <section id="messages" class="messages" aria-live="polite"></section>
 
-    <div id="attachments" class="attachments" hidden></div>
-    <form id="composer" class="composer">
-      <input id="file" type="file" multiple hidden>
-      <button id="attach" class="icon-btn attach" type="button" title="Прикрепить файл или картинку (можно перетащить или вставить)" aria-label="Прикрепить">
-        <svg viewBox="0 0 24 24" width="20" height="20"><path d="M21 11.5l-8.6 8.6a5 5 0 01-7.1-7.1l8.6-8.6a3.3 3.3 0 014.7 4.7l-8.6 8.6a1.7 1.7 0 01-2.4-2.4l7.9-7.9" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      </button>
-      <textarea id="input" rows="1" placeholder="Сообщение…" title="Enter — отправить, Shift+Enter — новая строка"></textarea>
-      <button id="send" class="send" type="submit" aria-label="Отправить">
-        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 19V5M5 12l7-7 7 7" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      </button>
-      <button id="stop" class="send stop" type="button" aria-label="Остановить" hidden>
-        <svg viewBox="0 0 24 24" width="14" height="14"><rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor"/></svg>
-      </button>
-    </form>
+    <div class="composer-wrap">
+      <form id="composer" class="composer">
+        <div id="attachments" class="attachments" hidden></div>
+        <textarea id="input" rows="1" placeholder="Сообщение…" aria-label="Сообщение"></textarea>
+        <div class="composer-bar">
+          <input id="file" type="file" multiple hidden>
+          <button id="attach" class="icon-btn" type="button" title="Прикрепить файл — можно перетащить или вставить из буфера" aria-label="Прикрепить"><svg><use href="#i-clip"/></svg></button>
+          <label class="select" title="Модель"><select id="model" aria-label="Модель"></select></label>
+          <label class="select" title="Права агента"><svg class="lead"><use href="#i-shield"/></svg><select id="mode" aria-label="Права агента"></select></label>
+          <span id="hint" class="hint">Enter — отправить · Shift+Enter — перенос</span>
+          <button id="stop" class="send stop" type="button" title="Остановить" aria-label="Остановить" hidden><svg><use href="#i-stop"/></svg></button>
+          <button id="send" class="send" type="submit" title="Отправить" aria-label="Отправить"><svg><use href="#i-send"/></svg></button>
+        </div>
+      </form>
+    </div>
   </main>
 
   <aside id="tasks" class="tasks" hidden>
-    <h4>Задачи</h4>
-    <ol id="todo-list" class="todo-list"><li class="muted">Пока нет</li></ol>
+    <div class="tasks-head"><h4>Задачи</h4><span id="tasks-progress" class="muted"></span></div>
+    <div class="progress"><i id="tasks-bar"></i></div>
+    <ol id="todo-list" class="todo-list"></ol>
   </aside>
 </div>
 
-<div id="panel" class="panel" hidden>
-  <div class="panel-card">
-    <div class="panel-head"><h3 id="panel-title"></h3><button id="panel-close" class="icon-btn" aria-label="Закрыть">✕</button></div>
-    <div id="panel-body" class="panel-body"></div>
+<div id="panel" class="drawer" hidden>
+  <div class="drawer-card" role="dialog" aria-modal="true" aria-labelledby="panel-title">
+    <div class="drawer-head"><h3 id="panel-title"></h3><button id="panel-close" class="icon-btn" aria-label="Закрыть"><svg><use href="#i-x"/></svg></button></div>
+    <div id="panel-body" class="drawer-body"></div>
   </div>
 </div>
 

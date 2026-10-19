@@ -37,4 +37,11 @@ def build_domain(settings: Settings) -> Domain:
         subagents=dict(DEFAULT_SUBAGENTS),
         rules=rules,
         deps={"notes_path": str(settings.data_dir / "notes.json")},
+        description="Находит, записывает и приводит в порядок ваши заметки.",
+        suggestions=[
+            "Что у меня в заметках про воду?",
+            "Запиши: позвонить метрологу в пятницу",
+            "Сделай еженедельный обзор заметок",
+            "Найди похожие заметки и предложи, что объединить",
+        ],
     )

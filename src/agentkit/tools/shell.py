@@ -18,7 +18,7 @@ from agentkit.tools.base import Tool, ToolContext, ToolDenied, ToolResult, tool
 
 
 def shell_tool(*, timeout: float = 120.0, env: dict[str, str] | None = None) -> Tool:
-    @tool(group="shell", destructive=True, timeout=timeout + 5, source="builtin",
+    @tool(title="Команда", group="shell", destructive=True, timeout=timeout + 5, source="builtin",
           describe=lambda a: [["Команда", a["command"]]])
     async def shell(
         ctx: ToolContext,

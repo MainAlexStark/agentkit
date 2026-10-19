@@ -117,7 +117,10 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         s = svc.settings
         return {"name": s.name, "models": s.model_list(), "default_model": s.model_main,
                 "modes": [m.value for m in Mode if m != Mode.BYPASS or user.has_role("admin")],
-                "default_mode": s.default_mode, "is_admin": user.has_role("admin")}
+                "default_mode": s.default_mode, "is_admin": user.has_role("admin"),
+                "description": svc.domain.description or s.description,
+                "suggestions": svc.domain.suggestions or [x.strip() for x in s.suggestions.split("|") if x.strip()],
+                "titles": {t.name: t.title for t in svc.registry.all() if t.title}}
 
     # ── сессии ───────────────────────────────────────────────────────
     @api.get("/sessions")
@@ -140,7 +143,8 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         return {
             "id": s.id, "title": s.title, "state": s.state,
             "messages": [{"seq": seq, **m.to_dict()} for seq, m in msgs],
-            "approvals": [a.__dict__ for a in pending],
+            "approvals": [{**a.__dict__, "destructive": bool((t := svc.registry.get(a.tool_name)) and t.destructive),
+                           "title": t.title if t else ""} for a in pending],
             "running_run": await svc.runs.active_run(session_id),
             "queued": await svc.store.inbox_count(session_id),
             "last_seq": await svc.store.last_event_seq(session_id),
@@ -281,7 +285,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
     @api.get("/tools")
     async def tools(user: User = Depends(auth)):
         return {
-            "tools": [{"name": t.name, "description": t.description.split("\n")[0], "read_only": t.read_only,
+            "tools": [{"name": t.name, "title": t.title, "description": t.description.split("\n")[0], "read_only": t.read_only,
                        "destructive": t.destructive, "deferred": t.deferred, "group": t.group, "source": t.source}
                       for t in svc.registry.all()],
             "mcp": [{"name": s.name, "ok": s.ok, "tools": s.tools, "error": s.error, "needs_auth": s.needs_auth,

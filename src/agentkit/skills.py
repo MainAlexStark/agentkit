@@ -64,7 +64,7 @@ class SkillLibrary:
     def tool(self) -> Tool:
         lib = self
 
-        @tool(read_only=True, group="core", source="builtin")
+        @tool(title="Инструкция", read_only=True, group="core", source="builtin")
         async def skill(
             ctx: ToolContext,
             name: Annotated[str, "Имя skill'а из списка в системном промпте"],

@@ -525,7 +525,9 @@ class Agent:
 
     async def _one(self, session_id, user, run_id, emit, call: ToolCall, perms: Permissions, seq: int,
                    seen: dict[str, int]) -> tuple[str, str | None]:
-        await emit(Event(EventType.TOOL_CALL, {"id": call.id, "name": call.name, "args": call.arguments}))
+        t0 = self.tools.get(call.name)
+        await emit(Event(EventType.TOOL_CALL, {"id": call.id, "name": call.name, "args": call.arguments,
+                                               "title": t0.title if t0 else ""}))
         tool = self.tools.get(call.name)
 
         async def done(result: ToolResult) -> tuple[str, str | None]:
@@ -623,10 +625,11 @@ class Agent:
 
     async def _record_result(self, session_id, run_id, emit, call_id: str, name: str, result: ToolResult) -> None:
         await self.store.append_message(session_id, Message.tool(call_id, name, result.content,
-                                                                 is_error=result.is_error, ui=result.ui), run_id)
+                                                                 is_error=result.is_error, ui=result.ui,
+                                                                 elapsed_ms=result.elapsed_ms), run_id)
         await emit(Event(EventType.TOOL_RESULT, {
             "id": call_id, "name": name, "content": result.content[:4000], "is_error": result.is_error,
-            "data": _jsonable(result.data), "ui": result.ui}))
+            "data": _jsonable(result.data), "ui": result.ui, "elapsed_ms": result.elapsed_ms}))
 
     async def _expire_pending(self, session_id, emit, run_id, why: str) -> None:
         for rec in await self.store.list_approvals(session_id, status="pending"):

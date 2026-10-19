@@ -373,6 +373,7 @@ class MCPManager:
         schema.setdefault("properties", {})
         desc = spec.get("description") or spec.get("title") or remote
         return Tool(
+            title=spec.get("title") or ann.get("title") or "",
             name=mcp_tool_name(cfg.name, remote),
             description=f"[{cfg.name}] {desc}",
             parameters=schema,

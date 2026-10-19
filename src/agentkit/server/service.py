@@ -67,6 +67,9 @@ class Domain:
     rules: Callable[[User], str] | str = ""
     deps: dict[str, Any] = field(default_factory=dict)
     memory_global_roles: tuple[str, ...] = ("admin",)
+    # Пустой экран чата: что умеет агент и примеры запросов (кнопками).
+    description: str = ""
+    suggestions: list[str] = field(default_factory=list)
     # Вызывается после старта: подключить БД хоста, прогреть кэш и т. п.
     on_start: Callable[[AgentService], Any] | None = None
 

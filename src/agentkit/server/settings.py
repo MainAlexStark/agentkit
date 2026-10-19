@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AGENT_", env_file=".env", extra="ignore")
 
     name: str = "Агент"
+    description: str = ""  # одна строка под приветствием на пустом экране
+    suggestions: str = ""  # примеры запросов на пустом экране, через «|»
     public_url: str = "http://localhost:8080"
     host: str = "0.0.0.0"
     port: int = 8080

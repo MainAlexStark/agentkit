@@ -52,7 +52,7 @@ def html_to_text(src: str) -> str:
 
 
 def web_fetch_tool(*, allow_private: bool = False, max_chars: int = 60_000) -> Tool:
-    @tool(read_only=True, group="web", timeout=60, source="builtin")
+    @tool(title="Чтение страницы", read_only=True, group="web", timeout=60, source="builtin")
     async def web_fetch(
         ctx: ToolContext,
         url: Annotated[str, "Адрес http(s)"],
@@ -102,7 +102,7 @@ class TavilySearch:
 
 
 def web_search_tool(provider: SearchProvider) -> Tool:
-    @tool(read_only=True, group="web", timeout=60, source="builtin")
+    @tool(title="Поиск в интернете", read_only=True, group="web", timeout=60, source="builtin")
     async def web_search(
         ctx: ToolContext,
         query: Annotated[str, "Поисковый запрос"],

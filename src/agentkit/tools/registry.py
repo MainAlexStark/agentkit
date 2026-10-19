@@ -94,7 +94,7 @@ LOADED_KEY = "loaded_tools"
 
 
 def make_tool_search(registry_getter) -> Tool:
-    @tool(read_only=True, group="core", source="builtin")
+    @tool(title="Подключение инструментов", read_only=True, group="core", source="builtin")
     async def tool_search(
         ctx: ToolContext,
         query: Annotated[str, "Слова для поиска или select:имя1,имя2 для точного выбора"],

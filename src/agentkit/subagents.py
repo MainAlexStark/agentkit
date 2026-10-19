@@ -52,7 +52,7 @@ DEFAULT_SUBAGENTS = {s.name: s for s in (EXPLORE, PLAN, GENERAL)}
 def task_tool(specs: dict[str, AgentSpec]) -> Tool:
     names = list(specs)
 
-    @tool(read_only=True, concurrency_safe=True, timeout=1800, group="core", source="builtin")
+    @tool(title="Субагент", read_only=True, concurrency_safe=True, timeout=1800, group="core", source="builtin")
     async def task(
         ctx: ToolContext,
         agent_type: Annotated[str, "Тип субагента из описания инструмента"],

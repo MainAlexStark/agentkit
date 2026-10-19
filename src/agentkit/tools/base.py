@@ -93,6 +93,7 @@ class Tool:
     # Pydantic-модель аргументов, если инструмент собран декоратором.
     args_model: type[BaseModel] | None = None
     source: str = "builtin"  # builtin | domain | mcp | skill
+    title: str = ""  # человеческое название для интерфейса: «Поиск заметок» вместо notes_search
 
     @property
     def parallel_ok(self) -> bool:
@@ -174,6 +175,7 @@ def tool(
     group: str = "",
     describe: Callable[[dict[str, Any]], list[list[str]]] | None = None,
     source: str = "domain",
+    title: str = "",
 ) -> Any:
     """Собирает Tool из функции `async def f(ctx, a: int, b: Annotated[str, "описание"] = "")`.
 
@@ -218,6 +220,7 @@ def tool(
             describe=describe,
             args_model=model,
             source=source,
+            title=title,
         )
 
     return wrap(fn) if fn is not None else wrap

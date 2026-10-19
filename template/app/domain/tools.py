@@ -5,6 +5,7 @@ MCP-клиент своего сервера). Правила хорошего �
 
 * docstring пишется для модели: что делает и КОГДА пригодится;
 * описания аргументов — в Annotated[тип, "описание"];
+* title= — как действие назовёт интерфейс («Поиск заметок»), иначе покажется имя функции;
 * читающий инструмент — read_only=True (вызывается без вопросов, параллельно);
 * пишущий — без read_only: в режиме default пойдёт через карточку подтверждения;
   describe= задаёт, как карточка покажет действие человеку;
@@ -40,7 +41,7 @@ def _save(ctx: ToolContext, notes: list[dict]) -> None:
     p.write_text(json.dumps(notes, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
-@tool(read_only=True)
+@tool(title="Поиск заметок", read_only=True)
 async def notes_search(
     ctx: ToolContext,
     query: Annotated[str, "Слова для поиска; пусто — все заметки"] = "",
@@ -59,7 +60,7 @@ async def notes_search(
     )
 
 
-@tool(describe=lambda a: [["Новая заметка", a["text"]]])
+@tool(title="Новая заметка", describe=lambda a: [["Новая заметка", a["text"]]])
 async def notes_add(
     ctx: ToolContext,
     text: Annotated[str, "Текст заметки"],
@@ -72,7 +73,7 @@ async def notes_add(
     return f"Заметка #{nid} создана."
 
 
-@tool(destructive=True, describe=lambda a: [["Удалить заметку", f"#{a['id']}"]])
+@tool(title="Удаление заметки", destructive=True, describe=lambda a: [["Удалить заметку", f"#{a['id']}"]])
 async def notes_delete(
     ctx: ToolContext,
     id: Annotated[int, "Номер заметки"],

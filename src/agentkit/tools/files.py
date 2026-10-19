@@ -41,7 +41,7 @@ async def checkpoint(ctx: ToolContext, p: Path) -> None:
                              meta={"path": rel(ctx, p), "existed": existed, "message_seq": ctx.message_seq})
 
 
-@tool(read_only=True, group="files", source="builtin")
+@tool(title="Чтение файла", read_only=True, group="files", source="builtin")
 async def read_file(
     ctx: ToolContext,
     path: Annotated[str, "Путь от корня рабочей папки"],
@@ -62,7 +62,7 @@ async def read_file(
     return ToolResult(content=body or "(пустой файл)")
 
 
-@tool(group="files", source="builtin", describe=lambda a: [["Файл", a["path"]], ["Размер", f"{len(a['content'])} символов"]])
+@tool(title="Запись файла", group="files", source="builtin", describe=lambda a: [["Файл", a["path"]], ["Размер", f"{len(a['content'])} символов"]])
 async def write_file(
     ctx: ToolContext,
     path: Annotated[str, "Путь от корня рабочей папки"],
@@ -76,7 +76,7 @@ async def write_file(
     return ToolResult(content=f"Записан {path} ({len(content)} символов).")
 
 
-@tool(group="files", source="builtin",
+@tool(title="Правка файла", group="files", source="builtin",
       describe=lambda a: [["Файл", a["path"]], ["Было", a["old_string"][:400]], ["Станет", a["new_string"][:400]]])
 async def edit_file(
     ctx: ToolContext,
@@ -101,7 +101,7 @@ async def edit_file(
     return ToolResult(content=f"Изменён {path} ({n if replace_all else 1} замен).")
 
 
-@tool(read_only=True, group="files", source="builtin")
+@tool(title="Список файлов", read_only=True, group="files", source="builtin")
 async def glob_files(
     ctx: ToolContext,
     pattern: Annotated[str, "Шаблон, например **/*.py или docs/*.md"] = "**/*",
@@ -115,7 +115,7 @@ async def glob_files(
     return ToolResult(content="\n".join(names) + tail if names else "Ничего не найдено.")
 
 
-@tool(read_only=True, group="files", source="builtin")
+@tool(title="Поиск по файлам", read_only=True, group="files", source="builtin")
 async def grep(
     ctx: ToolContext,
     pattern: Annotated[str, "Регулярное выражение (Python re)"],

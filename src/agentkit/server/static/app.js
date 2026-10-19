@@ -10,8 +10,16 @@ const h = (tag, attrs = {}, ...kids) => {
     else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
     else if (v !== false && v != null) el.setAttribute(k, v === true ? "" : v);
   }
-  for (const kid of kids.flat()) if (kid != null) el.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
   return el;
+};
+const icon = (name, cls = "") => {
+  const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  if (cls) s.setAttribute("class", cls);
+  const u = document.createElementNS("http://www.w3.org/2000/svg", "use");
+  u.setAttribute("href", "#i-" + name);
+  s.append(u);
+  return s;
 };
 
 const store = {
@@ -22,19 +30,22 @@ const store = {
 const S = {
   token: store.get("agent_token"),
   config: null,
+  me: null,
   sessionId: null,
+  sessions: [],
   lastSeq: 0,
   stream: null,      // AbortController текущего SSE
   running: false,
-  bubble: null,      // текущий пузырь стрима
+  bubble: null,      // текущий ответ, который печатается
   bubbleText: "",
-  tools: new Map(),  // tool_call_id → элемент
-  subs: new Map(),   // id дочерней сессии → контейнер в блоке task
+  group: null,       // текущая группа действий агента
+  steps: new Map(),  // tool_call_id → шаг
+  subs: new Map(),   // id дочерней сессии → контейнер субагента
   cards: new Map(),  // approval_id → карточка
   cost: 0,
-  attachments: [],   // загруженные файлы для следующего сообщения
+  attachments: [],
   uploading: 0,
-  queued: [],        // пузыри сообщений, отправленных во время работы агента
+  queued: [],        // сообщения, отправленные во время работы агента
 };
 
 // ── API ─────────────────────────────────────────────────────────────
@@ -50,7 +61,7 @@ async function api(path, opts = {}) {
   return data;
 }
 
-// ── Markdown (минимум: заголовки, списки, таблицы, код, ссылки, жирный) ─
+// ── текст ───────────────────────────────────────────────────────────
 function esc(s) { return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 function inline(s) {
   return esc(s)
@@ -94,14 +105,36 @@ function md(src) {
   }
   return out;
 }
-
-// ── рендер ──────────────────────────────────────────────────────────
-const box = () => $("#messages");
-function scroll(force) {
-  const el = box();
-  if (force || el.scrollHeight - el.scrollTop - el.clientHeight < 160) el.scrollTop = el.scrollHeight;
+function renderMd(el, text) {
+  el.innerHTML = md(text);
+  for (const pre of el.querySelectorAll("pre")) pre.append(copyBtn(() => pre.querySelector("code")?.textContent || ""));
 }
-function add(el) { $("#empty")?.remove(); box().append(el); scroll(); return el; }
+function copyBtn(get) {
+  const b = h("button", { class: "icon-btn copy", title: "Скопировать", type: "button" }, icon("copy"));
+  b.addEventListener("click", e => {
+    e.stopPropagation();
+    navigator.clipboard?.writeText(get()).then(() => { b.replaceChildren(icon("check")); setTimeout(() => b.replaceChildren(icon("copy")), 1200); });
+  });
+  return b;
+}
+
+const plural = (n, one, few, many) => {
+  const m10 = n % 10, m100 = n % 100;
+  return m10 === 1 && m100 !== 11 ? one : m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? few : many;
+};
+const secs = ms => ms < 1000 ? `${ms} мс` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0).replace(".", ",")} с`;
+function humanSize(n) { return !n ? "" : n < 1024 ? `${n} Б` : n < 1048576 ? `${(n / 1024).toFixed(0)} КБ` : `${(n / 1048576).toFixed(1)} МБ`; }
+
+// ── лента ───────────────────────────────────────────────────────────
+const box = () => $("#messages");
+function nearBottom() { const el = box(); return el.scrollHeight - el.scrollTop - el.clientHeight < 160; }
+function scroll(force) { if (force || nearBottom()) box().scrollTop = box().scrollHeight; }
+function add(el, { keepGroup = false } = {}) {
+  $("#empty")?.remove();
+  // Любой элемент, кроме шагов, закрывает текущую группу действий.
+  if (!keepGroup) closeGroup();
+  box().append(el); scroll(); return el;
+}
 
 function splitContent(content) {
   if (typeof content === "string") return { text: content, files: [] };
@@ -111,13 +144,13 @@ function splitContent(content) {
 
 function userMsg(content, seq, { queued = false } = {}) {
   const { text, files } = splitContent(content);
-  const rewind = seq ? h("button", { class: "link-btn small", title: "Откатить разговор и файлы к моменту до этого сообщения",
-    onclick: () => doRewind(seq, text) }, "↺ изменить") : null;
-  const badge = queued ? h("span", { class: "badge queued" }, "агент прочтёт после текущего шага") : null;
+  const badge = queued ? h("span", { class: "queued-badge" }, "агент прочтёт после текущего шага") : null;
+  const rewind = seq ? h("button", { class: "btn ghost sm", title: "Откатить разговор и файлы агента к моменту до этого сообщения",
+    onclick: () => doRewind(seq, text) }, icon("undo"), "Изменить") : null;
   const el = add(h("div", { class: "msg user" + (queued ? " queued" : "") },
     files.length ? h("div", { class: "files" }, files.map(fileView)) : null,
     text ? h("div", { class: "bubble" }, text) : null,
-    h("div", { class: "tools-row" }, badge, rewind)));
+    h("div", { class: "meta" }, badge, rewind)));
   el._badge = badge;
   return el;
 }
@@ -129,9 +162,9 @@ function fileView(f) {
     img.addEventListener("click", () => blobURL(f.path).then(u => window.open(u)));
     return img;
   }
-  return h("button", { class: "file-chip", title: "Скачать", onclick: () => blobURL(f.path).then(u => {
+  return h("button", { class: "file-chip", title: "Скачать", type: "button", onclick: () => blobURL(f.path).then(u => {
     const a = h("a", { href: u, download: f.name }); document.body.append(a); a.click(); a.remove(); }) },
-    "📄 ", f.name, h("small", {}, " " + humanSize(f.size)));
+    icon("file"), h("span", {}, f.name), h("small", {}, humanSize(f.size)));
 }
 
 const blobCache = new Map();
@@ -144,101 +177,186 @@ async function blobURL(path) {
   blobCache.set(key, u);
   return u;
 }
-function humanSize(n) { return !n ? "" : n < 1024 ? `${n} Б` : n < 1048576 ? `${(n / 1024).toFixed(0)} КБ` : `${(n / 1048576).toFixed(1)} МБ`; }
 
 function assistantBubble() {
-  const b = h("div", { class: "bubble md streaming" });
+  const b = h("div", { class: "md streaming" });
   add(h("div", { class: "msg assistant" }, b));
   return b;
 }
 
-function brief(args) {
-  const s = JSON.stringify(args || {});
-  return s.length > 120 ? s.slice(0, 120) + "…" : s;
+// ── действия агента: группа шагов ───────────────────────────────────
+function toolTitle(name, title) {
+  if (title) return title;
+  if (S.config?.titles?.[name]) return S.config.titles[name];
+  if (name.startsWith("mcp__")) { const [, srv, t] = name.split("__"); return `${srv} · ${t.replace(/_/g, " ")}`; }
+  const s = name.replace(/_/g, " ");
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+const PRIMARY = ["query", "path", "file_path", "url", "command", "text", "question", "description", "name", "title", "id", "sku", "pattern"];
+function argSummary(args) {
+  if (!args || typeof args !== "object") return String(args ?? "");
+  let v = PRIMARY.map(k => args[k]).find(x => x != null && x !== "");
+  if (v == null) v = Object.values(args).find(x => typeof x === "string" || typeof x === "number");
+  if (v == null) return Object.keys(args).length ? "" : "";
+  v = String(v).replace(/\s+/g, " ");
+  return v.length > 90 ? v.slice(0, 90) + "…" : v;
 }
 
-function toolBlock(id, name, args, agent) {
-  if (S.tools.has(id)) return S.tools.get(id);
-  const state = h("span", { class: "state run" });
-  const body = h("div", { class: "body" }, h("pre", {}, JSON.stringify(args || {}, null, 2)));
-  const el = h("details", { class: "tool" },
-    h("summary", {}, state, h("span", { class: "name" }, prettyName(name)), h("span", { class: "brief" }, brief(args))), body);
-  el._state = state; el._body = body;
-  S.tools.set(id, el);
-  if (agent && S.subs.has(agent)) S.subs.get(agent).append(h("div", {}, `→ ${prettyName(name)} ${brief(args)}`));
-  else add(el);
-  return el;
+function newGroup() {
+  const head = h("button", { class: "steps-head", type: "button" }, icon("chev", "chev"), h("span", { class: "summary" }), h("span", { class: "time" }));
+  const list = h("div", { class: "steps-list" });
+  const el = h("div", { class: "steps open" }, head, list);
+  const g = { el, head, list, steps: [], userToggled: false };
+  head.addEventListener("click", () => { g.userToggled = true; el.classList.toggle("open"); });
+  add(el, { keepGroup: true });
+  return g;
 }
-function prettyName(n) { return n.startsWith("mcp__") ? n.slice(5).replace("__", " · ") : n; }
+function closeGroup() {
+  const g = S.group;
+  if (!g) return;
+  S.group = null;
+  // Готовая группа сворачивается — ход мысли виден одной строкой; ошибки и ожидание оставляют её открытой.
+  if (!g.userToggled && g.steps.every(s => s.state === "ok")) g.el.classList.remove("open");
+  updateGroup(g);
+}
+function updateGroup(g) {
+  const n = g.steps.length;
+  const running = g.steps.filter(s => s.state === "run");
+  const errs = g.steps.filter(s => s.state === "err").length;
+  const waiting = g.steps.some(s => s.state === "wait");
+  const ms = g.steps.reduce((a, s) => a + (s.ms || 0), 0);
+  const sum = g.head.querySelector(".summary");
+  sum.replaceChildren();
+  if (running.length) sum.append(h("b", {}, running.at(-1).title), "…");
+  else if (waiting) sum.append(h("b", {}, "Ждёт подтверждения"));
+  else sum.append(`${n} ${plural(n, "действие", "действия", "действий")}`);
+  if (errs) sum.append(h("span", { style: "color:var(--err)" }, ` · ${errs} ${plural(errs, "ошибка", "ошибки", "ошибок")}`));
+  if (n > 1 && running.length) sum.append(h("span", {}, ` · шаг ${n - running.length + 1} из ${n}`));
+  g.head.querySelector(".time").textContent = ms ? secs(ms) : "";
+}
 
-function toolResult(id, content, isError, ui) {
-  const el = S.tools.get(id);
-  if (!el) return;
-  el._state.className = "state " + (isError ? "err" : "ok");
-  el._state.textContent = isError ? "✕" : "✓";
-  el._body.append(h("pre", {}, content || ""));
-  for (const w of ui || []) el.after(widget(w));
+function stepRow(id, name, args, title, agent) {
+  if (S.steps.has(id)) return S.steps.get(id);
+  const st = h("span", { class: "st run" });
+  const ttl = toolTitle(name, title);
+  const time = h("span", { class: "step-time" });
+  const row = h("button", { class: "step-row", type: "button", title: name }, st, h("span", { class: "step-title" }, ttl),
+    h("span", { class: "step-args" }, argSummary(args)), time);
+  const detail = h("div", { class: "step-detail" });
+  const argText = JSON.stringify(args ?? {}, null, 2);
+  if (argText !== "{}") detail.append(h("div", {}, h("div", { class: "label" }, "Аргументы", copyBtn(() => argText)), h("pre", {}, argText)));
+  const el = h("div", { class: "step" }, row, detail);
+  row.addEventListener("click", () => el.classList.toggle("open"));
+  const step = { el, st, time, detail, title: ttl, state: "run", ms: 0, group: null };
+  S.steps.set(id, step);
+  if (agent && S.subs.has(agent)) {
+    S.subs.get(agent).append(el);
+  } else {
+    if (!S.group) S.group = newGroup();
+    step.group = S.group;
+    S.group.steps.push(step);
+    S.group.list.append(el);
+    updateGroup(S.group);
+  }
+  scroll();
+  return step;
+}
+function setStepState(step, state) {
+  step.state = state;
+  step.st.className = "st " + state;
+  step.st.replaceChildren(state === "ok" ? icon("check") : state === "err" ? icon("x") : state === "wait" ? icon("pause") : "");
+  if (step.group) {
+    updateGroup(step.group);
+    if (state === "err" || state === "wait") step.group.el.classList.add("open");
+  }
+}
+function stepResult(id, content, isError, ui, ms) {
+  const step = S.steps.get(id);
+  if (!step) return;
+  step.ms = ms || 0;
+  if (ms) step.time.textContent = secs(ms);
+  setStepState(step, isError ? "err" : "ok");
+  // Группа уже закрыта (действие подтверждали позже) — сворачиваем, когда всё прошло успешно.
+  const g = step.group;
+  if (g && g !== S.group && !g.userToggled && g.steps.every(s => s.state === "ok")) g.el.classList.remove("open");
+  step.detail.append(h("div", {}, h("div", { class: "label" }, isError ? "Ошибка" : "Результат", copyBtn(() => content || "")),
+    h("pre", { class: isError ? "err" : "" }, content || "—")));
+  for (const w of ui || []) widgetAfter(w);
+}
+function widgetAfter(w) {
+  const el = widget(w);
+  if (el) add(el, { keepGroup: true });
 }
 
 function widget(w) {
   if (w.type === "table") {
     const t = h("table", {}, h("thead", {}, h("tr", {}, (w.columns || []).map(c => h("th", {}, c)))),
       h("tbody", {}, (w.rows || []).map(r => h("tr", {}, r.map(c => h("td", {}, c ?? ""))))));
-    return h("div", { class: "msg assistant" }, h("div", { class: "bubble md" }, w.title ? h("strong", {}, w.title) : null, t));
+    return h("div", { class: "msg assistant" }, h("div", { class: "md" }, w.title ? h("h3", {}, w.title) : null, t));
   }
   if (w.type === "kv") {
-    return h("div", { class: "msg assistant" }, h("div", { class: "bubble md" },
+    return h("div", { class: "msg assistant" }, h("div", { class: "md" },
       h("table", {}, h("tbody", {}, (w.items || []).map(([k, v]) => h("tr", {}, h("td", {}, k), h("td", {}, v)))))));
   }
   if (w.type === "attachments") {
-    return h("div", { class: "msg assistant" }, (w.items || []).filter(a => a.type === "image").map(a =>
-      h("img", { src: `data:${a.mime};base64,${a.data}`, style: "max-width:100%;border-radius:10px" })));
+    const imgs = (w.items || []).filter(a => a.type === "image");
+    return imgs.length ? h("div", { class: "msg assistant" }, imgs.map(a => h("img", { class: "thumb", src: `data:${a.mime};base64,${a.data}` }))) : null;
   }
-  if (w.type === "choices") return choices(w.question, w.options || []);
-  return h("div", {});
+  if (w.type === "choices") return null; // вопрос рисуется по событию ask_user
+  return null;
 }
 
 function choices(question, options) {
-  const wrap = h("div", { class: "choices" });
+  const wrap = h("div", { class: "choices" }, question ? h("div", { class: "q" }, "Выберите вариант или ответьте своими словами") : null);
   for (const o of options) {
-    wrap.append(h("button", { class: "choice", onclick: () => { wrap.remove(); send(o.label); } },
-      o.label, o.description ? h("small", {}, o.description) : null));
+    wrap.append(h("button", { class: "choice", type: "button", onclick: () => { wrap.remove(); send(o.label); } },
+      h("span", {}, o.label), o.description ? h("small", {}, o.description) : null));
   }
   return wrap;
 }
 
 function approvalCard(a) {
   if (S.cards.has(a.approval_id)) return;
-  const comment = h("input", { placeholder: "Комментарий (необязательно)" });
-  const yes = h("button", { class: "btn primary", onclick: () => decide(a.approval_id, true, comment.value, card) }, "Подтвердить");
-  const no = h("button", { class: "btn danger", onclick: () => decide(a.approval_id, false, comment.value, card) }, "Отклонить");
+  const comment = h("input", { placeholder: "Комментарий агенту (необязательно)" });
+  const yes = h("button", { class: "btn primary", type: "button", onclick: () => decide(a.approval_id, true, comment.value, card) }, "Подтвердить");
+  const no = h("button", { class: "btn", type: "button", onclick: () => decide(a.approval_id, false, comment.value, card) }, "Отклонить");
+  comment.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); yes.click(); } });
   const rows = (a.view || []).map(([k, v]) => h("tr", {}, h("td", {}, k), h("td", {}, v)));
+  const name = a.tool || a.tool_name;
   const card = h("div", { class: "card" + (a.destructive ? " destructive" : "") },
-    h("div", { class: "title" }, "Нужно подтверждение: ", prettyName(a.tool || a.tool_name)),
-    a.reason ? h("div", { class: "muted" }, a.reason) : null,
-    h("table", {}, h("tbody", {}, rows)),
+    h("div", { class: "card-head" }, icon("shield"), a.destructive ? "Необратимое действие — подтвердите" : "Нужно подтверждение",
+      h("span", { class: "tool-name" }, "· " + toolTitle(name, a.title))),
+    a.reason ? h("div", { class: "reason" }, a.reason) : null,
+    rows.length ? h("table", {}, h("tbody", {}, rows)) : null,
     h("div", { class: "actions" }, comment, no, yes));
   S.cards.set(a.approval_id, card);
   add(card);
-  const t = S.tools.get(a.tool_call_id);
-  if (t) { t._state.className = "state wait"; t._state.textContent = "⏸"; }
+  scroll(true); // карточка требует действия — она не должна оказаться под полем ввода
+  const step = S.steps.get(a.tool_call_id);
+  if (step) setStepState(step, "wait");
 }
-
 function closeCard(id, approved, expired) {
   const c = S.cards.get(id);
   if (!c) return;
   c.classList.add("done");
-  c.querySelector(".actions")?.replaceWith(h("div", { class: "muted" }, expired ? "Не выполнено" : approved ? "Подтверждено" : "Отклонено"));
+  c.querySelector(".actions")?.replaceWith(h("div", { class: "verdict " + (expired ? "" : approved ? "ok" : "no") },
+    icon(expired ? "x" : approved ? "check" : "x"), expired ? "Не выполнено — разговор пошёл дальше" : approved ? "Подтверждено" : "Отклонено"));
 }
 
-function note(text, err) { add(h("div", { class: "note" + (err ? " err" : "") }, text)); }
+function note(text) { add(h("div", { class: "note" }, text)); }
+function alertMsg(text) { add(h("div", { class: "alert", role: "alert" }, text)); }
 
 function renderTodos(todos) {
-  const ol = $("#todo-list");
-  ol.replaceChildren(...(todos?.length ? todos.map(t => h("li", { class: t.status },
-    h("span", { class: "st" }, t.status === "completed" ? "✓" : t.status === "in_progress" ? "▸" : "○"), t.content))
-    : [h("li", { class: "muted" }, "Пока нет")]));
-  if (todos?.length) $("#tasks").hidden = false;
+  const list = todos || [];
+  const done = list.filter(t => t.status === "completed").length;
+  $("#todo-list").replaceChildren(...(list.length ? list.map(t => h("li", { class: t.status },
+    h("span", { class: "box" }, t.status === "completed" ? icon("check") : null), h("span", {}, t.content)))
+    : [h("li", { class: "muted" }, "Агент заведёт список, если задача из нескольких шагов")]));
+  $("#tasks-progress").textContent = list.length ? `${done} из ${list.length}` : "";
+  $("#tasks-bar").style.width = list.length ? `${(done / list.length) * 100}%` : "0";
+  const left = list.length - done;
+  $("#tasks-count").hidden = !left; $("#tasks-count").textContent = left;
+  if (list.length && !S.tasksShown && innerWidth > 960) { $("#tasks").hidden = false; S.tasksShown = true; }
 }
 
 function setCost(v) { S.cost = v; $("#cost").textContent = v > 0 ? `$${v.toFixed(v < 0.1 ? 4 : 2)}` : ""; }
@@ -251,7 +369,7 @@ function onEvent(ev) {
     case "run_started": setRunning(true); break;
     case "user_message": {
       const el = S.queued.shift();
-      if (el) { el.classList.remove("queued"); el._badge?.remove(); }
+      if (el) { el.classList.remove("queued"); el._badge?.remove(); closeGroup(); }
       else userMsg(d.content, d.seq);
       break;
     }
@@ -264,22 +382,20 @@ function onEvent(ev) {
       if (ev.agent) break;
       if (d.content) {
         if (!S.bubble) S.bubble = assistantBubble();
-        S.bubble.innerHTML = md(d.content);
+        renderMd(S.bubble, d.content);
       } else S.bubble?.parentElement.remove();
       S.bubble?.classList.remove("streaming");
       S.bubble = null; S.bubbleText = "";
-      for (const tc of d.tool_calls || []) toolBlock(tc.id, tc.function.name, safeJSON(tc.function.arguments));
+      for (const tc of d.tool_calls || []) stepRow(tc.id, tc.function.name, safeJSON(tc.function.arguments));
       break;
-    case "tool_call": toolBlock(d.id, d.name, d.args, ev.agent); break;
-    case "tool_result":
-      if (ev.agent && S.subs.has(ev.agent)) { if (d.is_error) S.subs.get(ev.agent).append(h("div", {}, `  ✕ ${d.content.slice(0, 160)}`)); }
-      else toolResult(d.id, d.content, d.is_error, d.ui);
-      break;
+    case "tool_call": stepRow(d.id, d.name, d.args, d.title, ev.agent); break;
+    case "tool_result": stepResult(d.id, d.content, d.is_error, ev.agent ? [] : d.ui, d.elapsed_ms); break;
     case "subagent_started": {
-      const t = S.tools.get(d.tool_call_id);
-      const sub = h("div", { class: "sub" }, h("div", {}, `субагент ${d.type}: ${d.description}`));
+      const step = S.steps.get(d.tool_call_id);
+      const sub = h("div", { class: "sub" }, h("div", { class: "sub-title" }, `${d.type}: ${d.description}`));
       S.subs.set(d.session_id, sub);
-      t?._body.append(sub); break;
+      step?.el.insertBefore(sub, step.detail);
+      break;
     }
     case "approval_required": approvalCard(d); break;
     case "approval_resolved": closeCard(d.approval_id, d.approved, d.expired); break;
@@ -287,15 +403,17 @@ function onEvent(ev) {
     case "todo": if (!ev.agent) renderTodos(d.todos); break;
     case "compacted": note("История сжата, чтобы поместиться в контекст"); break;
     case "notice": note(d.message); break;
-    case "error": note(d.message, true); break;
+    case "error": alertMsg(d.message); break;
     case "usage": setCost(S.cost + (d.cost || 0)); break;
     case "run_finished": {
       setRunning(false);
       S.bubble?.classList.remove("streaming"); S.bubble = null;
+      for (const step of S.steps.values()) if (step.state === "run") setStepState(step, "err");
+      closeGroup();
       const st = d.status;
-      if (st === "max_steps") note("Достигнут лимит шагов — напишите «продолжай», чтобы агент продолжил");
+      if (st === "max_steps") note("Достигнут лимит шагов — напишите «продолжай»");
       else if (st === "cancelled") note("Остановлено");
-      else if (st === "error" && d.error) note(d.error, true);
+      else if (st === "error" && d.error) alertMsg(d.error);
       loadSessions();
       break;
     }
@@ -333,8 +451,10 @@ function setRunning(on) {
   // Отправка доступна и во время работы: сообщение встанет в очередь, агент прочтёт его между шагами.
   S.running = on;
   $("#stop").hidden = !on;
-  $("#input").placeholder = on ? "Дописать агенту на ходу…" : "Сообщение…";
+  $("#input").placeholder = on ? "Дописать агенту, пока он работает…" : "Сообщение…";
+  updateSend();
 }
+function updateSend() { $("#send").disabled = !$("#input").value.trim() && !S.attachments.length; }
 
 // ── действия ────────────────────────────────────────────────────────
 async function ensureSession() {
@@ -357,15 +477,15 @@ async function send(text) {
   const content = files.length ? [...(text ? [{ type: "text", text }] : []), ...files] : text;
   const el = userMsg(content, null, { queued: wasRunning });
   if (wasRunning) S.queued.push(el);
+  scroll(true);
   try {
     const r = await api(`/api/sessions/${sid}/messages`, { method: "POST", body: { text, files, model: $("#model").value, mode: $("#mode").value } });
     if (!r.queued) { setRunning(true); follow(); }
     else if (!wasRunning) { S.queued.push(el); el.classList.add("queued"); setRunning(true); follow(); }
-  } catch (e) { note(e.message, true); }
+  } catch (e) { alertMsg(e.message); }
   loadSessions();
 }
 
-// ── вложения ────────────────────────────────────────────────────────
 async function attach(fileList) {
   const list = [...fileList];
   if (!list.length) return;
@@ -376,32 +496,33 @@ async function attach(fileList) {
       const fd = new FormData(); fd.append("file", f, f.name || "image.png");
       const r = await fetch(`/api/sessions/${sid}/files`, { method: "POST", headers: { Authorization: `Bearer ${S.token}` }, body: fd });
       const d = await r.json().catch(() => ({}));
-      if (!r.ok) { note(`${f.name}: ${d.detail || r.statusText}`, true); continue; }
+      if (!r.ok) { alertMsg(`${f.name}: ${d.detail || r.statusText}`); continue; }
       S.attachments.push(d);
     }
   } finally { S.uploading--; renderAttachments(); }
 }
 
 function renderAttachments() {
-  const box = $("#attachments");
-  box.replaceChildren(...S.attachments.map((a, i) => h("span", { class: "chip" }, a.kind === "image" ? "🖼 " : "📄 ", a.name,
-    a.note ? h("small", { class: "muted" }, " — " + a.note) : null,
-    h("button", { class: "chip-x", "aria-label": "Убрать", onclick: () => { S.attachments.splice(i, 1); renderAttachments(); } }, "×"))),
-    S.uploading ? h("span", { class: "chip muted" }, "загрузка…") : null);
-  box.hidden = !S.attachments.length && !S.uploading;
+  const el = $("#attachments");
+  el.replaceChildren(...S.attachments.map((a, i) => h("span", { class: "chip", title: a.note || a.name }, icon(a.kind === "image" ? "file" : "file"),
+    h("span", {}, a.name), h("small", { class: "muted" }, humanSize(a.size)),
+    h("button", { class: "chip-x", type: "button", "aria-label": "Убрать", onclick: () => { S.attachments.splice(i, 1); renderAttachments(); } }, icon("x")))),
+    S.uploading ? h("span", { class: "chip loading" }, h("span", { class: "st run" }), "загрузка…") : null);
+  el.hidden = !S.attachments.length && !S.uploading;
+  updateSend();
 }
 
 async function decide(id, approve, comment, card) {
-  card.querySelectorAll("button").forEach(b => (b.disabled = true));
+  card.querySelectorAll("button, input").forEach(b => (b.disabled = true));
   try {
     await api(`/api/approvals/${id}`, { method: "POST", body: { approve, comment } });
     setRunning(true); follow();
-  } catch (e) { note(e.message, true); card.querySelectorAll("button").forEach(b => (b.disabled = false)); }
+  } catch (e) { alertMsg(e.message); card.querySelectorAll("button, input").forEach(b => (b.disabled = false)); }
 }
 
 async function doRewind(seq, text) {
   if (S.running) return;
-  if (!confirm("Откатить разговор (и файлы агента) к моменту до этого сообщения?")) return;
+  if (!confirm("Откатить разговор и файлы агента к моменту до этого сообщения? Текст вернётся в поле ввода.")) return;
   await api(`/api/sessions/${S.sessionId}/rewind`, { method: "POST", body: { seq: seq - 1 } });
   await openSession(S.sessionId);
   $("#input").value = text; autosize(); $("#input").focus();
@@ -409,20 +530,56 @@ async function doRewind(seq, text) {
 
 // ── сессии ──────────────────────────────────────────────────────────
 async function loadSessions() {
-  const items = await api("/api/sessions");
-  const cur = items.find(s => s.id === S.sessionId);
+  S.sessions = await api("/api/sessions");
+  const cur = S.sessions.find(s => s.id === S.sessionId);
   if (cur) $("#chat-title").textContent = cur.title;
-  $("#sessions").replaceChildren(...items.map(s => h("div", {
-    class: "session" + (s.id === S.sessionId ? " active" : ""), onclick: () => { openSession(s.id); $("#sidebar").classList.remove("open"); },
-  }, s.running ? h("i", { class: "dot" }) : null, h("span", {}, s.title))));
+  renderSessions();
+}
+function renderSessions() {
+  const q = $("#session-filter").value.trim().toLowerCase();
+  const items = S.sessions.filter(s => !q || s.title.toLowerCase().includes(q));
+  const day = 86400, now = new Date(); now.setHours(0, 0, 0, 0);
+  const today = now.getTime() / 1000;
+  const groups = [["Сегодня", t => t >= today], ["Вчера", t => t >= today - day], ["Последние 7 дней", t => t >= today - 7 * day], ["Ранее", () => true]];
+  const out = [];
+  const used = new Set();
+  for (const [label, test] of groups) {
+    const g = items.filter(s => !used.has(s.id) && test(s.updated_at));
+    if (!g.length) continue;
+    g.forEach(s => used.add(s.id));
+    out.push(h("div", { class: "group-label" }, label));
+    for (const s of g) out.push(h("button", {
+      class: "session" + (s.id === S.sessionId ? " active" : ""), type: "button", title: s.title,
+      onclick: () => { openSession(s.id); toggleSidebar(false); },
+    }, h("span", {}, s.title), s.running ? h("i", { class: "dot", title: "Агент работает" }) : null));
+  }
+  if (!out.length) out.push(h("div", { class: "group-label" }, q ? "Ничего не найдено" : "Разговоров пока нет"));
+  $("#sessions").replaceChildren(...out);
+}
+
+function greeting() {
+  const hr = new Date().getHours();
+  const part = hr < 5 ? "Доброй ночи" : hr < 12 ? "Доброе утро" : hr < 18 ? "Добрый день" : "Добрый вечер";
+  const name = (S.me?.name || "").split(/\s+/)[0];
+  return name && name !== S.me?.id ? `${part}, ${name}` : part;
+}
+function emptyState() {
+  const sugg = S.config?.suggestions || [];
+  return h("div", { class: "empty", id: "empty" },
+    h("h1", {}, greeting()),
+    h("p", {}, S.config?.description || "Опишите задачу — агент сам найдёт, посчитает и подготовит."),
+    sugg.length ? h("div", { class: "suggestions" }, sugg.map(t => h("button", { class: "suggestion", type: "button", onclick: () => send(t) }, t))) : null,
+    h("div", { class: "facts" },
+      h("span", {}, icon("shield"), "Изменения — только после вашего подтверждения"),
+      h("span", {}, icon("clip"), "Можно приложить файлы и фото"),
+      h("span", {}, icon("send"), "Можно дописывать, пока агент работает")));
 }
 
 function resetView() {
   S.stream?.abort();
-  S.tools.clear(); S.subs.clear(); S.cards.clear(); S.bubble = null; S.lastSeq = 0; setCost(0);
-  box().replaceChildren(h("div", { class: "empty", id: "empty" }, h("h3", {}, "Чем помочь?"),
-    h("p", { class: "muted" }, "Агент сам вызывает инструменты. Изменения — через карточку подтверждения.")));
-  renderTodos([]); $("#tasks").hidden = true; setRunning(false);
+  S.steps.clear(); S.subs.clear(); S.cards.clear(); S.bubble = null; S.group = null; S.lastSeq = 0; setCost(0);
+  box().replaceChildren(emptyState());
+  S.tasksShown = false; renderTodos([]); $("#tasks").hidden = true; setRunning(false);
   S.queued = []; S.attachments = []; renderAttachments();
 }
 
@@ -435,103 +592,159 @@ async function openSession(id) {
   $("#chat-title").textContent = s.title || "Новый разговор";
   if (s.state?.model) $("#model").value = s.state.model;
   if (s.state?.mode) $("#mode").value = s.state.mode;
+  if (!s.messages.length) box().replaceChildren(emptyState());
   for (const m of s.messages) {
     if (m.meta?.hidden) continue;
     if (m.role === "user") userMsg(m.content, m.seq);
     else if (m.role === "assistant") {
-      if (m.content) { const b = assistantBubble(); b.classList.remove("streaming"); b.innerHTML = md(m.content); }
-      for (const tc of m.tool_calls || []) toolBlock(tc.id, tc.function.name, safeJSON(tc.function.arguments));
-    } else if (m.role === "tool") toolResult(m.tool_call_id, m.content, m.meta?.is_error, m.meta?.ui);
+      if (m.content) { const b = assistantBubble(); b.classList.remove("streaming"); renderMd(b, m.content); }
+      for (const tc of m.tool_calls || []) stepRow(tc.id, tc.function.name, safeJSON(tc.function.arguments));
+    } else if (m.role === "tool") stepResult(m.tool_call_id, m.content, m.meta?.is_error, m.meta?.ui, m.meta?.elapsed_ms);
   }
-  // Варианты ответа живы, только пока вопрос — последнее, что было в разговоре.
+  // Последний вопрос агента с вариантами — снова кнопками, если на него ещё не ответили.
   const last = s.messages.filter(m => !m.meta?.hidden).at(-1);
-  if (!(last?.role === "tool" && last.name === "ask_user")) box().querySelectorAll(".choices").forEach(e => e.remove());
+  if (last?.role === "tool" && last.name === "ask_user") {
+    const w = (last.meta?.ui || []).find(x => x.type === "choices");
+    if (w) add(choices(w.question, w.options || []));
+  }
   for (const a of s.approvals) approvalCard({ ...a, approval_id: a.id, tool: a.tool_name });
+  if (!s.running_run) closeGroup();
   renderTodos(s.state?.todos);
   setCost((s.runs || []).reduce((acc, r) => acc + (r.usage?.cost || 0), 0));
   S.lastSeq = s.last_seq;
-  scroll(true);
-  if (s.running_run) { setRunning(true); S.lastSeq = Math.max(0, s.last_seq - 0); follow(); }
+  requestAnimationFrame(() => scroll(true));
+  if (s.running_run) { setRunning(true); follow(); }
   loadSessions();
 }
 
 // ── панели ──────────────────────────────────────────────────────────
+const row = (main, ...right) => h("div", { class: "row" }, h("div", { class: "grow" }, main), ...right);
 const panels = {
   async memory(body) {
     const items = await api("/api/memory");
-    const input = h("textarea", { rows: 2, placeholder: "Что запомнить (правило или факт)" });
-    const scope = S.config.is_admin ? h("select", {}, h("option", { value: "user" }, "для меня"), h("option", { value: "global" }, "для всех")) : null;
+    const input = h("textarea", { rows: 2, placeholder: "Правило или факт, например: «отчёты присылай по пятницам»" });
+    const scope = S.config.is_admin ? h("select", {}, h("option", { value: "user" }, "Только для меня"), h("option", { value: "global" }, "Для всех")) : null;
     body.append(h("div", { class: "form" }, input, h("div", { class: "actions" }, scope,
       h("button", { class: "btn primary", onclick: async () => { if (!input.value.trim()) return; await api("/api/memory", { method: "POST", body: { text: input.value, scope: scope?.value || "user" } }); openPanel("memory"); } }, "Добавить"))));
-    if (!items.length) body.append(h("p", { class: "muted" }, "Память пуста. Скажите агенту «запомни: …» или добавьте здесь."));
-    for (const m of items) body.append(h("div", { class: "row" }, h("div", { class: "grow" }, m.text),
-      h("span", { class: "badge" }, m.scope === "global" ? "все" : "моё"),
-      h("button", { class: "link-btn small", onclick: async () => { await api(`/api/memory/${m.id}`, { method: "DELETE" }); openPanel("memory"); } }, "удалить")));
+    if (!items.length) body.append(h("p", { class: "muted" }, "Пока пусто. Скажите агенту «запомни: …» — правило появится здесь и будет учитываться в каждом разговоре."));
+    for (const m of items) body.append(row(m.text,
+      h("span", { class: "badge" }, m.scope === "global" ? "для всех" : "моё"),
+      h("button", { class: "icon-btn", title: "Удалить", onclick: async () => { await api(`/api/memory/${m.id}`, { method: "DELETE" }); openPanel("memory"); } }, icon("x"))));
   },
   async tools(body) {
     const d = await api("/api/tools");
-    for (const s of d.mcp) {
-      let action = null;
-      if (S.config.is_admin && s.needs_auth) action = h("button", { class: "btn primary small", onclick: () => mcpConnect(s.name) }, "Подключить");
-      else if (S.config.is_admin && s.oauth) action = h("button", { class: "link-btn small", onclick: async () => {
-        if (!confirm(`Отключить ${s.name}? Токены будут отозваны.`)) return;
-        await api(`/api/mcp/${encodeURIComponent(s.name)}/connect`, { method: "DELETE" }); openPanel("tools"); } }, "отключить");
-      body.append(h("div", { class: "row" }, h("div", { class: "grow" }, h("strong", {}, "MCP · " + s.name),
-        s.oauth ? h("span", { class: "badge ok" }, " OAuth") : null, s.error && !s.ok ? h("div", { class: "muted" }, s.error) : null),
-        h("span", { class: "badge " + (s.ok ? "ok" : s.needs_auth ? "warn" : "err") }, s.ok ? `${s.tools} инстр.` : s.needs_auth ? "нужен вход" : "нет связи"),
-        action));
+    if (S.config.is_admin) body.append(h("div", { class: "form" }, h("div", { class: "actions" },
+      h("span", { class: "muted", style: "flex:1;font-size:12.5px" }, "mcp.json и skills читаются при старте"),
+      h("button", { class: "btn sm", onclick: async () => { await api("/api/reload", { method: "POST" }); openPanel("tools"); } }, "Перечитать"))));
+    if (d.mcp.length) {
+      body.append(h("div", { class: "section-title" }, "MCP-серверы"));
+      for (const s of d.mcp) {
+        let action = null;
+        if (S.config.is_admin && s.needs_auth) action = h("button", { class: "btn primary sm", onclick: () => mcpConnect(s.name) }, "Подключить");
+        else if (S.config.is_admin && s.oauth) action = h("button", { class: "btn ghost sm", onclick: async () => {
+          if (!confirm(`Отключить ${s.name}? Токены будут отозваны.`)) return;
+          await api(`/api/mcp/${encodeURIComponent(s.name)}/connect`, { method: "DELETE" }); openPanel("tools"); } }, "Отключить");
+        body.append(row([h("div", {}, h("b", {}, s.name), s.oauth ? h("span", { class: "muted" }, " · OAuth") : null),
+          !s.ok && s.error ? h("div", { class: "sub-text" }, s.error) : null],
+          h("span", { class: "badge " + (s.ok ? "ok" : s.needs_auth ? "warn" : "err") }, s.ok ? `${s.tools} ${plural(s.tools, "инструмент", "инструмента", "инструментов")}` : s.needs_auth ? "нужен вход" : "нет связи"),
+          action));
+      }
     }
-    for (const k of d.skills) body.append(h("div", { class: "row" }, h("div", { class: "grow" }, h("strong", {}, "skill · " + k.name), h("div", { class: "muted" }, k.description))));
-    for (const t of d.tools) body.append(h("div", { class: "row" }, h("div", { class: "grow" }, h("code", {}, prettyName(t.name)), h("div", { class: "muted" }, t.description)),
-      h("span", { class: "badge " + (t.read_only ? "ok" : t.destructive ? "err" : "warn") }, t.read_only ? "чтение" : t.destructive ? "опасно" : "запись"),
-      t.deferred ? h("span", { class: "badge" }, "отложен") : null));
-    if (S.config.is_admin) body.prepend(h("button", { class: "btn", onclick: async () => { await api("/api/reload", { method: "POST" }); openPanel("tools"); } }, "Перечитать mcp.json и skills"));
+    if (d.skills.length) {
+      body.append(h("div", { class: "section-title" }, "Skills"));
+      for (const k of d.skills) body.append(row([h("b", {}, k.name), h("div", { class: "sub-text" }, k.description)]));
+    }
+    const filter = h("input", { class: "field filter", placeholder: `Найти среди ${d.tools.length} инструментов` });
+    const list = h("div");
+    const draw = () => {
+      const q = filter.value.trim().toLowerCase();
+      list.replaceChildren(...d.tools.filter(t => !q || (t.name + t.title + t.description).toLowerCase().includes(q)).map(t => row(
+        [h("div", {}, h("b", {}, toolTitle(t.name, t.title)), " ", h("code", {}, t.name)), h("div", { class: "sub-text" }, t.description)],
+        t.deferred ? h("span", { class: "badge", title: "Схема подгружается по запросу агента" }, "по запросу") : null,
+        h("span", { class: "badge " + (t.read_only ? "ok" : t.destructive ? "err" : "warn") }, t.read_only ? "чтение" : t.destructive ? "необратимо" : "запись"))));
+    };
+    filter.addEventListener("input", draw);
+    body.append(h("div", { class: "section-title" }, "Инструменты"), filter, list);
+    draw();
   },
   async schedules(body) {
     const items = await api("/api/schedules");
-    const name = h("input", { placeholder: "Название" }), cron = h("input", { placeholder: "cron, напр. 45 8 * * 1-5 (будни 8:45)" });
+    const name = h("input", { placeholder: "Название, например «Утренний отчёт»" });
+    const cron = h("input", { placeholder: "Когда: cron, например 45 8 * * 1-5 — по будням в 8:45" });
     const prompt = h("textarea", { rows: 3, placeholder: "Что сделать агенту" });
-    body.append(h("div", { class: "form" }, name, cron, prompt, h("button", { class: "btn primary", onclick: async () => {
+    body.append(h("div", { class: "form" }, name, cron, prompt, h("div", { class: "actions" }, h("button", { class: "btn primary", onclick: async () => {
       try { await api("/api/schedules", { method: "POST", body: { name: name.value, cron: cron.value, prompt: prompt.value } }); openPanel("schedules"); }
-      catch (e) { alert(e.message); } } }, "Добавить")));
-    for (const s of items) body.append(h("div", { class: "row" }, h("div", { class: "grow" }, h("strong", {}, s.name), h("div", { class: "muted" }, `${s.cron} · ${s.prompt}`),
-      s.next_run_at ? h("div", { class: "muted" }, "следующий: " + new Date(s.next_run_at * 1000).toLocaleString("ru-RU")) : null),
-      h("button", { class: "link-btn small", onclick: async () => { await api(`/api/schedules/${s.id}`, { method: "DELETE" }); openPanel("schedules"); } }, "удалить")));
+      catch (e) { alert(e.message); } } }, "Добавить"))));
+    if (!items.length) body.append(h("p", { class: "muted" }, "Задач по расписанию нет. Результат каждого запуска появится отдельным разговором."));
+    for (const s of items) body.append(row([h("b", {}, s.name), h("div", { class: "sub-text" }, s.prompt),
+      h("div", { class: "sub-text" }, h("code", {}, s.cron), s.next_run_at ? " · следующий запуск " + new Date(s.next_run_at * 1000).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" }) : "")],
+      h("button", { class: "icon-btn", title: "Удалить", onclick: async () => { await api(`/api/schedules/${s.id}`, { method: "DELETE" }); openPanel("schedules"); } }, icon("x"))));
   },
   async usage(body) {
     const u = await api("/api/usage?days=30");
-    body.append(h("div", { class: "row" }, h("div", { class: "grow" }, "Прогонов за 30 дней"), h("strong", {}, u.runs)),
-      h("div", { class: "row" }, h("div", { class: "grow" }, "Токенов: вход / выход / из кэша"), h("strong", {}, `${u.input_tokens} / ${u.output_tokens} / ${u.cached_tokens}`)),
-      h("div", { class: "row" }, h("div", { class: "grow" }, "Стоимость"), h("strong", {}, `$${(u.cost || 0).toFixed(4)}`)),
-      ...Object.entries(u.cost_by_model || {}).map(([m, c]) => h("div", { class: "row" }, h("div", { class: "grow muted" }, m), h("span", {}, `$${c.toFixed(4)}`))));
+    const fmt = n => Number(n || 0).toLocaleString("ru-RU");
+    body.append(h("div", { class: "section-title" }, "За 30 дней"),
+      h("div", { class: "stat" },
+        h("div", {}, h("b", {}, fmt(u.runs)), h("span", {}, "запусков")),
+        h("div", {}, h("b", {}, `$${(u.cost || 0).toFixed(2)}`), h("span", {}, "стоимость")),
+        h("div", {}, h("b", {}, u.input_tokens ? `${Math.round((u.cached_tokens / u.input_tokens) * 100)}%` : "—"), h("span", {}, "из кэша"))),
+      row("Токенов на входе", h("span", {}, fmt(u.input_tokens))),
+      row("Токенов на выходе", h("span", {}, fmt(u.output_tokens))));
+    const models = Object.entries(u.cost_by_model || {}).sort((a, b) => b[1] - a[1]);
+    if (models.length) {
+      body.append(h("div", { class: "section-title" }, "По моделям"));
+      for (const [m, c] of models) body.append(row(h("code", {}, m), h("span", {}, `$${c.toFixed(4)}`)));
+    }
   },
 };
 const titles = { memory: "Память", tools: "Инструменты", schedules: "Расписание", usage: "Расход" };
 async function openPanel(name) {
   $("#panel").hidden = false; $("#panel-title").textContent = titles[name];
-  const body = $("#panel-body"); body.replaceChildren(h("p", { class: "muted" }, "Загрузка…"));
-  const fresh = h("div", { class: "panel-body", style: "padding:0" });
+  const body = $("#panel-body");
+  const fresh = h("div", { style: "display:contents" });
+  if (!body.childElementCount || body.dataset.panel !== name) body.replaceChildren(h("p", { class: "muted" }, "Загрузка…"));
+  body.dataset.panel = name;
   try { await panels[name](fresh); body.replaceChildren(...fresh.childNodes); } catch (e) { body.replaceChildren(h("p", { class: "error-text" }, e.message)); }
+}
+function closePanel() { $("#panel").hidden = true; }
+
+// ── тема ────────────────────────────────────────────────────────────
+const THEMES = ["auto", "light", "dark"];
+const THEME_NAMES = { auto: "Тема: как в системе", light: "Тема: светлая", dark: "Тема: тёмная" };
+function applyTheme(t) {
+  if (t === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
+  $("#theme").replaceChildren(icon(t === "light" ? "sun" : t === "dark" ? "moon" : "auto"));
+  $("#theme").title = THEME_NAMES[t];
 }
 
 // ── старт ───────────────────────────────────────────────────────────
-function autosize() { const t = $("#input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, innerHeight * 0.4) + "px"; }
+function autosize() { const t = $("#input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, innerHeight * 0.4) + "px"; updateSend(); }
 function logout() { store.set("agent_token", null); S.token = null; $("#app").hidden = true; $("#login").hidden = false; }
+function toggleSidebar(open) { $("#sidebar").classList.toggle("open", open); $("#scrim").hidden = !open; }
+function newChat() { S.sessionId = null; history.replaceState(null, "", "#"); resetView(); $("#chat-title").textContent = "Новый разговор"; renderSessions(); toggleSidebar(false); $("#input").focus(); }
 
 async function boot() {
+  applyTheme(store.get("agent_theme") || "auto");
   if (!S.token) { $("#login").hidden = false; return; }
   try { S.config = await api("/api/config"); } catch { return; }
-  const me = await api("/api/me");
-  document.title = S.config.name; $("#app-name").textContent = S.config.name; $("#login-title").textContent = S.config.name;
-  $("#me-name").textContent = me.name;
-  $("#model").replaceChildren(...S.config.models.map(m => h("option", { value: m }, m.replace(/^[^:]+:/, ""))));
+  S.me = await api("/api/me");
+  const name = S.config.name;
+  document.title = name;
+  $("#app-name").textContent = name; $("#login-title").textContent = name;
+  for (const el of document.querySelectorAll(".logo-mark")) el.textContent = name.trim().charAt(0).toUpperCase();
+  $("#me-name").textContent = S.me.name;
+  $("#me-avatar").textContent = (S.me.name || "?").trim().charAt(0).toUpperCase();
+  $("#model").replaceChildren(...S.config.models.map(m => h("option", { value: m }, m.replace(/^[^:]+:/, "").replace(/^[^/]+\//, ""))));
   $("#model").value = S.config.default_model;
-  const modeNames = { default: "Спрашивать", accept_edits: "Правки файлов — сразу", plan: "Только план", readonly: "Только чтение", auto: "Авто", bypass: "Без вопросов" };
-  $("#mode").replaceChildren(...S.config.modes.map(m => h("option", { value: m }, modeNames[m] || m)));
+  const modeNames = { default: "Спрашивать", accept_edits: "Правки без вопросов", plan: "Только план", readonly: "Только чтение", auto: "Авто", bypass: "Без вопросов" };
+  const modeHelp = { default: "Любое изменение данных — через карточку подтверждения", accept_edits: "Файлы рабочей папки агент правит сам, остальное — с подтверждением",
+    plan: "Агент только изучает и предлагает план, ничего не меняет", readonly: "Только чтение", auto: "Изменения без подтверждения, кроме отмеченных как опасные",
+    bypass: "Всё без подтверждения — только для доверенных задач" };
+  $("#mode").replaceChildren(...S.config.modes.map(m => h("option", { value: m, title: modeHelp[m] }, modeNames[m] || m)));
   $("#mode").value = S.config.default_mode;
   $("#login").hidden = true; $("#app").hidden = false;
   const id = location.hash.slice(1);
-  if (id) await openSession(id); else await loadSessions();
+  if (id) await openSession(id); else { resetView(); await loadSessions(); }
   $("#input").focus();
 }
 
@@ -539,20 +752,31 @@ $("#login-form").addEventListener("submit", async e => {
   e.preventDefault();
   S.token = $("#token-input").value.trim(); store.set("agent_token", S.token);
   $("#login-error").textContent = "";
-  try { await api("/api/me"); boot(); } catch (err) { $("#login-error").textContent = "Токен не подошёл"; logout(); }
+  try { await api("/api/me"); boot(); } catch { $("#login-error").textContent = "Токен не подошёл"; logout(); }
 });
 $("#composer").addEventListener("submit", e => { e.preventDefault(); send(); });
 $("#input").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
 $("#input").addEventListener("input", autosize);
 $("#stop").addEventListener("click", () => S.sessionId && api(`/api/sessions/${S.sessionId}/cancel`, { method: "POST" }));
-$("#new-chat").addEventListener("click", () => { S.sessionId = null; history.replaceState(null, "", "#"); resetView(); $("#chat-title").textContent = "Новый разговор"; loadSessions(); $("#input").focus(); });
+$("#new-chat").addEventListener("click", newChat);
 $("#logout").addEventListener("click", logout);
-$("#menu").addEventListener("click", () => $("#sidebar").classList.toggle("open"));
+$("#theme").addEventListener("click", () => {
+  const next = THEMES[(THEMES.indexOf(store.get("agent_theme") || "auto") + 1) % THEMES.length];
+  store.set("agent_theme", next); applyTheme(next);
+});
+$("#menu").addEventListener("click", () => toggleSidebar(true));
+$("#scrim").addEventListener("click", () => toggleSidebar(false));
+$("#session-filter").addEventListener("input", renderSessions);
 $("#toggle-tasks").addEventListener("click", () => ($("#tasks").hidden = !$("#tasks").hidden));
-$("#panel-close").addEventListener("click", () => ($("#panel").hidden = true));
-$("#panel").addEventListener("click", e => { if (e.target.id === "panel") $("#panel").hidden = true; });
-document.querySelectorAll("[data-panel]").forEach(b => b.addEventListener("click", () => openPanel(b.dataset.panel)));
+$("#panel-close").addEventListener("click", closePanel);
+$("#panel").addEventListener("click", e => { if (e.target.id === "panel") closePanel(); });
+document.querySelectorAll("[data-panel]").forEach(b => b.addEventListener("click", () => { toggleSidebar(false); openPanel(b.dataset.panel); }));
 for (const id of ["model", "mode"]) $("#" + id).addEventListener("change", () => S.sessionId && api(`/api/sessions/${S.sessionId}`, { method: "PATCH", body: { [id]: $("#" + id).value } }));
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") { if (!$("#panel").hidden) closePanel(); else toggleSidebar(false); }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); newChat(); }
+});
+
 async function mcpConnect(name) {
   // Окно открываем сразу по клику — иначе браузер сочтёт его всплывающим и заблокирует.
   const w = window.open("about:blank", "oauth", "width=520,height=720");
@@ -564,7 +788,7 @@ async function mcpConnect(name) {
 window.addEventListener("message", e => {
   if (e.data?.type !== "agentkit-oauth") return;
   if (!$("#panel").hidden) openPanel("tools");
-  note(e.data.ok ? `Подключено: ${e.data.text}` : `Не удалось подключить: ${e.data.text}`, !e.data.ok);
+  if (e.data.ok) note(`Подключено: ${e.data.text}`); else alertMsg(`Не удалось подключить: ${e.data.text}`);
 });
 
 $("#attach").addEventListener("click", () => $("#file").click());

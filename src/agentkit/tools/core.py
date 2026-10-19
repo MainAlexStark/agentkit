@@ -15,7 +15,7 @@ class TodoItem(BaseModel):
     status: Literal["pending", "in_progress", "completed"] = "pending"
 
 
-@tool(read_only=True, concurrency_safe=False, group="core", source="builtin")
+@tool(title="План задач", read_only=True, concurrency_safe=False, group="core", source="builtin")
 async def todo_write(
     ctx: ToolContext,
     todos: Annotated[list[TodoItem], "Полный список задач (заменяет прежний)"],
@@ -37,7 +37,7 @@ class Choice(BaseModel):
     description: str = Field("", description="Что будет, если выбрать этот вариант")
 
 
-@tool(read_only=True, concurrency_safe=False, group="core", source="builtin")
+@tool(title="Вопрос", read_only=True, concurrency_safe=False, group="core", source="builtin")
 async def ask_user(
     ctx: ToolContext,
     question: Annotated[str, "Вопрос целиком, заканчивается знаком вопроса"],
@@ -55,7 +55,7 @@ async def ask_user(
                       ui=[{"type": "choices", "question": question, "options": opts, "multi": multi}])
 
 
-@tool(read_only=True, group="core", source="builtin")
+@tool(title="Чтение вывода", read_only=True, group="core", source="builtin")
 async def read_output(
     ctx: ToolContext,
     id: Annotated[str, "id из пометки «Вывод обрезан»"],
@@ -83,7 +83,7 @@ def memory_tools(*, global_roles: tuple[str, ...] = ("admin",)) -> list[Tool]:
 
     # read_only=True: память агента — не данные пользователя; без этого каждое
     # «запомни» требовало бы карточку. Общая память страхуется needs_approval.
-    @tool(needs_approval=needs_ok, read_only=True, concurrency_safe=False, group="memory", source="builtin",
+    @tool(title="Запомнить", needs_approval=needs_ok, read_only=True, concurrency_safe=False, group="memory", source="builtin",
           describe=lambda a: [["Запомнить", a.get("text", "")], ["Для кого", "всех" if a.get("scope") == "global" else "меня"]])
     async def memory_save(
         ctx: ToolContext,
@@ -100,7 +100,7 @@ def memory_tools(*, global_roles: tuple[str, ...] = ("admin",)) -> list[Tool]:
         rec = await ctx.store.memory_add(sc, text.strip(), created_by=ctx.user.id)
         return ToolResult(content=f"Запомнил [{rec.id}].", data={"id": rec.id})
 
-    @tool(group="memory", source="builtin", read_only=True, concurrency_safe=False)
+    @tool(title="Забыть", group="memory", source="builtin", read_only=True, concurrency_safe=False)
     async def memory_delete(
         ctx: ToolContext,
         id: Annotated[str, "id записи из раздела «Память» системного промпта"],
