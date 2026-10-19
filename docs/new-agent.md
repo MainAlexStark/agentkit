@@ -1,0 +1,80 @@
+# Новый агент на agentkit — по шагам
+
+Это же — основа будущего skill'а «создать агента».
+
+## 0. Решить до кода
+
+1. **Что агент делает и для кого.** Одна фраза. Например: «помощник поверителя: находит тип СИ во ФГИС и готовит черновик протокола».
+2. **Чем он это делает.** Список действий → инструменты. Для каждого: читает или меняет? опасно ли? кто имеет право?
+3. **Где живут данные.** Своя система с API → доменные инструменты в `app/domain/tools.py`. Уже есть MCP-сервер → строка в `mcp.json`. Нужно и Claude, и агенту → сначала MCP-сервер по `mcp-server-standard`, потом строка в `mcp.json`.
+4. **Как встраивается.** Самостоятельный чат / HTTP из другого сервиса (`/api/run`) / библиотекой.
+
+## 1. Создать проект
+
+```bash
+agentkit new <имя> --dest ~/projects
+cd ~/projects/<имя>
+python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt pytest pytest-asyncio
+cp deploy/<имя>.env.example .env
+git init && git add -A && git commit -m "Агент <имя> из шаблона agentkit"
+```
+
+## 2. Промпт — `app/domain/prompt.md`
+
+Только предметная часть (общие правила уже в ядре): роль → термины → иерархия источников → жёсткие запреты → типовые сценарии → формат ответа. Конкретно и с примерами; «ошибки недопустимы» — значит прописать, что делать при нехватке данных (пустое поле, вопрос человеку).
+
+## 3. Инструменты — `app/domain/tools.py`
+
+```python
+@tool(read_only=True)
+async def si_type_find(ctx, query: Annotated[str, "номер в реестре или название"]) -> ToolResult: ...
+
+@tool(describe=lambda a: [["Тип СИ", a["name"]], ["Номер", a["number"]]])
+async def si_type_create(ctx, name: str, number: str) -> str: ...
+```
+
+* docstring — для модели: что делает и когда звать;
+* читающие — `read_only=True`; пишущие — без него (карточка подтверждения), `describe=` — как карточка покажет действие;
+* опасные — `destructive=True` или `needs_approval=lambda args, ctx: "причина" if … else None`;
+* права пользователя — внутри инструмента (`ctx.user.roles`), отказ — `raise ToolDenied("…")`;
+* зависимости (БД, клиенты API) — через `Domain.deps`, внутри — `ctx.deps[…]`;
+* много инструментов (>15) — `deferred=True` для редких.
+
+## 4. MCP — `mcp.json`
+
+```json
+{"servers": {"rst": {"url": "https://rst.example.ru/mcp", "token": "${RST_MCP_TOKEN}", "read_only": ["*"]}}}
+```
+
+## 5. Хуки и правила — `app/domain/hooks.py`, `rules()`
+
+Доменные запреты, которые должны работать независимо от модели — в `pre_tool_use`. Аудит — `post_tool_use`. «Не говори «готово», пока не проверил» — `stop`. Правила, зависящие от пользователя или настроек компании — `rules(user)`.
+
+## 6. Skills — `app/skills/<имя>/SKILL.md`
+
+Длинные процедуры («как составить протокол», «как разобрать возврат») — skill'ами, а не в промпт: в промпте только их оглавление.
+
+## 7. Evals — `evals/*.yaml`
+
+Минимум: по кейсу на каждый пишущий инструмент (вызов → карточка → подтверждение), кейс на режим plan, 3–5 кейсов на реальной модели с `judge` по главным сценариям. Офлайн-кейсы — в CI.
+
+```bash
+pytest && agentkit eval evals/ --app app.evals:make_agent --offline   # бесплатно
+agentkit eval evals/ --app app.evals:make_agent                        # на модели
+```
+
+## 8. Развернуть
+
+```bash
+# на VPS, в клоне репозитория проекта
+./deploy.sh agent.example.com     # спросит ключ модели, придумает токены, поднимет и проверит
+./deploy.sh token ivan worker     # токен сотруднику
+./deploy.sh update                # обновление с автооткатом
+```
+
+## 9. Обновить ядро
+
+```bash
+cd ~/projects/agentkit && git pull
+cd ~/projects/<имя> && agentkit vendor && pytest && git commit -am "agentkit X.Y.Z"
+```
