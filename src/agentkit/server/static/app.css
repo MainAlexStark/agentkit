@@ -655,3 +655,108 @@ button.link:hover { text-decoration: underline; }
   .setting-line > select { width: 100%; }
   .setting-line .switch { align-self: flex-start; }
 }
+
+/* ── пустой разговор: поле ввода по центру ─────────────────────────── */
+.main.is-empty .messages { flex: 0 0 auto; margin-top: auto; overflow: visible; padding-bottom: 20px; }
+.main.is-empty .composer-wrap { padding-bottom: 8px; }
+.main.is-empty .below { margin-bottom: auto; }
+.below { padding: 6px 20px 24px; }
+.below > * { max-width: var(--col); margin-left: auto; margin-right: auto; }
+.empty { padding-top: 0; text-align: left; }
+.empty-mark { width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; margin-bottom: 18px; background: var(--text); color: var(--bg); font-weight: 700; font-size: 18px; box-shadow: var(--shadow-2); }
+.empty h1 { font-size: 28px; }
+.empty p { margin-bottom: 0; }
+.below .suggestions { margin-top: 10px; }
+.suggestion { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.suggestion svg { width: 15px; height: 15px; color: var(--faint); opacity: 0; transform: translateX(-4px); transition: opacity .12s, transform .12s; }
+.suggestion:hover svg { opacity: 1; transform: none; }
+.below .facts { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px 22px; margin-top: 22px; color: var(--faint); font-size: 12px; }
+.below .facts span { display: inline-flex; align-items: center; gap: 6px; }
+.below .facts svg { width: 14px; height: 14px; }
+.composer { transition: border-color .12s, box-shadow .2s; }
+.composer:focus-within { border-color: var(--line-2); box-shadow: 0 0 0 4px color-mix(in srgb, var(--text) 5%, transparent), var(--shadow-1); }
+.main.is-empty .composer { box-shadow: 0 6px 24px rgba(0,0,0,.06); }
+
+/* ── ответ: действия, кнопка вниз ──────────────────────────────────── */
+.msg-actions { display: flex; gap: 2px; margin-top: 4px; margin-left: -6px; opacity: 0; transition: opacity .12s; }
+.msg.assistant:hover .msg-actions, .msg.assistant:last-child .msg-actions { opacity: 1; }
+.msg-actions .icon-btn { width: 28px; height: 28px; }
+.msg-actions svg { width: 15px; height: 15px; }
+.composer-wrap { position: relative; }
+.to-bottom { position: absolute; left: 50%; top: -40px; transform: translateX(-50%); width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--line-2); background: var(--surface); color: var(--text-2); box-shadow: var(--shadow-2); display: grid; place-items: center; cursor: pointer; z-index: 2; animation: pop .15s ease-out; }
+.to-bottom:hover { background: var(--surface-2); color: var(--text); }
+.to-bottom svg { width: 16px; height: 16px; }
+
+/* ── права агента ──────────────────────────────────────────────────── */
+.mode-btn .lead { width: 15px; height: 15px; color: var(--text-2); }
+.mode-btn[data-tone="warn"] { color: var(--warn); } .mode-btn[data-tone="warn"] .lead { color: var(--warn); }
+.mode-btn[data-tone="err"] { color: var(--err); background: var(--err-soft); } .mode-btn[data-tone="err"] .lead { color: var(--err); }
+.mode-pop { width: 330px; max-width: calc(100vw - 16px); padding: 5px; }
+.mode-pop .pop-label { padding: 6px 9px 6px; }
+.mode-opt { display: flex; align-items: flex-start; gap: 11px; width: 100%; padding: 8px 9px; border: 0; background: none; border-radius: var(--r); cursor: pointer; text-align: left; color: var(--text); }
+.mode-opt:hover, .mode-opt:focus-visible { background: var(--surface-2); box-shadow: none; }
+.mode-ic { flex: none; width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; background: var(--surface-2); color: var(--text-2); border: 1px solid var(--line); }
+.mode-ic svg { width: 16px; height: 16px; }
+.mode-opt.on .mode-ic { background: var(--text); color: var(--bg); border-color: transparent; }
+.mode-opt[data-tone="warn"] .mode-ic { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 25%, transparent); }
+.mode-opt[data-tone="err"] .mode-ic { color: var(--err); background: var(--err-soft); border-color: color-mix(in srgb, var(--err) 25%, transparent); }
+.mode-text { flex: 1; min-width: 0; display: grid; gap: 1px; }
+.mode-text b { font-size: 13px; font-weight: 500; }
+.mode-text span { font-size: 12px; color: var(--muted); line-height: 1.35; }
+.mode-opt .mo-check { padding-top: 6px; }
+
+/* ── задачи ────────────────────────────────────────────────────────── */
+.tasks { display: flex; flex-direction: column; }
+.tasks-head { align-items: center; gap: 8px; margin: -4px -6px 0 0; }
+.tasks h4 { display: flex; align-items: center; gap: 7px; flex: 1; }
+.tasks h4 svg { width: 15px; height: 15px; color: var(--muted); }
+.tasks-head .icon-btn { width: 28px; height: 28px; }
+.tasks-head .icon-btn svg { width: 15px; height: 15px; }
+.tasks.all-done .progress i { background: var(--ok); }
+.tasks.all-done h4::after { content: "готово"; font-size: 11px; font-weight: 500; color: var(--ok); background: color-mix(in srgb, var(--ok) 11%, transparent); padding: 1px 7px; border-radius: 999px; }
+#toggle-tasks.on { background: var(--surface-3); color: var(--text); }
+.todo-list li { transition: background .15s; }
+
+/* ── MCP: свой сервер ──────────────────────────────────────────────── */
+.src-label { display: flex; align-items: center; justify-content: space-between; margin: 10px 2px -2px; font-size: 11px; font-weight: 600; color: var(--faint); text-transform: uppercase; letter-spacing: .04em; }
+.src-label .btn { text-transform: none; letter-spacing: 0; color: var(--accent); }
+.src-label .btn svg { width: 14px; height: 14px; }
+.src-card.disabled .src-icon, .src-card.disabled .src-title { opacity: .5; }
+.src-addr { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.add-card { display: flex; align-items: center; gap: 12px; width: 100%; padding: 12px; border: 1px dashed var(--line-2); border-radius: var(--r-lg); background: none; cursor: pointer; text-align: left; color: var(--text); }
+.add-card:hover { background: var(--surface-2); border-color: var(--faint); }
+.add-card .src-sub { white-space: normal; }
+.mcp-editor textarea.mono, .mcp-editor input { font-family: inherit; }
+.mcp-editor textarea.mono { font-family: var(--mono); font-size: 12.5px; }
+.more-opts { border-top: 1px solid var(--line); padding-top: 10px; }
+.more-opts summary { cursor: pointer; font-size: 12.5px; font-weight: 500; color: var(--text-2); list-style: none; display: inline-flex; align-items: center; gap: 6px; }
+.more-opts summary::before { content: ""; width: 5px; height: 5px; border: solid var(--muted); border-width: 0 1.5px 1.5px 0; transform: rotate(-45deg); transition: transform .15s; }
+.more-opts[open] summary::before { transform: rotate(45deg); }
+.more-opts[open] { display: grid; gap: 12px; }
+.test-result { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: var(--r); background: var(--surface-2); font-size: 13px; }
+.test-result > svg { width: 16px; height: 16px; margin-top: 1px; }
+.test-result b { font-weight: 500; }
+.test-result.ok { background: color-mix(in srgb, var(--ok) 9%, transparent); } .test-result.ok > svg { color: var(--ok); }
+.test-result.warn { background: var(--warn-soft); } .test-result.warn > svg { color: var(--warn); }
+.test-result.err { background: var(--err-soft); } .test-result.err > svg { color: var(--err); }
+.spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--line-2); border-top-color: var(--accent); animation: spin .8s linear infinite; flex: none; margin-top: 2px; }
+
+@media (max-width: 960px) {
+  .tasks { width: min(340px, 88vw); border-radius: 16px 0 0 16px; z-index: 11; }
+}
+@media (max-width: 760px) {
+  .mode-btn span { display: none; }
+  .mode-btn { padding-right: 20px; }
+  /* на телефоне поле ввода остаётся внизу, под пальцем; примеры — над ним */
+  .main.is-empty .messages { flex: 1 1 auto; margin-top: 0; padding-top: 8vh; overflow-y: auto; }
+  .main.is-empty .below { order: 2; margin-bottom: 0; padding: 0 16px 8px; }
+  .main.is-empty .composer-wrap { order: 3; }
+  .below .suggestions { grid-template-columns: minmax(0, 1fr); }
+  .below .facts { display: none; }
+  .empty h1 { font-size: 24px; }
+  .src-label .btn { padding: 0 4px; }
+}
+@media (max-width: 760px) {
+  .mode-btn .lead { display: block; }
+  .tasks { padding-top: calc(16px + env(safe-area-inset-top)); }
+}

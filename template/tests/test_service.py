@@ -244,3 +244,32 @@ def test_memory_edit_and_schedule_lifecycle(client):
         time.sleep(0.02)
     assert msgs[-1]["content"] == "Обзор готов"
     assert client.delete(f"/api/schedules/{s['id']}", headers={"Authorization": "Bearer t-alex"}).status_code == 200
+
+
+def test_custom_mcp_servers(client):
+    bob = {"Authorization": "Bearer t-bob"}
+    body = {"name": "crm", "url": "http://127.0.0.1:9/mcp", "auth": "token", "token": "secret-1"}
+    assert client.post("/api/mcp/servers", json=body, headers=bob).status_code == 403
+    assert client.post("/api/mcp/servers", json={**body, "name": "Bad Name"}, headers=H).status_code == 400
+    assert client.post("/api/mcp/servers", json={**body, "url": "ftp://x"}, headers=H).status_code == 400
+    assert client.post("/api/mcp/servers", json={**body, "token": ""}, headers=H).status_code == 400
+    t = client.post("/api/mcp/test", json=body, headers=H).json()
+    assert t["ok"] is False and t["error"]
+    assert client.post("/api/mcp/servers", json=body, headers=H).status_code == 200
+    assert client.post("/api/mcp/servers", json=body, headers=H).status_code == 409  # имя занято
+
+    mcp = {s["name"]: s for s in client.get("/api/tools", headers=H).json()["mcp"]}
+    crm = mcp["crm"]
+    assert crm["custom"] and crm["auth"] == "token" and crm["has_token"] and not crm["ok"]
+    assert "secret-1" not in json.dumps(mcp)  # токен наружу не уходит
+    assert "address" not in client.get("/api/tools", headers=bob).json()["mcp"][0]
+
+    # правка без токена сохраняет прежний; переименование
+    r = client.post("/api/mcp/servers", json={"name": "crm2", "original_name": "crm", "url": body["url"], "auth": "token"}, headers=H)
+    assert r.status_code == 200
+    mcp = {s["name"]: s for s in client.get("/api/tools", headers=H).json()["mcp"]}
+    assert "crm" not in mcp and mcp["crm2"]["has_token"]
+    assert client.patch("/api/mcp/servers/crm2", json={"enabled": False}, headers=H).status_code == 200
+    assert client.get("/api/tools", headers=H).json()["mcp"][0]["enabled"] is False
+    assert client.delete("/api/mcp/servers/crm2", headers=H).status_code == 200
+    assert client.get("/api/tools", headers=H).json()["mcp"] == []

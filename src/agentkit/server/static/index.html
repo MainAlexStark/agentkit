@@ -24,6 +24,12 @@
   <symbol id="i-book" viewBox="0 0 24 24"><path d="M5 4.5A1.5 1.5 0 0 1 6.5 3H19v15H6.5A1.5 1.5 0 0 0 5 19.5zM5 19.5A1.5 1.5 0 0 0 6.5 21H19v-3"/></symbol>
   <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.5 2.6 3.5 5.5 3.5 8.5s-1 5.9-3.5 8.5c-2.5-2.6-3.5-5.5-3.5-8.5s1-5.9 3.5-8.5z"/></symbol>
   <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/></symbol>
+  <symbol id="i-ask" viewBox="0 0 24 24"><path d="M4.5 5.5h15v10h-8l-4.5 3.5v-3.5H4.5z"/><path d="M10.2 8.9a1.9 1.9 0 0 1 3.7.6c0 1.2-1.9 1.5-1.9 2.6M12 13.6h.01"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><path d="M9 4.5 3.5 6.5v13L9 17.5l6 2 5.5-2v-13L15 6.5zM9 4.5v13M15 6.5v13"/></symbol>
+  <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 3 5 13.5h6L10 21l8-10.5h-6z"/></symbol>
+  <symbol id="i-unlock" viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 7.7-1.5"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="4" y="4.5" width="16" height="6" rx="1.5"/><rect x="4" y="13.5" width="16" height="6" rx="1.5"/><path d="M7.5 7.5h.01M7.5 16.5h.01"/></symbol>
   <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
   <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
   <symbol id="i-memory" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0-6 6c0 2.2 1.2 3.6 2.2 4.6.6.6.8 1.2.8 1.9V17h6v-1.5c0-.7.2-1.3.8-1.9 1-1 2.2-2.4 2.2-4.6a6 6 0 0 0-6-6zM9.5 20.5h5"/></symbol>
@@ -114,6 +120,7 @@
     <section id="messages" class="messages" aria-live="polite"></section>
 
     <div class="composer-wrap">
+      <button id="to-bottom" class="to-bottom" type="button" title="К последнему сообщению" aria-label="К последнему сообщению" hidden><svg><use href="#i-down"/></svg></button>
       <form id="composer" class="composer">
         <div id="attachments" class="attachments" hidden></div>
         <textarea id="input" rows="1" placeholder="Сообщение…" aria-label="Сообщение"></textarea>
@@ -121,17 +128,19 @@
           <input id="file" type="file" multiple hidden>
           <button id="attach" class="icon-btn" type="button" title="Прикрепить файл — можно перетащить или вставить из буфера" aria-label="Прикрепить"><svg><use href="#i-clip"/></svg></button>
           <button id="model-btn" class="select picker-btn" type="button" title="Модель" aria-haspopup="listbox" aria-expanded="false"><span id="model-name">…</span></button>
-          <label class="select" title="Права агента"><svg class="lead"><use href="#i-shield"/></svg><select id="mode" aria-label="Права агента"></select></label>
+          <button id="mode-btn" class="select picker-btn mode-btn" type="button" title="Права агента" aria-haspopup="listbox" aria-expanded="false"><svg class="lead" id="mode-icon"><use href="#i-ask"/></svg><span id="mode-name">…</span></button>
           <span id="hint" class="hint">Enter — отправить · Shift+Enter — перенос</span>
           <button id="stop" class="send stop" type="button" title="Остановить" aria-label="Остановить" hidden><svg><use href="#i-stop"/></svg></button>
           <button id="send" class="send" type="submit" title="Отправить" aria-label="Отправить"><svg><use href="#i-send"/></svg></button>
         </div>
       </form>
     </div>
+    <div id="below" class="below" hidden></div>
   </main>
 
   <aside id="tasks" class="tasks" hidden>
-    <div class="tasks-head"><h4>Задачи</h4><span id="tasks-progress" class="muted"></span></div>
+    <div class="tasks-head"><h4><svg><use href="#i-tasks"/></svg>Задачи</h4><span id="tasks-progress" class="muted"></span>
+      <button id="tasks-close" class="icon-btn" type="button" title="Скрыть" aria-label="Скрыть задачи"><svg><use href="#i-x"/></svg></button></div>
     <div class="progress"><i id="tasks-bar"></i></div>
     <ol id="todo-list" class="todo-list"></ol>
   </aside>
@@ -159,6 +168,7 @@
 
 <div id="popover" class="menu popover" role="menu" hidden></div>
 <div id="model-pop" class="menu model-pop" role="dialog" aria-label="Выбор модели" hidden></div>
+<div id="mode-pop" class="menu mode-pop" role="listbox" aria-label="Права агента" hidden></div>
 
 <script src="/static/app.js"></script>
 </body>

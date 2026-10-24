@@ -7,12 +7,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,12 +24,13 @@ from pydantic import BaseModel
 
 from agentkit.attachments import UPLOADS, save_upload
 from agentkit.events import EventType
+from agentkit.mcp import MCPAuthRequired, MCPClient, MCPServerConfig
 from agentkit.oauth import OAuthError, OAuthOptions
 from agentkit.permissions import Mode
 from agentkit.runs import Busy
 from agentkit.scheduler import next_run, validate_cron
 from agentkit.server.auth import require_admin
-from agentkit.server.service import AgentService
+from agentkit.server.service import MCP_NAME, AgentService
 from agentkit.store.base import ScheduleRec
 from agentkit.tools.base import User
 
@@ -99,6 +102,29 @@ class ScheduleIn(BaseModel):
 
 
 class SchedulePatch(BaseModel):
+    enabled: bool
+
+
+class MCPServerIn(BaseModel):
+    name: str
+    url: str
+    auth: Literal["none", "token", "oauth"] = "none"
+    token: str | None = None  # None — оставить прежний (в интерфейс токен не отдаётся)
+    headers: dict[str, str] | None = None
+    enabled: bool = True
+    deferred: bool | None = None
+    original_name: str | None = None  # правка существующего (в том числе переименование)
+
+
+class MCPTestIn(BaseModel):
+    url: str
+    auth: Literal["none", "token", "oauth"] = "none"
+    token: str | None = None
+    headers: dict[str, str] | None = None
+    name: str | None = None  # для правки: взять сохранённый токен
+
+
+class MCPToggle(BaseModel):
     enabled: bool
 
 
@@ -361,17 +387,13 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
     # ── инструменты, MCP, расход ─────────────────────────────────────
     @api.get("/tools")
     async def tools(user: User = Depends(auth)):
+        custom = await svc.mcp_custom()
         return {
             "tools": [{"name": t.name, "title": t.title, "description": t.description.split("\n")[0], "read_only": t.read_only,
                        "destructive": t.destructive, "deferred": t.deferred, "group": t.group, "source": t.source}
                       for t in svc.registry.all()],
-            "mcp": [{"name": s.name, "ok": s.ok, "tools": s.tools, "error": s.error, "needs_auth": s.needs_auth,
-                     "oauth": s.oauth, "server": s.server_info.get("name") or "",
-                     "version": s.server_info.get("version") or "",
-                     # адрес — только админу: в нём бывают внутренние хосты
-                     "transport": (("http" if c.url else "stdio") if (c := svc.mcp.config(s.name)) else ""),
-                     "address": ((c.url or c.command or "") if c and user.has_role("admin") else "")}
-                    for s in svc.mcp.status.values()],
+            "mcp": [_mcp_view(c, svc.mcp.status.get(c.name), custom.get(c.name), user.has_role("admin"),
+                              c.name not in svc.mcp_file_names) for c in svc.mcp_all],
             "skills": [{"name": k.name, "description": k.description} for k in (svc.agent.skills.skills.values()
                                                                                if svc.agent.skills else [])],
         }
@@ -537,12 +559,92 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         require_admin(user)
         cfg = svc.mcp.config(name)
         if cfg is None or not cfg.url:
-            raise HTTPException(404, f"нет HTTP MCP-сервера {name} в mcp.json")
+            raise HTTPException(404, f"нет HTTP MCP-сервера {name}")
         try:
             url = await svc.oauth.start(name, cfg.url, OAuthOptions.from_config(cfg.oauth), user_id=user.id)
         except OAuthError as e:
             raise HTTPException(400, str(e)) from None
         return {"url": url, "redirect_uri": svc.oauth.redirect_uri}
+
+    @api.post("/mcp/servers")
+    async def mcp_save(body: MCPServerIn, user: User = Depends(auth)):
+        """Добавить или изменить свой MCP-сервер (из mcp.json — только правкой файла)."""
+        require_admin(user)
+        servers = await svc.mcp_custom()
+        old_name = body.original_name or body.name
+        if not MCP_NAME.match(body.name):
+            raise HTTPException(400, "имя — латиница в нижнем регистре, цифры, «-» и «_», до 32 символов")
+        if body.name in svc.mcp_file_names:
+            raise HTTPException(409, f"сервер {body.name} уже задан в mcp.json — выберите другое имя")
+        if body.name != old_name and body.name in servers:
+            raise HTTPException(409, f"сервер {body.name} уже есть")
+        if not body.original_name and body.name in servers:
+            raise HTTPException(409, f"сервер {body.name} уже есть")
+        prev = servers.pop(old_name, {}) if body.original_name else {}
+        token = prev.get("token", "") if body.token is None else body.token.strip()
+        if body.auth == "token" and not token:
+            raise HTTPException(400, "укажите токен или выберите другой способ входа")
+        servers[body.name] = {
+            "url": _check_mcp_url(body.url), "auth": body.auth, "token": token if body.auth == "token" else "",
+            "headers": prev.get("headers", {}) if body.headers is None else _check_headers(body.headers),
+            "enabled": body.enabled, "deferred": body.deferred,
+            "added_by": prev.get("added_by") or user.id, "created_at": prev.get("created_at") or time.time(),
+        }
+        if body.original_name and old_name != body.name:
+            await _forget_oauth(old_name)
+        await svc.save_mcp_custom(servers)
+        st = svc.mcp.status.get(body.name)
+        return {"ok": True, "status": st.__dict__ if st else None}
+
+    @api.post("/mcp/test")
+    async def mcp_test(body: MCPTestIn, user: User = Depends(auth)):
+        """Проверить сервер до сохранения: отвечает ли, сколько инструментов, нужен ли вход."""
+        require_admin(user)
+        token = body.token
+        if token is None and body.name:
+            token = (await svc.mcp_custom()).get(body.name, {}).get("token", "")
+        cfg = MCPServerConfig(name=body.name or "test", url=_check_mcp_url(body.url),
+                              token=(token or None) if body.auth == "token" else None,
+                              headers=_check_headers(body.headers or {}), timeout=20)
+        client = MCPClient(cfg)
+        try:
+            raw = await asyncio.wait_for(client.list_tools(), 20)
+        except MCPAuthRequired:
+            return {"ok": False, "needs_auth": True,
+                    "error": "сервер просит вход" + ("" if body.auth == "oauth" else " — выберите OAuth или токен")}
+        except Exception as e:  # noqa: BLE001 — любой сбой показываем человеку как есть
+            return {"ok": False, "needs_auth": False, "error": str(e) or type(e).__name__}
+        finally:
+            await client.close()
+        return {"ok": True, "tools": [t.get("title") or t["name"] for t in raw][:50], "count": len(raw),
+                "server": client.server_info.get("name") or "", "version": client.server_info.get("version") or ""}
+
+    @api.patch("/mcp/servers/{name}")
+    async def mcp_toggle(name: str, body: MCPToggle, user: User = Depends(auth)):
+        require_admin(user)
+        servers = await svc.mcp_custom()
+        if name not in servers:
+            raise HTTPException(404, "такого сервера нет среди добавленных в настройках")
+        servers[name]["enabled"] = body.enabled
+        await svc.save_mcp_custom(servers)
+        return {"ok": True}
+
+    @api.delete("/mcp/servers/{name}")
+    async def mcp_delete(name: str, user: User = Depends(auth)):
+        require_admin(user)
+        servers = await svc.mcp_custom()
+        if name not in servers:
+            raise HTTPException(404, "такого сервера нет среди добавленных в настройках")
+        servers.pop(name)
+        await _forget_oauth(name)
+        await svc.save_mcp_custom(servers)
+        return {"ok": True}
+
+    async def _forget_oauth(name: str) -> None:
+        try:
+            await svc.oauth.disconnect(name)
+        except Exception:  # noqa: BLE001 — входа могло и не быть
+            pass
 
     @api.delete("/mcp/{name}/connect")
     async def mcp_disconnect(name: str, user: User = Depends(auth)):
@@ -590,6 +692,42 @@ def _oauth_page(ok: bool, text: str) -> str:
 <body style="font:16px system-ui;padding:40px;text-align:center">
 <p>{'✓' if ok else '✕'} {html.escape(text)}</p><p style="color:#888">Окно можно закрыть.</p>
 <script>try{{window.opener&&window.opener.postMessage({payload},"*");setTimeout(()=>window.close(),1200)}}catch(e){{}}</script>"""
+
+
+def _check_mcp_url(url: str) -> str:
+    url = url.strip()
+    if not re.match(r"^https?://[^\s/]+", url):
+        raise HTTPException(400, "адрес сервера — http(s)://…, например https://example.com/mcp")
+    return url
+
+
+def _check_headers(headers: dict[str, str]) -> dict[str, str]:
+    out = {}
+    for k, v in headers.items():
+        k, v = k.strip(), str(v).strip()
+        if not k:
+            continue
+        if not re.match(r"^[A-Za-z0-9-]+$", k) or not v.isascii():
+            raise HTTPException(400, f"заголовок «{k}»: имя — латиница, цифры и «-», значение — без кириллицы")
+        out[k] = v
+    return out
+
+
+def _mcp_view(c: Any, st: Any, d: dict[str, Any] | None, admin: bool, custom: bool) -> dict[str, Any]:
+    """Сервер для списка в настройках. Токены не отдаются никогда — только «задан/не задан»."""
+    view: dict[str, Any] = {
+        "name": c.name, "enabled": c.enabled, "custom": custom,
+        "ok": bool(st and st.ok), "tools": st.tools if st else 0, "error": st.error if st else "",
+        "needs_auth": bool(st and st.needs_auth), "oauth": bool(st and st.oauth),
+        "server": (st.server_info.get("name") or "") if st else "", "version": (st.server_info.get("version") or "") if st else "",
+        "transport": "http" if c.url else "stdio",
+    }
+    if admin:  # адрес — только админу: в нём бывают внутренние хосты
+        view["address"] = c.url or c.command or ""
+        if custom and d:
+            view.update(auth=d.get("auth", "none"), has_token=bool(d.get("token")), header_names=sorted(d.get("headers") or {}),
+                        deferred=d.get("deferred"), added_by=d.get("added_by", ""))
+    return view
 
 
 def _check_mode(mode: str | None, user: User) -> str | None:

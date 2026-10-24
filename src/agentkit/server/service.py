@@ -59,6 +59,27 @@ def load_mcp_config(path: Path) -> list[MCPServerConfig]:
     return out
 
 
+MCP_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
+def mcp_from_dict(name: str, d: dict[str, Any]) -> MCPServerConfig:
+    """Сервер, добавленный в настройках чата (хранится в базе, не в mcp.json).
+
+    Из интерфейса — только HTTP: stdio-сервер — это запуск команды на машине
+    сервиса, такое добавляется только руками в mcp.json.
+    """
+    auth = d.get("auth", "none")
+    return MCPServerConfig(
+        name=name,
+        url=d["url"],
+        token=(d.get("token") or None) if auth == "token" else None,
+        headers=dict(d.get("headers") or {}),
+        enabled=bool(d.get("enabled", True)),
+        deferred=d.get("deferred"),
+        oauth=True if auth == "oauth" else None,
+    )
+
+
 @dataclass
 class Domain:
     """Предметная часть конкретного агента — единственное, что пишется в новом проекте."""
@@ -95,6 +116,8 @@ class AgentService:
         self.scheduler: Scheduler | None = None
         self.registry: ToolRegistry | None = None
         self.catalog: ModelCatalog | None = None
+        self.mcp_all: list[MCPServerConfig] = []  # вместе с выключенными — для списка в настройках
+        self.mcp_file_names: set[str] = set()
 
     async def start(self) -> None:
         s = self.settings
@@ -142,7 +165,8 @@ class AgentService:
     async def _build_agent(self) -> None:
         if self.mcp:
             await self.mcp.close()
-        self.mcp = MCPManager(load_mcp_config(self.settings.mcp_config), oauth=self.oauth)
+        self.mcp_all = await self.mcp_configs()
+        self.mcp = MCPManager(self.mcp_all, oauth=self.oauth)
         mcp_tools = await self.mcp.connect()
         self.agent = assemble_agent(self.settings, self.domain, self.store, router=self._router,
                                     mcp_tools=mcp_tools, mcp_instructions=self.mcp.instructions)
@@ -157,6 +181,21 @@ class AgentService:
         self.agent.vision_for = self.catalog.vision
         log.info("агент готов: %d инструментов (MCP: %s)", len(self.registry),
                  ", ".join(f"{k}={'ok' if v.ok else 'ошибка'}" for k, v in self.mcp.status.items()) or "нет")
+
+    # ── MCP-серверы: из mcp.json и добавленные в настройках ──────────
+    async def mcp_custom(self) -> dict[str, dict[str, Any]]:
+        return await self.store.kv_get("config", "mcp_servers") or {}
+
+    async def mcp_configs(self) -> list[MCPServerConfig]:
+        """mcp.json главнее: сервер с тем же именем из базы игнорируется (его нельзя «перебить» из UI)."""
+        file = load_mcp_config(self.settings.mcp_config)
+        self.mcp_file_names = {c.name for c in file}
+        custom = [mcp_from_dict(n, d) for n, d in (await self.mcp_custom()).items() if n not in self.mcp_file_names]
+        return [*file, *custom]
+
+    async def save_mcp_custom(self, servers: dict[str, dict[str, Any]]) -> None:
+        await self.store.kv_set("config", "mcp_servers", servers)
+        await self.reload()
 
     async def reload(self) -> None:
         """Перечитать mcp.json и skills без перезапуска — во всех процессах сервиса."""

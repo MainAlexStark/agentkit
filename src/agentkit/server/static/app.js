@@ -129,8 +129,9 @@ function humanSize(n) { return !n ? "" : n < 1024 ? `${n} Б` : n < 1048576 ? `$
 const box = () => $("#messages");
 function nearBottom() { const el = box(); return el.scrollHeight - el.scrollTop - el.clientHeight < 160; }
 function scroll(force) { if (force || nearBottom()) box().scrollTop = box().scrollHeight; }
+function setEmpty(on) { $(".main").classList.toggle("is-empty", on); $("#below").hidden = !on; }
 function add(el, { keepGroup = false } = {}) {
-  $("#empty")?.remove();
+  if ($("#empty")) { $("#empty").remove(); setEmpty(false); }
   // Любой элемент, кроме шагов, закрывает текущую группу действий.
   if (!keepGroup) closeGroup();
   box().append(el); scroll(); return el;
@@ -178,6 +179,13 @@ async function blobURL(path) {
   return u;
 }
 
+function finishBubble(b, text, intermediate = false) {
+  b.classList.remove("streaming");
+  if (intermediate) return; // «Проверю по реестру.» перед действиями — копировать нечего
+  const msg = b.parentElement;
+  msg.querySelector(".msg-actions")?.remove();
+  msg.append(h("div", { class: "msg-actions" }, copyBtn(() => text)));
+}
 function assistantBubble() {
   const b = h("div", { class: "md streaming" });
   add(h("div", { class: "msg assistant" }, b));
@@ -356,7 +364,9 @@ function renderTodos(todos) {
   $("#tasks-bar").style.width = list.length ? `${(done / list.length) * 100}%` : "0";
   const left = list.length - done;
   $("#tasks-count").hidden = !left; $("#tasks-count").textContent = left;
-  if (list.length && !S.tasksShown && innerWidth > 960) { $("#tasks").hidden = false; S.tasksShown = true; }
+  $("#tasks").classList.toggle("all-done", !!list.length && !left);
+  // Сам открываем один раз за разговор и только на широком экране; закрыл человек — больше не навязываем.
+  if (list.length && !S.tasksShown && innerWidth > 960) { toggleTasks(true); S.tasksShown = true; }
 }
 
 function setCost(v) { S.cost = v; $("#cost").textContent = v > 0 ? `$${v.toFixed(v < 0.1 ? 4 : 2)}` : ""; }
@@ -382,7 +392,7 @@ function onEvent(ev) {
       if (ev.agent) break;
       if (d.content) {
         if (!S.bubble) S.bubble = assistantBubble();
-        renderMd(S.bubble, d.content);
+        renderMd(S.bubble, d.content); finishBubble(S.bubble, d.content, !!d.tool_calls?.length);
       } else S.bubble?.parentElement.remove();
       S.bubble?.classList.remove("streaming");
       S.bubble = null; S.bubbleText = "";
@@ -459,7 +469,7 @@ function updateSend() { $("#send").disabled = !$("#input").value.trim() && !S.at
 // ── действия ────────────────────────────────────────────────────────
 async function ensureSession() {
   if (S.sessionId) return S.sessionId;
-  const s = await api("/api/sessions", { method: "POST", body: { model: S.model, mode: $("#mode").value } });
+  const s = await api("/api/sessions", { method: "POST", body: { model: S.model, mode: S.mode } });
   S.sessionId = s.id; S.lastSeq = 0;
   history.replaceState(null, "", `#${s.id}`);
   return s.id;
@@ -479,7 +489,7 @@ async function send(text) {
   if (wasRunning) S.queued.push(el);
   scroll(true);
   try {
-    const r = await api(`/api/sessions/${sid}/messages`, { method: "POST", body: { text, files, model: S.model, mode: $("#mode").value } });
+    const r = await api(`/api/sessions/${sid}/messages`, { method: "POST", body: { text, files, model: S.model, mode: S.mode } });
     if (!r.queued) { setRunning(true); follow(); }
     else if (!wasRunning) { S.queued.push(el); el.classList.add("queued"); setRunning(true); follow(); }
   } catch (e) { alertMsg(e.message); }
@@ -570,22 +580,27 @@ function greeting() {
   return name && name !== S.me?.id ? `${part}, ${name}` : part;
 }
 function emptyState() {
+  // Пустой разговор: приветствие и поле ввода по центру, примеры — под полем (как у Claude).
   const sugg = S.config?.suggestions || [];
-  return h("div", { class: "empty", id: "empty" },
-    h("h1", {}, greeting()),
-    h("p", {}, S.config?.description || "Опишите задачу — агент сам найдёт, посчитает и подготовит."),
-    sugg.length ? h("div", { class: "suggestions" }, sugg.map(t => h("button", { class: "suggestion", type: "button", onclick: () => send(t) }, t))) : null,
+  $("#below").replaceChildren(
+    sugg.length ? h("div", { class: "suggestions" }, sugg.map(t => h("button", { class: "suggestion", type: "button", onclick: () => send(t) },
+      h("span", {}, t), icon("chev")))) : "",
     h("div", { class: "facts" },
       h("span", {}, icon("shield"), "Изменения — только после вашего подтверждения"),
       h("span", {}, icon("clip"), "Можно приложить файлы и фото"),
       h("span", {}, icon("send"), "Можно дописывать, пока агент работает")));
+  setEmpty(true);
+  return h("div", { class: "empty", id: "empty" },
+    h("div", { class: "empty-mark" }, (S.config?.name || "A").trim().charAt(0).toUpperCase()),
+    h("h1", {}, greeting()),
+    h("p", {}, S.config?.description || "Опишите задачу — агент сам найдёт, посчитает и подготовит."));
 }
 
 function resetView() {
   S.stream?.abort();
   S.steps.clear(); S.subs.clear(); S.cards.clear(); S.bubble = null; S.group = null; S.lastSeq = 0; setCost(0);
   box().replaceChildren(emptyState());
-  S.tasksShown = false; renderTodos([]); $("#tasks").hidden = true; setRunning(false);
+  S.tasksShown = false; renderTodos([]); toggleTasks(false); setRunning(false);
   S.queued = []; S.attachments = []; renderAttachments();
 }
 
@@ -597,13 +612,13 @@ async function openSession(id) {
   try { s = await api(`/api/sessions/${id}`); } catch { S.sessionId = null; history.replaceState(null, "", "#"); return; }
   $("#chat-title").textContent = s.title || "Новый разговор";
   if (s.state?.model) setModel(s.state.model);
-  if (s.state?.mode) $("#mode").value = s.state.mode;
+  setMode(s.state?.mode || S.config.default_mode);
   if (!s.messages.length) box().replaceChildren(emptyState());
   for (const m of s.messages) {
     if (m.meta?.hidden) continue;
     if (m.role === "user") userMsg(m.content, m.seq);
     else if (m.role === "assistant") {
-      if (m.content) { const b = assistantBubble(); b.classList.remove("streaming"); renderMd(b, m.content); }
+      if (m.content) { const b = assistantBubble(); renderMd(b, m.content); finishBubble(b, m.content, !!m.tool_calls?.length); }
       for (const tc of m.tool_calls || []) stepRow(tc.id, tc.function.name, safeJSON(tc.function.arguments));
     } else if (m.role === "tool") stepResult(m.tool_call_id, m.content, m.meta?.is_error, m.meta?.ui, m.meta?.elapsed_ms);
   }
@@ -672,6 +687,51 @@ function popMenu(btn, items) {
   const r = btn.getBoundingClientRect();
   pop.style.left = `${Math.max(8, Math.min(r.right - 200, innerWidth - 216))}px`; pop.style.top = `${r.bottom + 4}px`;
   pop.hidden = false; pop._owner = btn; btn.setAttribute("aria-expanded", "true");
+}
+
+// ── права агента ────────────────────────────────────────────────────
+const MODES = {
+  default: { icon: "ask", name: "Спрашивать", help: "Любое изменение — через карточку подтверждения" },
+  accept_edits: { icon: "pen", name: "Правки без вопросов", help: "Файлы рабочей папки правит сам, остальное — с подтверждением" },
+  plan: { icon: "map", name: "Только план", help: "Изучает и предлагает план, ничего не меняет" },
+  readonly: { icon: "eye", name: "Только чтение", help: "Читает и ищет, ничего не меняет" },
+  auto: { icon: "bolt", name: "Авто", help: "Меняет без вопросов, кроме необратимого", tone: "warn" },
+  bypass: { icon: "unlock", name: "Без вопросов", help: "Всё без подтверждения — только для доверенных задач", tone: "err" },
+};
+const modeInfo = m => MODES[m] || { icon: "shield", name: m, help: "" };
+function setMode(m, { save = false } = {}) {
+  S.mode = m;
+  const info = modeInfo(m);
+  $("#mode-icon use").setAttribute("href", "#i-" + info.icon);
+  $("#mode-name").textContent = info.name;
+  $("#mode-btn").dataset.tone = info.tone || "";
+  $("#mode-btn").title = `Права агента: ${info.name}. ${info.help}`;
+  if (save && S.sessionId) api(`/api/sessions/${S.sessionId}`, { method: "PATCH", body: { mode: m } }).catch(e => toast(e.message));
+}
+function openModePicker() {
+  const pop = $("#mode-pop"), btn = $("#mode-btn");
+  if (!pop.hidden) { closeMenus(); return; }
+  closeMenus();
+  const items = S.config.modes.map(m => {
+    const info = modeInfo(m);
+    return h("button", { class: "mode-opt" + (m === S.mode ? " on" : ""), type: "button", role: "option", "aria-selected": String(m === S.mode),
+      "data-tone": info.tone || "", onclick: () => { setMode(m, { save: true }); closeMenus(); btn.focus(); } },
+      h("span", { class: "mode-ic" }, icon(info.icon)),
+      h("span", { class: "mode-text" }, h("b", {}, info.name), h("span", {}, info.help)),
+      m === S.mode ? h("span", { class: "mo-check" }, icon("check")) : null);
+  });
+  pop.replaceChildren(h("div", { class: "pop-label" }, "Права агента в этом разговоре"), ...items);
+  const r = btn.getBoundingClientRect();
+  pop.style.left = `${Math.max(8, Math.min(r.left, innerWidth - 336))}px`;
+  pop.style.bottom = `${innerHeight - r.top + 6}px`;
+  pop.hidden = false; btn.setAttribute("aria-expanded", "true");
+  (pop.querySelector(".mode-opt.on") || pop.querySelector(".mode-opt"))?.focus();
+  pop.onkeydown = e => {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    e.preventDefault();
+    const all = [...pop.querySelectorAll(".mode-opt")], i = all.indexOf(document.activeElement);
+    all[(i + (e.key === "ArrowDown" ? 1 : -1) + all.length) % all.length].focus();
+  };
 }
 
 // ── модели ──────────────────────────────────────────────────────────
@@ -958,6 +1018,86 @@ async function memoryTab(body) {
 // ── инструменты ─────────────────────────────────────────────────────
 const TOOL_GROUPS = { core: "Основные", files: "Файлы", web: "Интернет", memory: "Память", shell: "Команды" };
 const openSources = new Set(["domain"]);
+// ── свой MCP-сервер ─────────────────────────────────────────────────
+const slug = v => v.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32);
+function nameFromUrl(u) {
+  try {
+    const x = new URL(u);
+    // localhost и IP ничего не говорят о сервере — берём первую часть пути (/crm/mcp → crm).
+    if (/^(localhost|[\d.]+|\[.*\])$/.test(x.hostname)) return slug(x.pathname.split("/").find(p => p && p !== "mcp") || "");
+    return slug(x.hostname.replace(/^(www|mcp|api)\./, "").split(".")[0] || "");
+  } catch { return ""; }
+}
+function parseHeaders(text) {
+  const out = {};
+  for (const line of text.split("\n")) {
+    const i = line.indexOf(":");
+    if (i > 0) out[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  }
+  return out;
+}
+function mcpEditor(srv, onClose) {
+  const editing = !!srv;
+  let auth = srv?.auth || "none", deferred = srv?.deferred ?? null, nameTouched = editing;
+  const name = h("input", { value: srv?.name || "", placeholder: "crm", spellcheck: "false", autocomplete: "off" });
+  const url = h("input", { value: srv?.address || "", placeholder: "https://example.com/mcp", spellcheck: "false", autocomplete: "off", inputmode: "url" });
+  const token = h("input", { type: "password", autocomplete: "new-password",
+    placeholder: editing && srv.has_token ? "Токен сохранён — оставьте пустым, чтобы не менять" : "Bearer-токен сервера" });
+  const headers = h("textarea", { rows: 2, spellcheck: "false", class: "mono",
+    placeholder: srv?.header_names?.length ? `Заданы: ${srv.header_names.join(", ")} — впишите заново, чтобы изменить` : "X-Api-Key: …\nX-Workspace: …" });
+  const result = h("div", { class: "test-result", hidden: true });
+  name.addEventListener("input", () => { nameTouched = true; });
+  url.addEventListener("input", () => { if (!nameTouched) name.value = nameFromUrl(url.value.trim()); result.hidden = true; });
+  const tokenRow = fieldRow("Токен", token, "Хранится в базе сервиса и никому не показывается");
+  const syncAuth = () => { tokenRow.hidden = auth !== "token"; };
+  const payload = () => ({
+    url: url.value.trim(), auth,
+    token: auth === "token" ? (token.value.trim() || (editing && srv.has_token ? null : "")) : "",
+    headers: headers.value.trim() ? parseHeaders(headers.value) : (editing ? null : {}),
+  });
+  const test = h("button", { class: "btn sm", type: "button", onclick: async () => {
+    test.disabled = true; result.hidden = false; result.className = "test-result"; result.replaceChildren(h("span", { class: "spin" }), "Проверяю…");
+    try {
+      const r = await api("/api/mcp/test", { method: "POST", body: { ...payload(), name: editing ? srv.name : null } });
+      result.className = "test-result " + (r.ok ? "ok" : r.needs_auth ? "warn" : "err");
+      result.replaceChildren(icon(r.ok ? "check" : r.needs_auth ? "lock" : "x"), h("div", {},
+        h("b", {}, r.ok ? `Отвечает${r.server ? ` · ${r.server}` : ""}${r.version ? ` v${r.version}` : ""} · ${r.count} ${plural(r.count, "инструмент", "инструмента", "инструментов")}`
+          : r.needs_auth ? (auth === "oauth" ? "Сервер просит вход — после сохранения нажмите «Подключить»" : "Сервер просит вход — выберите OAuth или токен") : "Не отвечает"),
+        r.ok && r.tools.length ? h("div", { class: "help" }, r.tools.slice(0, 12).join(", ") + (r.count > 12 ? "…" : "")) : null,
+        !r.ok && r.error && !r.needs_auth ? h("div", { class: "help" }, r.error) : null));
+    } catch (e) { result.className = "test-result err"; result.replaceChildren(icon("x"), e.message); }
+    finally { test.disabled = false; }
+  } }, icon("plug"), "Проверить");
+  const save = h("button", { class: "btn primary sm", type: "button", onclick: async () => {
+    save.disabled = true;
+    try {
+      const r = await api("/api/mcp/servers", { method: "POST", body: { ...payload(), name: slug(name.value), deferred, enabled: srv?.enabled ?? true,
+        original_name: editing ? srv.name : null } });
+      const st = r.status;
+      toast(st?.ok ? `«${slug(name.value)}» подключён: ${st.tools} ${plural(st.tools, "инструмент", "инструмента", "инструментов")}`
+        : st?.needs_auth ? "Сохранено — нажмите «Подключить», чтобы войти" : `Сохранено, но сервер не отвечает${st?.error ? `: ${st.error}` : ""}`);
+      openSources.add("mcp:" + slug(name.value));
+      onClose(true);
+    } catch (e) { toast(e.message); save.disabled = false; }
+  } }, editing ? "Сохранить" : "Добавить");
+  const el = h("div", { class: "sch-editor mcp-editor" },
+    h("div", { class: "ed-head" }, h("b", {}, editing ? `Сервер ${srv.name}` : "Новый MCP-сервер"),
+      h("button", { class: "icon-btn", type: "button", "aria-label": "Закрыть", onclick: () => onClose(false) }, icon("x"))),
+    h("div", { class: "two" }, fieldRow("Адрес", url, "Streamable HTTP, обычно оканчивается на /mcp"), fieldRow("Имя", name, "Латиницей — так инструменты будут подписаны у агента")),
+    h("div", { class: "field-row" }, h("label", {}, "Вход"),
+      segmented([["none", "Без входа"], ["token", "Токен"], ["oauth", "OAuth — войти в браузере"]], auth, v => { auth = v; syncAuth(); result.hidden = true; })),
+    tokenRow,
+    h("details", { class: "more-opts" }, h("summary", {}, "Дополнительно"),
+      fieldRow("Заголовки", headers, "По одному на строку: «Имя: значение»"),
+      h("div", { class: "field-row" }, h("label", {}, "Описания инструментов"),
+        segmented([[null, "Авто"], [false, "Сразу в промпте"], [true, "По запросу"]], deferred, v => { deferred = v; }),
+        h("div", { class: "help" }, "«По запросу» экономит контекст, если у сервера много инструментов. Авто — так, если их больше 15."))),
+    result,
+    h("div", { class: "compose-bar" }, test, h("span", { class: "grow" }), h("button", { class: "btn ghost sm", type: "button", onclick: () => onClose(false) }, "Отмена"), save));
+  syncAuth();
+  setTimeout(() => (editing ? url : url).focus(), 0);
+  return el;
+}
 async function toolsTab(body) {
   const d = await api("/api/tools");
   const admin = S.config.is_admin;
@@ -996,19 +1136,40 @@ async function toolsTab(body) {
     const builtin = d.tools.filter(t => t.source === "builtin");
     const out = [];
     if (domain.length) out.push(card({ key: "domain", ic: "cube", title: "Инструменты агента", sub: count(domain.length), tools: domain }));
+    if (d.mcp.length || admin) out.push(h("div", { class: "src-label" }, h("span", {}, "MCP-серверы"),
+      admin ? h("button", { class: "btn ghost sm", type: "button", onclick: () => openEditor(null) }, icon("plus"), "Добавить сервер") : null));
     for (const s of d.mcp) {
       const tools = d.tools.filter(t => t.group === `mcp:${s.name}`);
-      let action = null;
-      if (admin && s.needs_auth) action = h("button", { class: "btn primary sm", onclick: () => mcpConnect(s.name) }, icon("plug"), "Подключить");
-      else if (admin && s.oauth) action = h("button", { class: "btn ghost sm", onclick: async () => {
+      const acts = [];
+      if (admin && s.enabled && s.needs_auth) acts.push(h("button", { class: "btn primary sm", onclick: () => mcpConnect(s.name) }, icon("plug"), "Подключить"));
+      if (admin && s.custom) {
+        const more = h("button", { class: "icon-btn", title: "Ещё", "aria-label": "Действия", "aria-haspopup": "menu" }, icon("dots"));
+        more.addEventListener("click", e => { e.stopPropagation(); popMenu(more, [
+          ["pen", "Изменить", () => openEditor(s)],
+          s.oauth ? ["logout", "Выйти из аккаунта", async () => { await api(`/api/mcp/${encodeURIComponent(s.name)}/connect`, { method: "DELETE" }); openSettings("tools"); }] : null,
+          [s.enabled ? "pause" : "play", s.enabled ? "Выключить" : "Включить", async () => {
+            await api(`/api/mcp/servers/${encodeURIComponent(s.name)}`, { method: "PATCH", body: { enabled: !s.enabled } }); openSettings("tools"); }],
+          ["trash", "Удалить", async () => {
+            if (!confirm(`Удалить сервер ${s.name}? Его инструменты пропадут у агента.`)) return;
+            await api(`/api/mcp/servers/${encodeURIComponent(s.name)}`, { method: "DELETE" }); openSettings("tools"); }, true],
+        ].filter(Boolean)); });
+        acts.push(more);
+      } else if (admin && s.oauth) acts.push(h("button", { class: "btn ghost sm", onclick: async () => {
         if (!confirm(`Отключить ${s.name}? Токены будут отозваны.`)) return;
-        await api(`/api/mcp/${encodeURIComponent(s.name)}/connect`, { method: "DELETE" }); openSettings("tools"); } }, "Отключить");
-      const sub = s.ok ? [count(s.tools), s.server && s.server !== s.name ? s.server : "", s.version ? `v${s.version}` : "", s.oauth ? "OAuth" : ""].filter(Boolean).join(" · ")
+        await api(`/api/mcp/${encodeURIComponent(s.name)}/connect`, { method: "DELETE" }); openSettings("tools"); } }, "Отключить"));
+      const sub = !s.enabled ? "Выключен — агент его не видит"
+        : s.ok ? [count(s.tools), s.server && s.server !== s.name ? s.server : "", s.version ? `v${s.version}` : "", s.oauth ? "OAuth" : ""].filter(Boolean).join(" · ")
         : s.needs_auth ? "Нужно войти — подключение по OAuth" : (s.error || "нет связи");
-      out.push(card({ key: "mcp:" + s.name, ic: s.transport === "stdio" ? "tools" : "globe", title: s.name, sub, tools, actions: action,
-        status: s.ok ? pill("ok", "подключён") : s.needs_auth ? pill("warn", "нужен вход") : pill("err", "ошибка"),
-        extra: admin && s.address ? h("div", { class: "src-addr" }, h("code", {}, s.address)) : null }));
+      const c = card({ key: "mcp:" + s.name, ic: s.transport === "stdio" ? "tools" : "server", title: s.name, sub, tools,
+        actions: acts.length ? acts : null,
+        status: !s.enabled ? pill("", "выключен") : s.ok ? pill("ok", "на связи") : s.needs_auth ? pill("warn", "нужен вход") : pill("err", "ошибка"),
+        extra: admin && s.address ? h("div", { class: "src-addr" }, h("code", {}, s.address), h("span", { class: "tag" }, s.custom ? "добавлен в настройках" : "mcp.json")) : null });
+      c?.classList.toggle("disabled", !s.enabled);
+      out.push(c);
     }
+    if (admin && !d.mcp.length && !q) out.push(h("button", { class: "add-card", type: "button", onclick: () => openEditor(null) },
+      h("span", { class: "src-icon" }, icon("plus")), h("span", { class: "src-title" }, h("b", {}, "Подключить MCP-сервер"),
+        h("span", { class: "src-sub" }, "CRM, склад, почта, база знаний — всё, что умеет MCP, станет инструментами агента"))));
     if (builtin.length) {
       const groups = [...new Set(builtin.map(t => t.group || "core"))];
       out.push(card({ key: "builtin", ic: "gear", title: "Встроенные", sub: `${count(builtin.length)} · ${groups.map(g => TOOL_GROUPS[g] || g).join(", ")}`, tools: builtin }));
@@ -1022,6 +1183,11 @@ async function toolsTab(body) {
     if (!cards.childElementCount) cards.append(h("p", { class: "muted center" }, "Ничего не нашлось"));
   };
   const okMcp = d.mcp.filter(s => s.ok).length;
+  const slot = h("div");
+  const openEditor = srv => {
+    slot.replaceChildren(mcpEditor(srv, saved => { slot.replaceChildren(); if (saved) openSettings("tools"); }));
+    slot.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  };
   const [search] = searchBox(`Найти среди ${d.tools.length} инструментов`, v => { q = v; draw(); });
   body.append(
     h("div", { class: "tiles" },
@@ -1030,7 +1196,7 @@ async function toolsTab(body) {
       h("div", { class: "tile" }, h("b", {}, d.tools.filter(t => !t.read_only).length), h("span", {}, "изменяют данные — с подтверждением"))),
     h("div", { class: "toolbar" }, search, admin ? h("button", { class: "btn sm", title: "Перечитать mcp.json и папку навыков без перезапуска", onclick: async e => {
       e.currentTarget.disabled = true; await api("/api/reload", { method: "POST" }); openSettings("tools"); toast("Инструменты перечитаны"); } }, icon("refresh"), "Перечитать") : null),
-    cards);
+    slot, cards);
   draw();
 }
 
@@ -1194,6 +1360,7 @@ const panels = {
 function closeMenus() {
   $("#user-menu").hidden = true; $("#user-btn").setAttribute("aria-expanded", "false");
   $("#model-pop").hidden = true; $("#model-btn").setAttribute("aria-expanded", "false");
+  $("#mode-pop").hidden = true; $("#mode-btn").setAttribute("aria-expanded", "false");
   const pop = $("#popover");
   if (!pop.hidden) { pop.hidden = true; pop._owner?.setAttribute("aria-expanded", "false"); }
 }
@@ -1371,6 +1538,12 @@ function applyTheme(t) {
 function autosize() { const t = $("#input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, innerHeight * 0.4) + "px"; updateSend(); }
 function logout() { store.set("agent_token", null); S.token = null; closeSettings(); closeMenus(); $("#app").hidden = true; $("#login").hidden = false; }
 function toggleSidebar(open) { $("#sidebar").classList.toggle("open", open); $("#scrim").hidden = !open; }
+function toggleTasks(open = $("#tasks").hidden) {
+  $("#tasks").hidden = !open;
+  $("#toggle-tasks").classList.toggle("on", open); $("#toggle-tasks").setAttribute("aria-expanded", String(open));
+  // На узком экране панель — поверх чата: нужен фон, по которому её можно закрыть.
+  if (innerWidth <= 960) $("#scrim").hidden = !open;
+}
 function newChat() { S.sessionId = null; history.replaceState(null, "", "#"); resetView(); $("#chat-title").textContent = "Новый разговор"; renderSessions(); toggleSidebar(false); $("#input").focus(); }
 function renderMe() {
   $("#me-name").textContent = S.me.name;
@@ -1393,12 +1566,7 @@ async function boot() {
   if (S.config.help_url) { $("#menu-help").href = S.config.help_url; $("#menu-help").hidden = false; }
   setModel(S.config.default_model);
   loadCatalog().catch(() => {}); // имена и цены моделей — не задерживая старт
-  const modeNames = { default: "Спрашивать", accept_edits: "Правки без вопросов", plan: "Только план", readonly: "Только чтение", auto: "Авто", bypass: "Без вопросов" };
-  const modeHelp = { default: "Любое изменение данных — через карточку подтверждения", accept_edits: "Файлы рабочей папки агент правит сам, остальное — с подтверждением",
-    plan: "Агент только изучает и предлагает план, ничего не меняет", readonly: "Только чтение", auto: "Изменения без подтверждения, кроме отмеченных как опасные",
-    bypass: "Всё без подтверждения — только для доверенных задач" };
-  $("#mode").replaceChildren(...S.config.modes.map(m => h("option", { value: m, title: modeHelp[m] }, modeNames[m] || m)));
-  $("#mode").value = S.config.default_mode;
+  setMode(S.config.default_mode);
   $("#login").hidden = true; $("#app").hidden = false;
   const id = location.hash.slice(1);
   if (id) await openSession(id); else { resetView(); await loadSessions(); }
@@ -1431,14 +1599,17 @@ $("#settings-close").addEventListener("click", closeSettings);
 $("#settings").addEventListener("mousedown", e => { if (e.target.id === "settings") closeSettings(); });
 document.addEventListener("click", e => { if (!e.target.closest(".menu, #user-btn, .more")) closeMenus(); });
 $("#menu").addEventListener("click", () => toggleSidebar(true));
-$("#scrim").addEventListener("click", () => toggleSidebar(false));
+$("#scrim").addEventListener("click", () => { toggleSidebar(false); if (!$("#tasks").hidden && innerWidth <= 960) toggleTasks(false); });
 $("#session-filter").addEventListener("input", renderSessions);
-$("#toggle-tasks").addEventListener("click", () => ($("#tasks").hidden = !$("#tasks").hidden));
-$("#mode").addEventListener("change", () => S.sessionId && api(`/api/sessions/${S.sessionId}`, { method: "PATCH", body: { mode: $("#mode").value } }));
+$("#toggle-tasks").addEventListener("click", () => { S.tasksShown = true; toggleTasks(); });
+$("#tasks-close").addEventListener("click", () => toggleTasks(false));
+$("#to-bottom").addEventListener("click", () => scroll(true));
+$("#messages").addEventListener("scroll", () => { $("#to-bottom").hidden = nearBottom(); }, { passive: true });
+$("#mode-btn").addEventListener("click", e => { e.stopPropagation(); openModePicker(); });
 $("#model-btn").addEventListener("click", e => { e.stopPropagation(); openModelPicker(); });
 document.addEventListener("keydown", e => {
   if (e.key === "Escape") {
-    if (!$("#user-menu").hidden || !$("#popover").hidden || !$("#model-pop").hidden) closeMenus();
+    if (!$("#user-menu").hidden || !$("#popover").hidden || !$("#model-pop").hidden || !$("#mode-pop").hidden) closeMenus();
     else if (!$("#settings").hidden) closeSettings();
     else toggleSidebar(false);
   }
