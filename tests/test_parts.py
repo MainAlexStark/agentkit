@@ -317,3 +317,20 @@ async def test_model_catalog_keeps_snapshot_on_failure():
     assert cat.get("or:x/a").price_in is None and cat.get("or:x/a").name == "A"
     await cat.refresh(force=True)
     assert "or" in cat.errors and [m.id for m in cat.models()][0] == "or:x/a"
+
+
+async def test_openrouter_cyrillic_app_name_does_not_break_requests():
+    # Имя агента «Метролог» уходит в X-Title; httpx не пропускает не-ASCII в заголовках.
+    import httpx
+
+    from agentkit.llm.openai_compat import OpenAICompatProvider, openrouter
+
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["title"] = req.headers["X-Title"]
+        return httpx.Response(200, json={"data": [{"id": "a/b"}]})
+
+    p = OpenAICompatProvider(openrouter("k", app_name="Метролог ЕИ"), client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    assert await p.list_models() == [{"id": "a/b"}]
+    assert seen["title"] == "Metrolog EI"

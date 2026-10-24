@@ -42,8 +42,28 @@ class OpenAICompatConfig:
     timeout: float = 300.0
 
 
+_TRANSLIT = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
+                     ["a", "b", "v", "g", "d", "e", "e", "zh", "z", "i", "y", "k", "l", "m", "n", "o", "p", "r", "s",
+                      "t", "u", "f", "kh", "ts", "ch", "sh", "shch", "", "y", "", "e", "yu", "ya"], strict=True))
+
+
+def ascii_header(value: str) -> str:
+    """Значение HTTP-заголовка только в ASCII: httpx падает на «Метролог» ещё до отправки
+    ('ascii' codec can't encode…) — и не работают ни чат, ни список моделей.
+    Кириллицу транслитерируем, остальное не-ASCII выкидываем."""
+    out = []
+    for ch in value:
+        low = ch.lower()
+        if low in _TRANSLIT:
+            t = _TRANSLIT[low]
+            out.append(t.capitalize() if ch != low else t)
+        elif ord(ch) < 128:
+            out.append(ch)
+    return "".join(out).strip() or "agent"
+
+
 def openrouter(api_key: str, *, app_name: str = "agentkit", app_url: str = "") -> OpenAICompatConfig:
-    headers = {"X-Title": app_name}
+    headers = {"X-Title": ascii_header(app_name)}
     if app_url:
         headers["HTTP-Referer"] = app_url
     return OpenAICompatConfig(
@@ -155,7 +175,7 @@ class OpenAICompatProvider:
 
     async def stream(self, req: LLMRequest) -> AsyncIterator[StreamChunk]:
         cfg = self.cfg
-        headers = {"Content-Type": "application/json", **cfg.headers}
+        headers = {"Content-Type": "application/json", **{k: ascii_header(v) for k, v in cfg.headers.items()}}
         if cfg.api_key:
             headers["Authorization"] = f"{cfg.auth_scheme} {cfg.api_key}"
         body = self.build_body(req)
@@ -240,7 +260,7 @@ class OpenAICompatProvider:
 
     async def list_models(self) -> list[dict[str, Any]]:
         """Сырой каталог /models (у OpenRouter — с ценами, контекстом и поддержкой tools)."""
-        headers = dict(self.cfg.headers)
+        headers = {k: ascii_header(v) for k, v in self.cfg.headers.items()}
         if self.cfg.api_key:
             headers["Authorization"] = f"{self.cfg.auth_scheme} {self.cfg.api_key}"
         r = await self._http().get(self.cfg.base_url.rstrip("/") + "/models", headers=headers)
