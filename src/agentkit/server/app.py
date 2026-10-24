@@ -30,6 +30,7 @@ from agentkit.permissions import Mode
 from agentkit.runs import Busy
 from agentkit.scheduler import next_run, validate_cron
 from agentkit.server.auth import require_admin
+from agentkit.server.platform_api import register as register_platform
 from agentkit.server.service import MCP_NAME, AgentService
 from agentkit.store.base import ScheduleRec
 from agentkit.tools.base import User
@@ -41,6 +42,7 @@ class NewSession(BaseModel):
     title: str = ""
     model: str | None = None
     mode: str | None = None
+    project_id: str | None = None
 
 
 class PatchSession(BaseModel):
@@ -209,17 +211,27 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
                 "help_url": s.help_url or None, "plan_name": s.plan_name or None}
 
     # ── сессии ───────────────────────────────────────────────────────
+    async def project_names(user: User) -> dict[str, str]:
+        if svc.projects is None:
+            return {}
+        return {p.id: p.name for p, _ in await svc.store.project_list_for(user.id)}
+
     @api.get("/sessions")
-    async def list_sessions(user: User = Depends(auth)):
-        items = await svc.store.list_sessions(user.id, limit=100)
+    async def list_sessions(project_id: str | None = None, user: User = Depends(auth)):
+        items = await svc.store.list_sessions(user.id, limit=100, project_id=project_id)
+        names = await project_names(user)
         return [{"id": s.id, "title": s.title or "Новый разговор", "updated_at": s.updated_at,
+                 "project_id": s.project_id if s.project_id in names else None, "project": names.get(s.project_id or ""),
                  "running": await svc.runs.active_run(s.id) is not None} for s in items]
 
     @api.post("/sessions")
     async def create_session(body: NewSession, user: User = Depends(auth)):
         state = {k: v for k, v in {"model": await svc.check_model(body.model),
                                    "mode": _check_mode(body.mode, user)}.items() if v}
-        s = await svc.store.create_session(user.id, title=body.title, agent=svc.agent.spec.name, state=state)
+        if body.project_id:
+            await app.state.project_access(body.project_id, user)  # участник проекта — хотя бы читатель
+        s = await svc.store.create_session(user.id, title=body.title, agent=svc.agent.spec.name, state=state,
+                                           project_id=body.project_id or None)
         return {"id": s.id}
 
     @api.get("/sessions/{session_id}")
@@ -227,8 +239,12 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         s = await own_session(session_id, user)
         msgs = await svc.store.list_messages(session_id)
         pending = await svc.store.list_approvals(session_id, status="pending")
+        project = None
+        if s.project_id and svc.projects is not None:
+            p, role = await svc.store.project_role(s.project_id, user.id)
+            project = {"id": p.id, "name": p.name, "role": role} if p and role else None
         return {
-            "id": s.id, "title": s.title, "state": s.state,
+            "id": s.id, "title": s.title, "state": s.state, "project": project,
             "messages": [{"seq": seq, **m.to_dict()} for seq, m in msgs],
             "approvals": [{**a.__dict__, "destructive": bool((t := svc.registry.get(a.tool_name)) and t.destructive),
                            "title": t.title if t else ""} for a in pending],
@@ -666,6 +682,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         await svc.reload()
         return _oauth_page(True, f"{server} подключён")
 
+    register_platform(api, app, svc, auth)
     app.include_router(api)
     for r in extra_routers or []:
         app.include_router(r)

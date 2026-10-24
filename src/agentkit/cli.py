@@ -152,6 +152,14 @@ def main(argv: list[str] | None = None) -> None:
     p_e.add_argument("--offline", action="store_true", help="только кейсы со script (без реальной модели)")
     p_e.add_argument("--only")
     p_e.add_argument("--json")
+    # Мост и песочница разбирают свои аргументы сами — здесь только передаём остаток.
+    sub.add_parser("bridge", help="мост: папки и команды этого компьютера для агента", add_help=False)
+    sub.add_parser("sandbox", help="песочница для run_python / run_bash", add_help=False)
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in ("bridge", "sandbox"):
+        from agentkit import bridge, sandbox  # noqa: PLC0415
+
+        return (bridge if argv[0] == "bridge" else sandbox).main(argv[1:])
     a = ap.parse_args(argv)
     if a.cmd == "new":
         new(a.name, a.dest, a.git)

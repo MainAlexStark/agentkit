@@ -32,7 +32,16 @@ from sqlalchemy.pool import StaticPool
 
 from agentkit.events import Event, EventType
 from agentkit.messages import Message, new_id
-from agentkit.store.base import ApprovalRec, MemoryRec, RunRec, ScheduleRec, SessionRec, Store
+from agentkit.store.base import (
+    ApprovalRec,
+    MemoryRec,
+    ProjectFileRec,
+    ProjectRec,
+    RunRec,
+    ScheduleRec,
+    SessionRec,
+    Store,
+)
 
 md = MetaData()
 
@@ -46,6 +55,40 @@ sessions = Table(
     Column("state", JSON, default=dict),
     Column("created_at", Float, nullable=False),
     Column("updated_at", Float, nullable=False),
+    Column("project_id", String(40), nullable=True, index=True),
+)
+
+projects = Table(
+    "ak_projects", md,
+    Column("id", String(40), primary_key=True),
+    Column("owner_id", String(120), index=True, nullable=False),
+    Column("name", String(200), nullable=False),
+    Column("description", Text, default=""),
+    Column("instructions", Text, default=""),
+    Column("created_at", Float, nullable=False),
+    Column("updated_at", Float, nullable=False),
+)
+
+# Доступ к проекту: user_id="*" — всем пользователям сервиса. role: viewer | editor.
+project_members = Table(
+    "ak_project_members", md,
+    Column("project_id", String(40), ForeignKey("ak_projects.id", ondelete="CASCADE"), primary_key=True),
+    Column("user_id", String(120), primary_key=True),
+    Column("role", String(20), nullable=False),
+    Column("added_at", Float, nullable=False),
+)
+
+project_files = Table(
+    "ak_project_files", md,
+    Column("id", String(40), primary_key=True),
+    Column("project_id", String(40), ForeignKey("ak_projects.id", ondelete="CASCADE"), index=True),
+    Column("name", String(300), nullable=False),
+    Column("path", String(500), nullable=False),
+    Column("size", Integer, default=0),
+    Column("kind", String(20), default="file"),
+    Column("text_chars", Integer, default=0),
+    Column("added_by", String(120), default=""),
+    Column("created_at", Float, nullable=False),
 )
 
 messages = Table(
@@ -153,6 +196,24 @@ kv = Table(
 )
 
 
+def _add_missing_columns(conn: Any) -> None:
+    """create_all не добавляет колонки в уже существующие таблицы — досоздаём новые.
+
+    Без этого у развёрнутого сервиса (база от прошлой версии) обновление падало бы
+    на первом запросе к ak_sessions.project_id. Только добавление nullable-колонок;
+    переименования и удаления — уже Alembic.
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    insp = sa_inspect(conn)
+    for table in md.sorted_tables:
+        have = {c["name"] for c in insp.get_columns(table.name)}
+        for col in table.columns:
+            if col.name not in have and col.nullable:
+                ddl = col.type.compile(dialect=conn.dialect)
+                conn.exec_driver_sql(f'ALTER TABLE {table.name} ADD COLUMN "{col.name}" {ddl}')
+
+
 def _url(url: str) -> str:
     # Привычные DSN «postgres://…» из docker-окружения → асинхронный драйвер.
     if url.startswith("postgres://"):
@@ -180,16 +241,17 @@ class SQLStore(Store):
             if self.engine.dialect.name == "sqlite":
                 await c.exec_driver_sql("PRAGMA foreign_keys=ON")
             await c.run_sync(md.create_all)
+            await c.run_sync(_add_missing_columns)
         return self
 
     async def close(self) -> None:
         await self.engine.dispose()
 
     # ── сессии ───────────────────────────────────────────────────────
-    async def create_session(self, user_id, *, title="", agent="main", parent_id=None, state=None):
+    async def create_session(self, user_id, *, title="", agent="main", parent_id=None, state=None, project_id=None):
         now = time.time()
         rec = SessionRec(id=new_id("s_"), user_id=user_id, title=title, agent=agent, parent_id=parent_id,
-                         state=state or {}, created_at=now, updated_at=now)
+                         state=state or {}, created_at=now, updated_at=now, project_id=project_id)
         async with self.engine.begin() as c:
             await c.execute(insert(sessions).values(**rec.__dict__))
         return rec
@@ -199,8 +261,10 @@ class SQLStore(Store):
             r = (await c.execute(select(sessions).where(sessions.c.id == session_id))).mappings().first()
         return SessionRec(**r) if r else None
 
-    async def list_sessions(self, user_id, *, limit=50, include_children=False):
+    async def list_sessions(self, user_id, *, limit=50, include_children=False, project_id=None):
         q = select(sessions).where(sessions.c.user_id == user_id)
+        if project_id:
+            q = q.where(sessions.c.project_id == project_id)
         if not include_children:
             q = q.where(sessions.c.parent_id.is_(None))
         q = q.order_by(sessions.c.updated_at.desc()).limit(limit)
@@ -431,6 +495,106 @@ class SQLStore(Store):
                                 .values(value=value, updated_at=time.time()))
             else:
                 await c.execute(insert(kv).values(ns=ns, key=key, value=value, updated_at=time.time()))
+
+    async def kv_list(self, ns):
+        async with self.engine.connect() as c:
+            return {r.key: r.value for r in await c.execute(select(kv.c.key, kv.c.value).where(kv.c.ns == ns))}
+
+    async def known_user_ids(self):
+        async with self.engine.connect() as c:
+            rows = await c.execute(select(sessions.c.user_id).distinct())
+            return sorted({r.user_id for r in rows})
+
+    # ── проекты ──────────────────────────────────────────────────────
+    async def project_create(self, owner_id, name, *, description="", instructions=""):
+        now = time.time()
+        rec = ProjectRec(id=new_id("p_"), owner_id=owner_id, name=name, description=description,
+                         instructions=instructions, created_at=now, updated_at=now)
+        async with self.engine.begin() as c:
+            await c.execute(insert(projects).values(**rec.__dict__))
+        return rec
+
+    async def project_get(self, project_id):
+        async with self.engine.connect() as c:
+            r = (await c.execute(select(projects).where(projects.c.id == project_id))).mappings().first()
+        return ProjectRec(**r) if r else None
+
+    async def project_update(self, project_id, **fields):
+        fields.setdefault("updated_at", time.time())
+        async with self.engine.begin() as c:
+            await c.execute(update(projects).where(projects.c.id == project_id).values(**fields))
+
+    async def project_delete(self, project_id):
+        async with self.engine.begin() as c:
+            if self.engine.dialect.name == "sqlite":
+                await c.exec_driver_sql("PRAGMA foreign_keys=ON")
+            await c.execute(delete(project_files).where(project_files.c.project_id == project_id))
+            await c.execute(delete(project_members).where(project_members.c.project_id == project_id))
+            # Разговоры проекта остаются у людей — просто без проекта.
+            await c.execute(update(sessions).where(sessions.c.project_id == project_id).values(project_id=None))
+            await c.execute(delete(memory).where(memory.c.scope == f"project:{project_id}"))
+            await c.execute(delete(projects).where(projects.c.id == project_id))
+
+    async def project_list_for(self, user_id):
+        """Свои, открытые лично и открытые всем — с ролью: owner | editor | viewer."""
+        async with self.engine.connect() as c:
+            own = (await c.execute(select(projects).where(projects.c.owner_id == user_id))).mappings().all()
+            shared = (await c.execute(
+                select(projects, project_members.c.role, project_members.c.user_id.label("member"))
+                .join(project_members, project_members.c.project_id == projects.c.id)
+                .where(project_members.c.user_id.in_([user_id, "*"])))).mappings().all()
+        out: dict[str, tuple[ProjectRec, str]] = {r["id"]: (ProjectRec(**r), "owner") for r in own}
+        rank = {"viewer": 1, "editor": 2, "owner": 3}
+        for r in shared:
+            rec = ProjectRec(**{k: r[k] for k in ProjectRec.__dataclass_fields__})
+            prev = out.get(rec.id)
+            if prev is None or rank[r["role"]] > rank[prev[1]]:
+                out[rec.id] = (rec, r["role"])
+        return sorted(out.values(), key=lambda x: -x[0].updated_at)
+
+    async def project_role(self, project_id, user_id):
+        p = await self.project_get(project_id)
+        if p is None:
+            return None, None
+        if p.owner_id == user_id:
+            return p, "owner"
+        async with self.engine.connect() as c:
+            rows = (await c.execute(select(project_members.c.role).where(
+                project_members.c.project_id == project_id, project_members.c.user_id.in_([user_id, "*"])))).all()
+        roles = {r.role for r in rows}
+        return p, ("editor" if "editor" in roles else "viewer" if "viewer" in roles else None)
+
+    async def project_members_list(self, project_id):
+        async with self.engine.connect() as c:
+            rows = await c.execute(select(project_members).where(project_members.c.project_id == project_id)
+                                   .order_by(project_members.c.added_at))
+            return [dict(r) for r in rows.mappings()]
+
+    async def project_member_set(self, project_id, user_id, role):
+        async with self.engine.begin() as c:
+            await c.execute(delete(project_members).where(project_members.c.project_id == project_id,
+                                                          project_members.c.user_id == user_id))
+            if role:
+                await c.execute(insert(project_members).values(project_id=project_id, user_id=user_id, role=role,
+                                                               added_at=time.time()))
+
+    async def project_file_add(self, rec):
+        async with self.engine.begin() as c:
+            await c.execute(insert(project_files).values(**rec.__dict__))
+            await c.execute(update(projects).where(projects.c.id == rec.project_id).values(updated_at=time.time()))
+        return rec
+
+    async def project_files_list(self, project_id):
+        async with self.engine.connect() as c:
+            rows = await c.execute(select(project_files).where(project_files.c.project_id == project_id)
+                                   .order_by(project_files.c.created_at))
+            return [ProjectFileRec(**r) for r in rows.mappings()]
+
+    async def project_file_delete(self, project_id, file_id):
+        async with self.engine.begin() as c:
+            res = await c.execute(delete(project_files).where(project_files.c.project_id == project_id,
+                                                              project_files.c.id == file_id))
+            return res.rowcount > 0
 
     async def kv_delete(self, ns, key):
         async with self.engine.begin() as c:

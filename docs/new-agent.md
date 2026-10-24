@@ -80,3 +80,13 @@ agentkit eval evals/ --app app.evals:make_agent                        # на м
 cd ~/projects/agentkit && git pull
 cd ~/projects/<имя> && agentkit vendor && pytest && git commit -am "agentkit X.Y.Z"
 ```
+
+## Проекты, компьютер, песочница
+
+Включены по умолчанию, в проекте писать ничего не нужно:
+
+- **Проекты** (`AGENT_ENABLE_PROJECTS`) — пользователи сами заводят их в чате: инструкции, файлы, память, доступ коллегам.
+- **Компьютер** (`AGENT_ENABLE_DEVICES`) — «Настройки → Компьютер» выдаёт ключ и команду запуска `bridge.py`; агент получает инструменты `pc_*` только пока мост подключён.
+- **Песочница** — на VPS `deploy.sh` поднимает сервис `sandbox` и прописывает `AGENT_SANDBOX_URL`; локально: `agentkit sandbox --root data/workspaces --port 8090`. Нужны другие библиотеки — допишите их в `deploy/sandbox.Dockerfile`.
+
+Если агенту что-то из этого не нужно (например, сервис для внешних клиентов) — выключите переменной.

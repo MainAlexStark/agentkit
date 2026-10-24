@@ -21,6 +21,7 @@ from typing import Any
 from agentkit.agent import Agent, AgentConfig, AgentSpec, RunOutcome
 from agentkit.builder import make_router, standard_tools
 from agentkit.bus import Bus, make_bus
+from agentkit.devices import DeviceHub, device_tools
 from agentkit.events import EventType, RunStatus
 from agentkit.hooks import Hooks
 from agentkit.llm.catalog import ModelCatalog
@@ -29,6 +30,7 @@ from agentkit.mcp import MCPManager, MCPServerConfig
 from agentkit.messages import Usage
 from agentkit.oauth import OAuthBroker
 from agentkit.permissions import Mode, Permissions
+from agentkit.projects import ProjectLibrary, project_tools
 from agentkit.runs import Busy, RunManager
 from agentkit.scheduler import Scheduler
 from agentkit.server.auth import Auth
@@ -39,6 +41,7 @@ from agentkit.store.sql import SQLStore
 from agentkit.subagents import DEFAULT_SUBAGENTS, task_tool
 from agentkit.tools.base import Tool, User
 from agentkit.tools.registry import ToolRegistry
+from agentkit.tools.sandbox import sandbox_tools
 from agentkit.tracing import JSONLTracer, LogTracer
 
 log = logging.getLogger("agentkit.service")
@@ -116,6 +119,8 @@ class AgentService:
         self.scheduler: Scheduler | None = None
         self.registry: ToolRegistry | None = None
         self.catalog: ModelCatalog | None = None
+        self.devices: DeviceHub | None = None
+        self.projects: ProjectLibrary | None = None
         self.mcp_all: list[MCPServerConfig] = []  # вместе с выключенными — для списка в настройках
         self.mcp_file_names: set[str] = set()
 
@@ -126,12 +131,17 @@ class AgentService:
             # сессии, отмена «мимо», SSE без живых событий. Лучше не стартовать.
             raise RuntimeError("AGENT_WORKERS > 1 требует AGENT_REDIS_URL")
         s.data_dir.mkdir(parents=True, exist_ok=True)
+        # Папка рабочих пространств нужна до первого разговора: песочница монтирует её при старте.
+        (s.workspace_dir or s.data_dir / "workspaces").mkdir(parents=True, exist_ok=True)
         self.store = await SQLStore(s.database_url).init()
         self.bus = make_bus(s.redis_url)
         await self.bus.start()
         self.bus.on_broadcast(self._on_broadcast)
         self.oauth = OAuthBroker(self.store, s.public_url.rstrip("/") + "/oauth/callback", bus=self.bus,
                                  client_name=s.name)
+        self.devices = DeviceHub(self.store, self.bus) if s.enable_devices else None
+        self.projects = (ProjectLibrary(self.store, s.data_dir / "projects", inline_limit=s.project_inline_chars)
+                         if s.enable_projects else None)
         self.runs = RunManager(self.store, self.bus)
         self.runs.on_idle = self._drain_inbox
         await self._fail_orphans()
@@ -169,7 +179,12 @@ class AgentService:
         self.mcp = MCPManager(self.mcp_all, oauth=self.oauth)
         mcp_tools = await self.mcp.connect()
         self.agent = assemble_agent(self.settings, self.domain, self.store, router=self._router,
-                                    mcp_tools=mcp_tools, mcp_instructions=self.mcp.instructions)
+                                    mcp_tools=mcp_tools, mcp_instructions=self.mcp.instructions,
+                                    extra_tools=self._platform_tools())
+        if self.projects:
+            self.agent.context_providers.append(self.projects.context)
+        if self.devices:
+            self.agent.context_providers.append(self.devices.context)
         self.registry = self.agent.tools
         s = self.settings
         if self.catalog is None:
@@ -181,6 +196,17 @@ class AgentService:
         self.agent.vision_for = self.catalog.vision
         log.info("агент готов: %d инструментов (MCP: %s)", len(self.registry),
                  ", ".join(f"{k}={'ok' if v.ok else 'ошибка'}" for k, v in self.mcp.status.items()) or "нет")
+
+    def _platform_tools(self) -> list[Tool]:
+        s = self.settings
+        out: list[Tool] = []
+        if self.projects:
+            out += project_tools(self.projects)
+        if self.devices:
+            out += device_tools(self.devices)
+        if s.sandbox_url:
+            out += sandbox_tools(s.sandbox_url, s.sandbox_token)
+        return out
 
     # ── MCP-серверы: из mcp.json и добавленные в настройках ──────────
     async def mcp_custom(self) -> dict[str, dict[str, Any]]:
@@ -327,12 +353,13 @@ def assemble_agent(
     router: ModelRouter | None = None,
     mcp_tools: list[Tool] | None = None,
     mcp_instructions: Callable[[], str] | None = None,
+    extra_tools: list[Tool] | None = None,
 ) -> Agent:
     """Собирает агента из настроек и домена. Один и тот же код для сервиса, evals и тестов."""
     reg = standard_tools(
         files=s.enable_files, shell=s.enable_shell, web_fetch=s.enable_web, tavily_key=s.tavily_api_key,
         memory_global_roles=domain.memory_global_roles, subagents=False,
-        extra=[*domain.tools, *(mcp_tools or [])],
+        extra=[*domain.tools, *(extra_tools or []), *(mcp_tools or [])],
     )
     if domain.subagents:
         reg.add(task_tool(domain.subagents))

@@ -57,6 +57,17 @@ prepare_extra() {
   env_set "${PREFIX}_REDIS_URL" "redis://redis:6379/0"
   [ -n "$(env_get "${PREFIX}_WORKERS")" ] || env_set "${PREFIX}_WORKERS" "2"
 
+  # Песочница (run_python): свой контейнер; токен общий у агента и песочницы, придумывается один раз.
+  env_set "${PREFIX}_SANDBOX_URL" "http://sandbox:8090"
+  local sb_token
+  sb_token="$(env_get "${PREFIX}_SANDBOX_TOKEN")"
+  if [ -z "$sb_token" ]; then
+    sb_token="$(gen_secret 24)"
+    env_set "${PREFIX}_SANDBOX_TOKEN" "$sb_token"
+  fi
+  printf 'SANDBOX_TOKEN=%s\n' "$sb_token" > deploy/sandbox.env
+  chmod 600 deploy/sandbox.env
+
   # Токены придумываются один раз: перевыпуск выкинул бы всех из чата
   # и сломал бы интеграции, которые ходят с сервисным токеном.
   if [ -z "$(env_get "${PREFIX}_TOKENS")" ]; then

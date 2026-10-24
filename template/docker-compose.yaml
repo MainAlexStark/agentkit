@@ -32,6 +32,41 @@ services:
     networks:
       - mcp-network
       - internal
+      - sandbox
+
+  # Песочница для run_python / run_bash: сеть без выхода наружу, без секретов и базы.
+  # С агентом делит только рабочие папки разговоров (подпапка workspaces тома data).
+  sandbox:
+    build:
+      context: .
+      dockerfile: deploy/sandbox.Dockerfile
+    container_name: agent-service-sandbox
+    restart: unless-stopped
+    env_file:
+      - ./deploy/sandbox.env
+    depends_on:
+      agent-service:
+        condition: service_healthy
+    volumes:
+      - type: volume
+        source: data
+        target: /work
+        volume:
+          subpath: workspaces
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /home/sandbox
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 3g
+    cpus: 2
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks:
+      - sandbox
 
   postgres:
     image: postgres:16-alpine
@@ -79,3 +114,6 @@ networks:
   mcp-network:
     external: true
   internal:
+  # internal: true — у песочницы нет выхода в интернет.
+  sandbox:
+    internal: true

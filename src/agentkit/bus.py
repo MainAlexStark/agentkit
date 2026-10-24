@@ -95,6 +95,11 @@ class Bus:
 
     def lock(self, key: str, ttl: float = 30.0) -> contextlib.AbstractAsyncContextManager: ...
 
+    # Очередь «один положил — один забрал»: команды мосту компьютера и ответы на них.
+    # Мост ждёт команду в одном процессе сервиса, а вызов инструмента идёт в другом.
+    async def push(self, key: str, item: dict[str, Any], ttl: float = 600) -> None: ...
+    async def pop(self, key: str, timeout: float) -> dict[str, Any] | None: ...
+
     async def start(self) -> None: ...
     async def close(self) -> None: ...
 
@@ -106,6 +111,7 @@ class LocalBus(Bus):
         self._partial: dict[str, list[str]] = defaultdict(list)
         self._handlers: list[Handler] = []
         self._named: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._queues: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
 
     async def try_lock(self, session_id, value, ttl):
         if session_id in self._locks:
@@ -149,6 +155,19 @@ class LocalBus(Bus):
 
     def lock(self, key, ttl=30.0):
         return self._named[key]
+
+    async def push(self, key, item, ttl=600):
+        self._queues[key].put_nowait(item)
+
+    async def pop(self, key, timeout):
+        q = self._queues[key]
+        try:
+            return await asyncio.wait_for(q.get(), timeout)
+        except TimeoutError:
+            return None
+        finally:
+            if q.empty():
+                self._queues.pop(key, None)
 
     async def start(self):
         return None
@@ -238,6 +257,15 @@ class RedisBus(Bus):
 
     def lock(self, key, ttl=30.0):
         return _RedisLock(self.r, self._k("lock", key), ttl)
+
+    async def push(self, key, item, ttl=600):
+        k = self._k("q", key)
+        await self.r.rpush(k, json.dumps(item, ensure_ascii=False, default=str))
+        await self.r.expire(k, int(ttl))  # никто не забрал — очередь сама исчезнет
+
+    async def pop(self, key, timeout):
+        res = await self.r.blpop([self._k("q", key)], timeout=max(1, int(timeout)))
+        return json.loads(res[1]) if res else None
 
     async def start(self):
         await self.r.ping()

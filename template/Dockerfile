@@ -23,7 +23,7 @@ ARG VERSION=docker
 ENV AGENT_VERSION=${VERSION}
 
 # Не от root: агент с инструментами файлов и shell не должен иметь прав на весь контейнер.
-RUN useradd -m -u 1000 agent && mkdir -p /srv/data && chown -R agent /srv/data
+RUN useradd -m -u 1000 agent && mkdir -p /srv/data/workspaces && chown -R agent /srv/data
 USER agent
 
 EXPOSE 8080

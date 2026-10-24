@@ -310,6 +310,11 @@ function widget(w) {
     const imgs = (w.items || []).filter(a => a.type === "image");
     return imgs.length ? h("div", { class: "msg assistant" }, imgs.map(a => h("img", { class: "thumb", src: `data:${a.mime};base64,${a.data}` }))) : null;
   }
+  if (w.type === "files") {
+    const isImg = n => /\.(png|jpe?g|gif|webp)$/i.test(n);
+    return h("div", { class: "msg assistant" }, h("div", { class: "files out-files" },
+      (w.files || []).map(f => fileView({ ...f, kind: isImg(f.name) ? "image" : "file" }))));
+  }
   if (w.type === "choices") return null; // вопрос рисуется по событию ask_user
   return null;
 }
@@ -469,7 +474,7 @@ function updateSend() { $("#send").disabled = !$("#input").value.trim() && !S.at
 // ── действия ────────────────────────────────────────────────────────
 async function ensureSession() {
   if (S.sessionId) return S.sessionId;
-  const s = await api("/api/sessions", { method: "POST", body: { model: S.model, mode: S.mode } });
+  const s = await api("/api/sessions", { method: "POST", body: { model: S.model, mode: S.mode, project_id: S.projectId || null } });
   S.sessionId = s.id; S.lastSeq = 0;
   history.replaceState(null, "", `#${s.id}`);
   return s.id;
@@ -564,7 +569,8 @@ function renderSessions() {
         class: "session" + (s.id === S.sessionId ? " active" : ""), role: "button", tabindex: "0", title: s.title,
         onclick: e => { if (!e.target.closest(".more, input")) { openSession(s.id); toggleSidebar(false); } },
         onkeydown: e => { if (e.key === "Enter" && e.target === item) openSession(s.id); },
-      }, h("span", {}, s.title), s.running ? h("i", { class: "dot", title: "Агент работает" }) : null, more);
+      }, h("span", {}, s.title), s.project ? h("small", { class: "s-proj", title: `Проект «${s.project}»` }, icon("folder")) : null,
+      s.running ? h("i", { class: "dot", title: "Агент работает" }) : null, more);
       more.addEventListener("click", e => { e.stopPropagation(); sessionMenu(s, item, more); });
       out.push(item);
     }
@@ -581,7 +587,8 @@ function greeting() {
 }
 function emptyState() {
   // Пустой разговор: приветствие и поле ввода по центру, примеры — под полем (как у Claude).
-  const sugg = S.config?.suggestions || [];
+  const proj = S.projectId && S.project?.id === S.projectId ? S.project : null;
+  const sugg = proj ? [] : S.config?.suggestions || [];
   $("#below").replaceChildren(
     sugg.length ? h("div", { class: "suggestions" }, sugg.map(t => h("button", { class: "suggestion", type: "button", onclick: () => send(t) },
       h("span", {}, t), icon("chev")))) : "",
@@ -592,8 +599,9 @@ function emptyState() {
   setEmpty(true);
   return h("div", { class: "empty", id: "empty" },
     h("div", { class: "empty-mark" }, (S.config?.name || "A").trim().charAt(0).toUpperCase()),
-    h("h1", {}, greeting()),
-    h("p", {}, S.config?.description || "Опишите задачу — агент сам найдёт, посчитает и подготовит."));
+    h("h1", {}, proj ? proj.name : greeting()),
+    h("p", {}, proj ? (proj.description || "Агент видит инструкции, файлы и память проекта.")
+      : S.config?.description || "Опишите задачу — агент сам найдёт, посчитает и подготовит."));
 }
 
 function resetView() {
@@ -610,7 +618,9 @@ async function openSession(id) {
   history.replaceState(null, "", `#${id}`);
   let s;
   try { s = await api(`/api/sessions/${id}`); } catch { S.sessionId = null; history.replaceState(null, "", "#"); return; }
+  showPage(false);
   $("#chat-title").textContent = s.title || "Новый разговор";
+  S.projectId = s.project?.id || null; setCrumb(s.project);
   if (s.state?.model) setModel(s.state.model);
   setMode(s.state?.mode || S.config.default_mode);
   if (!s.messages.length) box().replaceChildren(emptyState());
@@ -1356,6 +1366,355 @@ const panels = {
   },
 };
 
+// ── страницы: проекты ───────────────────────────────────────────────
+// Маршруты: #projects — список, #p/<id> — проект, #<id сессии> — разговор.
+function showPage(on) {
+  $(".main").classList.toggle("has-page", on);
+  $("#page").hidden = !on;
+  for (const id of ["messages", "below"]) if (on) $("#" + id).hidden = true;
+  $("#messages").hidden = on;
+  $(".composer-wrap").hidden = on;
+  if (on) { $("#below").hidden = true; $("#to-bottom").hidden = true; toggleTasks(false); }
+  $("#nav-projects").classList.toggle("on", on);
+}
+function setCrumb(project) {
+  const c = $("#crumb");
+  c.hidden = !project;
+  if (project) { c.querySelector("span").textContent = project.name; c.onclick = () => openProject(project.id); }
+}
+const ROLE_NAMES = { owner: "владелец", editor: "редактор", viewer: "читатель" };
+const fileIcon = kind => ({ pdf: "file", docx: "file", xlsx: "chart", image: "eye", text: "file" }[kind] || "file");
+
+async function openProjects() {
+  S.stream?.abort(); S.sessionId = null; renderSessions();
+  history.replaceState(null, "", "#projects");
+  showPage(true); setCrumb(null);
+  $("#chat-title").textContent = "Проекты";
+  const page = $("#page");
+  page.replaceChildren(h("div", { class: "page-inner" }, h("p", { class: "muted" }, "Загрузка…")));
+  let items;
+  try { items = await api("/api/projects"); } catch (e) { page.replaceChildren(h("div", { class: "page-inner" }, h("p", { class: "error-text" }, e.message))); return; }
+  const list = h("div", { class: "proj-grid" });
+  let q = "";
+  const draw = () => {
+    const shown = items.filter(p => !q || `${p.name} ${p.description}`.toLowerCase().includes(q));
+    list.replaceChildren(...shown.map(p => h("button", { class: "proj-card", type: "button", onclick: () => openProject(p.id) },
+      h("div", { class: "pc-head" }, h("span", { class: "pc-icon" }, icon("folder")), h("b", {}, p.name),
+        p.role !== "owner" ? h("span", { class: "tag shared" }, ROLE_NAMES[p.role]) : p.public ? h("span", { class: "tag" }, icon("users"), "всем") : p.shared ? h("span", { class: "tag" }, icon("users"), "общий") : null),
+      h("p", {}, p.description || h("span", { class: "faint" }, "Без описания")),
+      h("div", { class: "pc-meta" }, `${p.chats} ${plural(p.chats, "разговор", "разговора", "разговоров")} · ${p.files} ${plural(p.files, "файл", "файла", "файлов")} · ${rel(p.updated_at)}`))));
+    if (!shown.length) list.replaceChildren(items.length ? h("p", { class: "muted" }, "Ничего не нашлось")
+      : emptyBlock("folder", "Проектов пока нет", "Проект собирает разговоры по одной теме: общие инструкции, файлы-знания и память. Например, «Поверка счётчиков воды» с методиками и шаблонами протоколов.",
+        h("button", { class: "btn primary sm", type: "button", onclick: () => newProjectForm() }, icon("plus"), "Создать проект")));
+  };
+  const [search] = searchBox("Поиск проектов", v => { q = v; draw(); });
+  page.replaceChildren(h("div", { class: "page-inner" },
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Проекты"), h("p", { class: "muted" }, "Инструкции, файлы и память для разговоров на одну тему")),
+      h("button", { class: "btn primary", type: "button", onclick: () => newProjectForm() }, icon("plus"), "Новый проект")),
+    items.length ? h("div", { class: "toolbar" }, search) : null, list));
+  draw();
+}
+
+function newProjectForm() {
+  const name = h("input", { placeholder: "Например: Поверка счётчиков воды", maxlength: 200 });
+  const desc = h("textarea", { rows: 2, placeholder: "Над чем работаете — коротко, для себя и коллег" });
+  const close = () => $("#modal2").remove();
+  const create = h("button", { class: "btn primary", type: "button", onclick: async () => {
+    if (!name.value.trim()) { name.focus(); return; }
+    create.disabled = true;
+    try { const p = await api("/api/projects", { method: "POST", body: { name: name.value, description: desc.value } }); close(); openProject(p.id); }
+    catch (e) { toast(e.message); create.disabled = false; }
+  } }, "Создать");
+  const m = h("div", { class: "modal", id: "modal2", onmousedown: e => { if (e.target.id === "modal2") close(); } },
+    h("div", { class: "modal-card dialog", role: "dialog", "aria-modal": "true" },
+      h("div", { class: "dialog-head" }, h("h3", {}, "Новый проект"), h("button", { class: "icon-btn", "aria-label": "Закрыть", onclick: close }, icon("x"))),
+      fieldRow("Название", name), fieldRow("Описание", desc),
+      h("div", { class: "compose-bar" }, h("span", { class: "grow" }), h("button", { class: "btn ghost", type: "button", onclick: close }, "Отмена"), create)));
+  m.addEventListener("keydown", e => { if (e.key === "Escape") { e.stopPropagation(); close(); } if (e.key === "Enter" && e.target === name) create.click(); });
+  document.body.append(m); name.focus();
+}
+
+async function openProject(id) {
+  S.stream?.abort(); S.sessionId = null; renderSessions();
+  history.replaceState(null, "", `#p/${id}`);
+  showPage(true); setCrumb(null);
+  const page = $("#page");
+  let p;
+  try { p = await api(`/api/projects/${id}`); } catch (e) { toast(e.message); openProjects(); return; }
+  S.project = p;
+  $("#chat-title").textContent = p.name;
+  const canEdit = p.role === "owner" || p.role === "editor";
+
+  // начать разговор в проекте
+  const input = h("textarea", { rows: 2, placeholder: `Новый разговор в проекте «${p.name}»…` });
+  const start = async () => {
+    const text = input.value.trim(); if (!text) return;
+    S.projectId = p.id; showPage(false); resetView(); S.sessionId = null;
+    $("#chat-title").textContent = "Новый разговор"; setCrumb({ id: p.id, name: p.name });
+    await send(text);
+  };
+  input.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); start(); } });
+  const starter = h("div", { class: "compose-card proj-start" }, input,
+    h("div", { class: "compose-bar" }, h("span", { class: "help" }, "Агент увидит инструкции, файлы и память проекта"), h("span", { class: "grow" }),
+      h("button", { class: "send", type: "button", "aria-label": "Начать", onclick: start }, icon("send"))));
+
+  const chats = h("div", { class: "proj-chats" },
+    p.chats.length ? p.chats.map(c => h("button", { class: "proj-chat", type: "button", onclick: () => openSession(c.id) },
+      icon("chat"), h("span", {}, c.title), h("small", {}, rel(c.updated_at))))
+      : h("p", { class: "muted small" }, "Ваших разговоров в этом проекте пока нет."));
+
+  const more = h("button", { class: "icon-btn", title: "Ещё", "aria-label": "Действия с проектом" }, icon("dots"));
+  more.addEventListener("click", e => { e.stopPropagation(); popMenu(more, [
+    canEdit ? ["pen", "Переименовать", () => editProjectField(p, "name")] : null,
+    canEdit ? ["file", "Изменить описание", () => editProjectField(p, "description")] : null,
+    p.role === "owner" ? ["trash", "Удалить проект", async () => {
+      if (!confirm(`Удалить проект «${p.name}»? Файлы и память проекта удалятся, разговоры останутся без проекта.`)) return;
+      await api(`/api/projects/${p.id}`, { method: "DELETE" }); toast("Проект удалён"); openProjects(); loadSessions(); }, true] : null,
+  ].filter(Boolean)); });
+
+  page.replaceChildren(h("div", { class: "page-inner proj-page" },
+    h("button", { class: "back-link", type: "button", onclick: openProjects }, icon("back"), "Все проекты"),
+    h("div", { class: "proj-layout" },
+      h("div", { class: "proj-main" },
+        h("div", { class: "page-head" }, h("div", {}, h("h1", {}, p.name), p.description ? h("p", { class: "muted" }, p.description) : null),
+          h("div", { class: "head-actions" }, p.role === "owner" ? h("button", { class: "btn sm", type: "button", onclick: () => shareDialog(p) }, icon("users"), "Доступ") : h("span", { class: "tag shared" }, ROLE_NAMES[p.role]), (canEdit ? more : null))),
+        starter,
+        h("div", { class: "section-title" }, "Разговоры"), chats),
+      h("aside", { class: "proj-side" },
+        instructionsCard(p, canEdit), filesCard(p, canEdit), memoryCard(p, canEdit)))));
+  setTimeout(() => input.focus(), 0);
+}
+
+async function editProjectField(p, field) {
+  const v = prompt(field === "name" ? "Название проекта" : "Описание проекта", p[field] || "");
+  if (v == null) return;
+  try { await api(`/api/projects/${p.id}`, { method: "PATCH", body: { [field]: v } }); openProject(p.id); loadSessions(); } catch (e) { toast(e.message); }
+}
+
+function sideCard(title, ic, action, ...kids) {
+  return h("section", { class: "side-card" }, h("div", { class: "sc-head" }, icon(ic), h("b", {}, title), h("span", { class: "grow" }), action || null), ...kids);
+}
+
+function instructionsCard(p, canEdit) {
+  const body = h("div", { class: "sc-body" });
+  const view = () => body.replaceChildren(p.instructions ? h("div", { class: "instr" }, p.instructions)
+    : h("p", { class: "muted small" }, canEdit ? "Как агенту работать в этом проекте: тон, формат, на что опираться." : "Инструкций нет."));
+  const edit = () => {
+    const ta = h("textarea", { rows: 8, placeholder: "Например: отвечай по методикам из файлов проекта, суммы в рублях, протоколы — по шаблону." });
+    ta.value = p.instructions || "";
+    const save = h("button", { class: "btn primary sm", type: "button", onclick: async () => {
+      save.disabled = true;
+      try { await api(`/api/projects/${p.id}`, { method: "PATCH", body: { instructions: ta.value } }); p.instructions = ta.value.trim(); view(); toast("Инструкции сохранены"); }
+      catch (e) { toast(e.message); save.disabled = false; }
+    } }, "Сохранить");
+    body.replaceChildren(h("div", { class: "mem-edit" }, ta, h("div", { class: "compose-bar" }, h("span", { class: "grow" }),
+      h("button", { class: "btn ghost sm", type: "button", onclick: view }, "Отмена"), save)));
+    ta.focus();
+  };
+  view();
+  return sideCard("Инструкции", "book", canEdit ? h("button", { class: "icon-btn", title: "Изменить", "aria-label": "Изменить инструкции", onclick: edit }, icon("pen")) : null, body);
+}
+
+function filesCard(p, canEdit) {
+  const list = h("div", { class: "pfiles" });
+  const draw = () => {
+    const total = p.files.reduce((a, f) => a + (f.text_chars || 0), 0);
+    list.replaceChildren(...p.files.map(f => h("div", { class: "pfile" },
+      h("span", { class: "pf-icon" }, icon(fileIcon(f.kind))),
+      h("button", { class: "pf-name", type: "button", title: "Скачать", onclick: () => downloadProjectFile(p.id, f) }, h("span", {}, f.name),
+        h("small", {}, [humanSize(f.size), f.text_chars ? `${Math.round(f.text_chars / 1000) || 1} тыс. симв.` : "без текста"].filter(Boolean).join(" · "))),
+      canEdit ? h("button", { class: "icon-btn", title: "Удалить", "aria-label": "Удалить файл", onclick: async () => {
+        if (!confirm(`Удалить «${f.name}» из проекта?`)) return;
+        await api(`/api/projects/${p.id}/files/${f.id}`, { method: "DELETE" }); p.files = p.files.filter(x => x.id !== f.id); draw(); } }, icon("trash")) : null)));
+    if (!p.files.length) list.append(h("p", { class: "muted small" }, canEdit ? "PDF, Word, Excel, текст — агент будет опираться на них." : "Файлов нет."));
+    else list.append(h("div", { class: "pf-note" }, total <= (p.inline_limit || 40000) && p.inline !== false
+      ? "Текст всех файлов агент видит целиком" : "Файлов много — агент ищет по ним, когда нужно"));
+  };
+  const input = h("input", { type: "file", multiple: true, hidden: true });
+  const upload = async files => {
+    for (const file of files) {
+      const fd = new FormData(); fd.append("file", file);
+      const ph = h("div", { class: "pfile loading" }, h("span", { class: "spin" }), h("span", {}, file.name));
+      list.prepend(ph);
+      try {
+        const r = await fetch(`/api/projects/${p.id}/files`, { method: "POST", headers: { Authorization: `Bearer ${S.token}` }, body: fd });
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+        p.files.push(await r.json());
+      } catch (e) { toast(`${file.name}: ${e.message}`); }
+      ph.remove();
+    }
+    p.inline = p.files.reduce((a, f) => a + (f.text_chars || 0), 0) <= 40000;
+    draw();
+  };
+  input.addEventListener("change", () => { upload([...input.files]); input.value = ""; });
+  const card = sideCard("Файлы", "file", canEdit ? h("button", { class: "icon-btn", title: "Добавить файлы", "aria-label": "Добавить файлы", onclick: () => input.click() }, icon("upload")) : null, input, list);
+  if (canEdit) {
+    card.addEventListener("dragover", e => { if (e.dataTransfer?.types?.includes("Files")) { e.preventDefault(); e.stopPropagation(); card.classList.add("drop"); } });
+    card.addEventListener("dragleave", () => card.classList.remove("drop"));
+    card.addEventListener("drop", e => { e.preventDefault(); e.stopPropagation(); card.classList.remove("drop"); document.body.classList.remove("dragging"); upload([...e.dataTransfer.files]); });
+  }
+  draw();
+  return card;
+}
+
+async function downloadProjectFile(pid, f) {
+  try {
+    const r = await fetch(`/api/projects/${pid}/files/${f.id}`, { headers: { Authorization: `Bearer ${S.token}` } });
+    if (!r.ok) throw new Error(r.statusText);
+    const u = URL.createObjectURL(await r.blob());
+    const a = h("a", { href: u, download: f.name }); document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(u), 10000);
+  } catch (e) { toast(e.message); }
+}
+
+function memoryCard(p, canEdit) {
+  const list = h("div", { class: "pmem" });
+  const draw = () => {
+    list.replaceChildren(...p.memory.map(m => h("div", { class: "pmem-item" }, h("span", {}, m.text),
+      canEdit ? h("button", { class: "icon-btn", title: "Забыть", "aria-label": "Забыть", onclick: async () => {
+        await api(`/api/projects/${p.id}/memory/${m.id}`, { method: "DELETE" }); p.memory = p.memory.filter(x => x.id !== m.id); draw(); } }, icon("x")) : null)));
+    if (!p.memory.length) list.append(h("p", { class: "muted small" }, "Скажите агенту в разговоре проекта «запомни для проекта: …»."));
+  };
+  draw();
+  return sideCard("Память проекта", "memory", null, list);
+}
+
+async function shareDialog(p) {
+  const [users, d] = await Promise.all([api("/api/users").catch(() => []), api(`/api/projects/${p.id}`)]);
+  let members = d.members;
+  const close = () => { $("#modal2")?.remove(); openProject(p.id); };
+  const body = h("div", { class: "share-list" });
+  const set = async (uid, role) => {
+    try { members = (await api(`/api/projects/${p.id}/members`, { method: "PUT", body: { user_id: uid, role } })).members; draw(); }
+    catch (e) { toast(e.message); }
+  };
+  const roleSel = (value, onChange) => {
+    const s = h("select", { class: "mini-select" }, h("option", { value: "viewer" }, "Читатель"), h("option", { value: "editor" }, "Редактор"));
+    s.value = value; s.addEventListener("change", () => onChange(s.value)); return s;
+  };
+  const name = id => users.find(u => u.id === id)?.name || id;
+  const all = members.find(m => m.user_id === "*");
+  const everyone = h("div", { class: "share-row everyone" }, h("span", { class: "avatar sm" }, icon("users")),
+    h("div", { class: "grow" }, h("b", {}, "Все пользователи"), h("div", { class: "help" }, "Любой, кто входит в этот сервис")), h("span", {}));
+  const draw = () => {
+    const allNow = members.find(m => m.user_id === "*");
+    everyone.lastChild.replaceWith(h("div", { class: "share-ctl" }, allNow ? roleSel(allNow.role, r => set("*", r)) : null,
+      toggle(!!allNow, on => set("*", on ? "viewer" : null), "Открыть всем")));
+    body.replaceChildren(
+      h("div", { class: "share-row" }, h("span", { class: "avatar sm" }, (d.owner_name || "?").charAt(0).toUpperCase()),
+        h("div", { class: "grow" }, h("b", {}, d.owner_name), h("div", { class: "help" }, "владелец"))),
+      ...members.filter(m => m.user_id !== "*").map(m => h("div", { class: "share-row" },
+        h("span", { class: "avatar sm" }, name(m.user_id).charAt(0).toUpperCase()),
+        h("div", { class: "grow" }, h("b", {}, name(m.user_id)), h("div", { class: "help" }, m.user_id)),
+        roleSel(m.role, r => set(m.user_id, r)),
+        h("button", { class: "icon-btn", title: "Убрать доступ", "aria-label": "Убрать доступ", onclick: () => set(m.user_id, null) }, icon("x")))));
+  };
+  const who = h("input", { list: "known-users", placeholder: "id пользователя" });
+  const dl = h("datalist", { id: "known-users" }, users.filter(u => u.id !== S.me.id).map(u => h("option", { value: u.id }, u.name)));
+  const newRole = roleSel("viewer", () => {});
+  const add = h("button", { class: "btn sm", type: "button", onclick: async () => { if (!who.value.trim()) return; await set(who.value.trim(), newRole.value); who.value = ""; } }, "Открыть");
+  const m = h("div", { class: "modal", id: "modal2", onmousedown: e => { if (e.target.id === "modal2") close(); } },
+    h("div", { class: "modal-card dialog", role: "dialog", "aria-modal": "true" },
+      h("div", { class: "dialog-head" }, h("h3", {}, `Доступ к «${p.name}»`), h("button", { class: "icon-btn", "aria-label": "Закрыть", onclick: close }, icon("x"))),
+      h("p", { class: "help" }, "Читатели общаются в проекте и видят файлы. Редакторы меняют инструкции, файлы и память. Разговоры у каждого свои."),
+      everyone, h("div", { class: "share-add" }, who, dl, newRole, add), body));
+  m.addEventListener("keydown", e => { if (e.key === "Escape") { e.stopPropagation(); close(); } });
+  document.body.append(m);
+  draw(); if (all) { /* уже открыт всем */ }
+  who.focus();
+}
+
+// ── компьютер ───────────────────────────────────────────────────────
+async function refreshDevices() {
+  try { S.devices = await api("/api/devices"); } catch { S.devices = []; }
+  const on = (S.devices || []).filter(d => d.online);
+  const chip = $("#device-chip");
+  chip.hidden = !on.length;
+  if (on.length) {
+    chip.querySelector("span").textContent = on.length > 1 ? `${on.length} компьютера` : on[0].name;
+    chip.title = "Агент видит: " + on.map(d => `${d.name} — ${(d.info.folders || []).map(f => f.name).join(", ")}`).join("; ");
+  }
+  return S.devices;
+}
+const shq = s => /^[\w@%+=:,./~-]+$/.test(s) ? s : `'${s.replace(/'/g, "'\\''")}'`;
+function bridgeCommands(server, key, os) {
+  if (os === "win") return [`Invoke-WebRequest ${server}/bridge.py -OutFile bridge.py`,
+    `py bridge.py --server ${server} --key ${key} --folder "$HOME\\Documents"`];
+  return [`curl -fsSLo bridge.py ${server}/bridge.py`, `python3 bridge.py --server ${server} --key ${shq(key)} --folder ~/Documents`];
+}
+function codeBlock(lines) {
+  const text = lines.join("\n");
+  return h("div", { class: "code-block" }, h("pre", {}, text), copyBtn(() => text));
+}
+async function computerTab(body) {
+  const devices = await refreshDevices();
+  const slot = h("div");
+  const connect = () => {
+    const name = h("input", { placeholder: "Например: Рабочий ноутбук", value: "" });
+    const go = h("button", { class: "btn primary sm", type: "button", onclick: async () => {
+      go.disabled = true;
+      try { pairing(await api("/api/devices", { method: "POST", body: { name: name.value } })); } catch (e) { toast(e.message); go.disabled = false; }
+    } }, "Получить ключ");
+    slot.replaceChildren(h("div", { class: "sch-editor" },
+      h("div", { class: "ed-head" }, h("b", {}, "Подключить компьютер"), h("button", { class: "icon-btn", "aria-label": "Закрыть", onclick: () => slot.replaceChildren() }, icon("x"))),
+      fieldRow("Как назвать", name, "Чтобы различать, если компьютеров несколько"),
+      h("div", { class: "compose-bar" }, h("span", { class: "grow" }), go)));
+    name.focus();
+  };
+  const pairing = r => {
+    let os = /Win/.test(navigator.platform) ? "win" : "unix";
+    const cmds = h("div");
+    const drawCmds = () => cmds.replaceChildren(codeBlock(bridgeCommands(location.origin, r.key, os)));
+    const status = h("div", { class: "test-result" }, h("span", { class: "spin" }), h("div", {}, h("b", {}, "Ждём подключения…"), h("div", { class: "help" }, "Запустите команды в терминале — статус обновится сам")));
+    drawCmds();
+    slot.replaceChildren(h("div", { class: "sch-editor" },
+      h("div", { class: "ed-head" }, h("b", {}, `Подключить «${r.device.name}»`), h("button", { class: "icon-btn", "aria-label": "Закрыть", onclick: () => { clearInterval(timer); openSettings("computer"); } }, icon("x"))),
+      h("ol", { class: "steps-howto" },
+        h("li", {}, "Нужен Python 3.9+ (на macOS и Linux уже есть, на Windows — python.org)."),
+        h("li", {}, "Скачайте мост и запустите его в терминале:", segmented([["unix", "macOS / Linux"], ["win", "Windows"]], os, v => { os = v; drawCmds(); }), cmds),
+        h("li", {}, "В ", h("code", {}, "--folder"), " укажите папки, которые увидит агент (можно несколько; ", h("code", {}, ":ro"), " в конце — только чтение). ",
+          "Чтобы агент мог выполнять команды, добавьте ", h("code", {}, "--allow-shell"), " — каждая команда всё равно спросит подтверждение в чате.")),
+      h("div", { class: "help" }, "Ключ показывается один раз. Мост сам ходит на сервер — открывать порты не нужно. Остановить — Ctrl+C."),
+      status));
+    const timer = setInterval(async () => {
+      const list = await api("/api/devices").catch(() => []);
+      const d = list.find(x => x.id === r.device.id);
+      if (d?.online) {
+        clearInterval(timer);
+        status.className = "test-result ok";
+        status.replaceChildren(icon("check"), h("div", {}, h("b", {}, `Подключено: ${d.info.hostname || d.name}`),
+          h("div", { class: "help" }, `Папки: ${(d.info.folders || []).map(f => f.name).join(", ") || "—"} · команды ${d.info.shell ? "разрешены" : "запрещены"}`)));
+        refreshDevices();
+      }
+    }, 2000);
+    const stop = new MutationObserver(() => { if (!document.body.contains(status)) { clearInterval(timer); stop.disconnect(); } });
+    stop.observe(document.body, { childList: true, subtree: true });
+  };
+  const card = d => {
+    const more = h("button", { class: "icon-btn", title: "Ещё", "aria-label": "Действия" }, icon("dots"));
+    more.addEventListener("click", e => { e.stopPropagation(); popMenu(more, [
+      ["pen", "Переименовать", async () => { const v = prompt("Название компьютера", d.name); if (v == null) return; await api(`/api/devices/${d.id}`, { method: "PATCH", body: { name: v } }); openSettings("computer"); }],
+      ["trash", "Отключить и удалить ключ", async () => { if (!confirm(`Удалить «${d.name}»? Мост на нём остановится.`)) return; await api(`/api/devices/${d.id}`, { method: "DELETE" }); refreshDevices(); openSettings("computer"); }, true]]); });
+    const info = d.info || {};
+    return h("div", { class: "src-card dev-card" + (d.online ? "" : " disabled") },
+      h("div", { class: "src-top" }, h("div", { class: "src-head static" },
+        h("span", { class: "src-icon" }, icon("monitor")),
+        h("span", { class: "src-title" }, h("b", {}, d.name), h("span", { class: "src-sub" }, [info.hostname, info.platform].filter(Boolean).join(" · ") || "ещё не подключался")),
+        d.online ? h("span", { class: "pill ok" }, h("i"), "на связи") : h("span", { class: "pill" }, h("i"), d.last_seen ? `был ${rel(d.last_seen)}` : "ждёт моста")), h("div", { class: "src-actions" }, more)),
+      (info.folders || []).length ? h("div", { class: "src-body dev-body" }, info.folders.map(f => h("div", { class: "tool-row" },
+        h("div", { class: "tr-main" }, h("div", { class: "tr-title" }, icon("folder"), h("span", {}, f.name), h("code", {}, f.path))),
+        h("div", { class: "tr-tags" }, h("span", { class: "tag " + (f.read_only ? "ok" : "warn") }, f.read_only ? "только чтение" : "чтение и запись")))),
+        h("div", { class: "tool-row" }, h("div", { class: "tr-main" }, h("div", { class: "tr-title" }, icon("terminal"), h("span", {}, "Команды"))),
+          h("div", { class: "tr-tags" }, h("span", { class: "tag " + (info.shell ? "err" : "") }, info.shell ? "разрешены, с подтверждением" : "запрещены")))) : null);
+  };
+  body.append(
+    h("div", { class: "tab-intro" }, h("p", { class: "lead-text" }, "Агент может работать с папками и программами на вашем компьютере через мост — маленькую программу, которую вы запускаете у себя. Что открыть, решаете вы при запуске."),
+      h("button", { class: "btn primary sm", type: "button", onclick: connect }, icon("plus"), "Подключить")),
+    slot,
+    devices.length ? h("div", { class: "src-list" }, devices.map(card))
+      : emptyBlock("monitor", "Компьютер не подключён", "Подключите, чтобы агент читал и правил ваши файлы, искал по папкам и запускал команды — всё с вашего подтверждения."));
+}
+
 // ── всплывающие меню ────────────────────────────────────────────────
 function closeMenus() {
   $("#user-menu").hidden = true; $("#user-btn").setAttribute("aria-expanded", "false");
@@ -1457,6 +1816,7 @@ const tabs = {
           h("div", { class: "help" }, "Ctrl + Enter удобнее, если часто пишете в несколько строк"))));
   },
   models: modelsTab,
+  computer: computerTab,
   memory: (b) => panels.memory(b),
   tools: (b) => panels.tools(b),
   schedules: (b) => panels.schedules(b),
@@ -1498,7 +1858,7 @@ const tabs = {
         } }, "Удалить"))));
   },
 };
-const TAB_TITLES = { general: "Общие", models: "Модели", memory: "Память", tools: "Инструменты", schedules: "Расписание", usage: "Расход", plan: "Подписка", account: "Аккаунт" };
+const TAB_TITLES = { general: "Общие", models: "Модели", computer: "Компьютер", memory: "Память", tools: "Инструменты", schedules: "Расписание", usage: "Расход", plan: "Подписка", account: "Аккаунт" };
 
 function themeCards() {
   const cur = store.get("agent_theme") || "auto";
@@ -1525,7 +1885,7 @@ async function openSettings(tab = "general") {
   try { await tabs[tab](fresh); body.replaceChildren(...fresh.childNodes); } catch (e) { body.replaceChildren(h("p", { class: "error-text" }, e.message)); }
   $("#settings .modal-card").focus({ preventScroll: true });
 }
-function closeSettings() { $("#settings").hidden = true; lastFocus?.focus?.(); }
+function closeSettings() { $("#settings").hidden = true; lastFocus?.focus?.(); refreshDevices(); }
 const openPanel = openSettings; // совместимость с кодом панелей
 
 // ── тема ────────────────────────────────────────────────────────────
@@ -1544,7 +1904,13 @@ function toggleTasks(open = $("#tasks").hidden) {
   // На узком экране панель — поверх чата: нужен фон, по которому её можно закрыть.
   if (innerWidth <= 960) $("#scrim").hidden = !open;
 }
-function newChat() { S.sessionId = null; history.replaceState(null, "", "#"); resetView(); $("#chat-title").textContent = "Новый разговор"; renderSessions(); toggleSidebar(false); $("#input").focus(); }
+function newChat() { S.sessionId = null; S.projectId = null; setCrumb(null); showPage(false); history.replaceState(null, "", "#"); resetView(); $("#chat-title").textContent = "Новый разговор"; renderSessions(); toggleSidebar(false); $("#input").focus(); }
+async function route(hash) {
+  if (hash === "projects") { await loadSessions(); return openProjects(); }
+  if (hash.startsWith("p/")) { await loadSessions(); return openProject(hash.slice(2)); }
+  if (hash) return openSession(hash);
+  resetView(); await loadSessions();
+}
 function renderMe() {
   $("#me-name").textContent = S.me.name;
   $("#me-avatar").textContent = (S.me.name || "?").trim().charAt(0).toUpperCase();
@@ -1569,7 +1935,8 @@ async function boot() {
   setMode(S.config.default_mode);
   $("#login").hidden = true; $("#app").hidden = false;
   const id = location.hash.slice(1);
-  if (id) await openSession(id); else { resetView(); await loadSessions(); }
+  await route(id);
+  refreshDevices(); setInterval(refreshDevices, 30000);
   $("#input").focus();
 }
 
@@ -1588,6 +1955,10 @@ $("#input").addEventListener("keydown", e => {
 $("#input").addEventListener("input", autosize);
 $("#stop").addEventListener("click", () => S.sessionId && api(`/api/sessions/${S.sessionId}/cancel`, { method: "POST" }));
 $("#new-chat").addEventListener("click", newChat);
+$("#nav-projects").addEventListener("click", () => { toggleSidebar(false); openProjects(); });
+// Ссылки вида …/#p/<id> и кнопка «назад» браузера. Свои переходы идут через replaceState и сюда не попадают.
+window.addEventListener("hashchange", () => S.config && route(location.hash.slice(1)));
+$("#device-chip").addEventListener("click", () => openSettings("computer"));
 $("#logout").addEventListener("click", logout);
 $("#user-btn").addEventListener("click", e => { e.stopPropagation(); toggleUserMenu(); });
 document.querySelectorAll("[data-settings]").forEach(b => b.addEventListener("click", () => openSettings(b.dataset.settings)));

@@ -22,7 +22,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -85,6 +85,21 @@ class AgentConfig:
 
 
 @dataclass
+class TurnContext:
+    """Что подмешать в конкретный шаг: текст в системный промпт и инструменты, которые спрятать.
+
+    Так ядро узнаёт о проекте разговора или подключённом компьютере, не зная о них
+    самих: поставщик контекста решает по пользователю и сессии.
+    """
+
+    text: str = ""
+    hide_tools: set[str] = field(default_factory=set)
+
+
+ContextProvider = Callable[[User, str], Awaitable["TurnContext | str | None"]]
+
+
+@dataclass
 class RunOutcome:
     run_id: str
     status: RunStatus
@@ -131,6 +146,8 @@ class Agent:
         self.tracers = tracers or []
         # Каталог моделей знает, кто умеет картинки, точнее шаблонов; сервис подставляет его сюда.
         self.vision_for: Callable[[str], bool | None] | None = None
+        # Проект разговора, подключённый компьютер и т. п. — см. TurnContext.
+        self.context_providers: list[ContextProvider] = []
         # Субагент не может остановиться ради подтверждения: продолжить его
         # прогон было бы некому. Вместо «спросить» он получает отказ.
         self.can_ask = can_ask
@@ -358,7 +375,25 @@ class Agent:
             cancel=self._cancel.get(run_id) or asyncio.Event(), message_seq=seq, agent_name=self.spec.name,
         )
 
-    async def _system_prompt(self, user: User, loaded: set[str], mode: Mode) -> str:
+    async def _turn_context(self, user: User, session_id: str) -> TurnContext:
+        out = TurnContext()
+        texts = []
+        for prov in self.context_providers:
+            try:
+                res = await prov(user, session_id)
+            except Exception:  # noqa: BLE001 — сбой поставщика не должен ронять прогон
+                log.exception("context provider failed")
+                continue
+            if isinstance(res, str):
+                res = TurnContext(text=res)
+            if res:
+                if res.text:
+                    texts.append(res.text)
+                out.hide_tools |= res.hide_tools
+        out.text = "\n\n".join(texts)
+        return out
+
+    async def _system_prompt(self, user: User, loaded: set[str], mode: Mode, extra: str = "") -> str:
         mem = await self.store.memory_list(self.memory_scopes(user))
         rules = self.rules(user) if callable(self.rules) else self.rules
         parts = PromptParts(
@@ -378,6 +413,8 @@ class Agent:
         if self.subagents:
             parts.extra.append("# Субагенты (инструмент task)\n" + "\n".join(
                 f"- {s.name}: {s.description}" for s in self.subagents.values()))
+        if extra:
+            parts.extra.append(extra)
         return build_system_prompt(parts)
 
     async def _loop(self, session_id: str, user: User, run_id: str, emit, *, model: str, mode: Mode) -> RunStatus:
@@ -398,8 +435,9 @@ class Agent:
             state = await self.store.get_state(session_id)
             loaded = set(state.get(LOADED_KEY, []))
             history = effective_history(await self.store.list_messages(session_id))
-            system = await self._system_prompt(user, loaded, mode)
-            visible = self.tools.visible(loaded)
+            turn = await self._turn_context(user, session_id)
+            system = await self._system_prompt(user, loaded, mode, turn.text)
+            visible = [t for t in self.tools.visible(loaded) if t.name not in turn.hide_tools]
             schemas = [t.schema() for t in visible]
             msgs = [Message.system(system), *self._prepare(history, session_id, model)]
 
@@ -677,13 +715,16 @@ class Agent:
     def child(self, spec: AgentSpec) -> Agent:
         """Агент-субагент: свой промпт и инструменты, общие модель, хранилище и хуки."""
         tools = self.tools.filtered(spec.tools, [*spec.deny_tools, "task"])
-        return Agent(
+        child = Agent(
             router=self.router, store=self.store, tools=tools, spec=spec, subagents={},
             permissions=self.permissions if spec.mode is None else self.permissions.with_mode(spec.mode),
             hooks=self.hooks, skills=self.skills, mcp_instructions=self.mcp_instructions, config=self.config,
             deps=self.deps, workspace=self._workspace, rules=self.rules, memory_scopes=self.memory_scopes,
             tracers=self.tracers, can_ask=False,
         )
+        child.context_providers = self.context_providers
+        child.vision_for = self.vision_for
+        return child
 
 
 def _for_model(history: list[tuple[int, Message]]) -> list[Message]:

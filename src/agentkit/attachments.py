@@ -88,6 +88,20 @@ def save_upload(workspace: Path, filename: str, data: bytes, mime: str = "") -> 
     return info
 
 
+def extract_text(name: str, data: bytes, mime: str = "") -> tuple[str, str]:
+    """(вид файла, текст) — для поиска по файлам проекта. Картинки и бинарные — без текста."""
+    kind = kind_of(name, mime)
+    if kind == "pdf":
+        return kind, _pdf_text(data)
+    if kind == "docx":
+        return kind, _docx_text(data)
+    if kind == "xlsx":
+        return kind, _xlsx_text(data)
+    if kind == "text":
+        return kind, data.decode("utf-8", errors="replace")
+    return kind, ""
+
+
 def _write_sidecar(target: Path, text: str) -> int:
     (target.parent / (target.name + ".txt")).write_text(text, encoding="utf-8")
     return len(text)

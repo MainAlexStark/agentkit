@@ -273,3 +273,48 @@ def test_custom_mcp_servers(client):
     assert client.get("/api/tools", headers=H).json()["mcp"][0]["enabled"] is False
     assert client.delete("/api/mcp/servers/crm2", headers=H).status_code == 200
     assert client.get("/api/tools", headers=H).json()["mcp"] == []
+
+
+def test_projects_api_and_prompt(client):
+    bob = {"Authorization": "Bearer t-bob"}
+    p = client.post("/api/projects", json={"name": "Поверка воды", "instructions": "Ссылайся на МИ 1592-2015"},
+                    headers=H).json()
+    f = client.post(f"/api/projects/{p['id']}/files", files={"file": ("сроки.txt", "МПИ счётчиков — 6 лет".encode(), "text/plain")},
+                    headers=H).json()
+    assert f["text_chars"] > 0
+    # чужому проект не виден, пока не открыли доступ
+    assert client.get(f"/api/projects/{p['id']}", headers=bob).status_code == 404
+    assert client.post("/api/sessions", json={"project_id": p["id"]}, headers=bob).status_code == 404
+    assert client.put(f"/api/projects/{p['id']}/members", json={"user_id": "bob", "role": "viewer"}, headers=bob).status_code == 404
+    client.put(f"/api/projects/{p['id']}/members", json={"user_id": "bob", "role": "viewer"}, headers=H)
+    d = client.get(f"/api/projects/{p['id']}", headers=bob).json()
+    assert d["role"] == "viewer" and d["files"][0]["name"] == "сроки.txt" and d["members"] == []
+    assert client.patch(f"/api/projects/{p['id']}", json={"name": "x"}, headers=bob).status_code == 403
+    assert client.get(f"/api/projects/{p['id']}/files/{f['id']}", headers=bob).content == "МПИ счётчиков — 6 лет".encode()
+
+    # разговор в проекте видит инструкции и файл
+    client.fake.push("ок")
+    sid = client.post("/api/sessions", json={"project_id": p["id"]}, headers=bob).json()["id"]
+    client.post(f"/api/sessions/{sid}/messages", json={"text": "какой МПИ?"}, headers=bob)
+    wait_idle(client, sid, headers=bob)
+    system = client.fake.requests[-1].messages[0].text
+    assert "МИ 1592-2015" in system and "6 лет" in system
+    assert client.get(f"/api/sessions/{sid}", headers=bob).json()["project"]["name"] == "Поверка воды"
+    listed = client.get("/api/sessions", headers=bob).json()
+    assert listed[0]["project"] == "Поверка воды"
+    assert [x["id"] for x in client.get("/api/projects", headers=bob).json()] == [p["id"]]
+    # удаление проекта: разговоры остаются, но без проекта
+    assert client.delete(f"/api/projects/{p['id']}", headers=bob).status_code == 403
+    assert client.delete(f"/api/projects/{p['id']}", headers=H).status_code == 200
+    assert client.get(f"/api/sessions/{sid}", headers=bob).json()["project"] is None
+
+
+def test_devices_api(client):
+    r = client.post("/api/devices", json={"name": "Ноутбук"}, headers=H).json()
+    assert r["key"].startswith(r["device"]["id"] + ".") and r["bridge_url"].endswith("/bridge.py")
+    assert client.get("/api/devices", headers=H).json()[0]["online"] is False
+    assert client.get("/api/devices", headers={"Authorization": "Bearer t-bob"}).json() == []
+    assert client.post("/api/bridge/poll", json={}, headers={"Authorization": "Bearer dev_x.y"}).status_code == 401
+    assert "Мост agentkit" in client.get("/bridge.py").text
+    client.delete(f"/api/devices/{r['device']['id']}", headers=H)
+    assert client.post("/api/bridge/poll", json={}, headers={"Authorization": f"Bearer {r['key']}"}).status_code == 401

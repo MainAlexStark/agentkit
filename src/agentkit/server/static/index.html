@@ -30,6 +30,13 @@
   <symbol id="i-unlock" viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 7.7-1.5"/></symbol>
   <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></symbol>
   <symbol id="i-server" viewBox="0 0 24 24"><rect x="4" y="4.5" width="16" height="6" rx="1.5"/><rect x="4" y="13.5" width="16" height="6" rx="1.5"/><path d="M7.5 7.5h.01M7.5 16.5h.01"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 6.5a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></symbol>
+  <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M8.5 20h7M12 16.5V20"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8.5" r="3.5"/><path d="M2.5 19.5c1-3.3 3.6-5 6.5-5s5.5 1.7 6.5 5M16 5.2a3.5 3.5 0 0 1 0 6.6M18 14.8c1.8.7 3 2.3 3.5 4.7"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 15V4M7.5 8.5 12 4l4.5 4.5M4.5 15v3a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-3"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M5 5.5h14a1.5 1.5 0 0 1 1.5 1.5v8a1.5 1.5 0 0 1-1.5 1.5h-7.5L7 20v-3.5H5A1.5 1.5 0 0 1 3.5 15V7A1.5 1.5 0 0 1 5 5.5z"/></symbol>
+  <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="15" rx="2"/><path d="M7 9.5l3 2.5-3 2.5M12.5 15h4.5"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></symbol>
   <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
   <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
   <symbol id="i-memory" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0-6 6c0 2.2 1.2 3.6 2.2 4.6.6.6.8 1.2.8 1.9V17h6v-1.5c0-.7.2-1.3.8-1.9 1-1 2.2-2.4 2.2-4.6a6 6 0 0 0-6-6zM9.5 20.5h5"/></symbol>
@@ -81,6 +88,9 @@
       <button id="new-chat" class="icon-btn" title="Новый разговор (Ctrl+K)" aria-label="Новый разговор"><svg><use href="#i-plus"/></svg></button>
     </div>
     <label class="search"><svg><use href="#i-search"/></svg><input id="session-filter" placeholder="Поиск по разговорам"></label>
+    <nav class="side-nav" aria-label="Разделы">
+      <button id="nav-projects" class="side-link" type="button"><svg><use href="#i-folder"/></svg>Проекты</button>
+    </nav>
     <nav id="sessions" class="sessions" aria-label="Разговоры"></nav>
     <div class="user-wrap">
       <button id="user-btn" class="user-btn" type="button" aria-haspopup="menu" aria-expanded="false">
@@ -110,13 +120,14 @@
   <main class="main">
     <header class="top">
       <button id="menu" class="icon-btn only-mobile" aria-label="Меню"><svg><use href="#i-menu"/></svg></button>
-      <h2 id="chat-title" class="chat-title">Новый разговор</h2>
+      <div class="title-wrap"><button id="crumb" class="crumb" type="button" hidden><svg><use href="#i-folder"/></svg><span></span></button><h2 id="chat-title" class="chat-title">Новый разговор</h2></div>
       <div class="controls">
         <span id="cost" class="cost" title="Стоимость разговора"></span>
         <button id="toggle-tasks" class="icon-btn" title="Задачи агента" aria-label="Задачи"><svg><use href="#i-tasks"/></svg><span id="tasks-count" class="count" hidden></span></button>
       </div>
     </header>
 
+    <section id="page" class="page" hidden></section>
     <section id="messages" class="messages" aria-live="polite"></section>
 
     <div class="composer-wrap">
@@ -129,6 +140,7 @@
           <button id="attach" class="icon-btn" type="button" title="Прикрепить файл — можно перетащить или вставить из буфера" aria-label="Прикрепить"><svg><use href="#i-clip"/></svg></button>
           <button id="model-btn" class="select picker-btn" type="button" title="Модель" aria-haspopup="listbox" aria-expanded="false"><span id="model-name">…</span></button>
           <button id="mode-btn" class="select picker-btn mode-btn" type="button" title="Права агента" aria-haspopup="listbox" aria-expanded="false"><svg class="lead" id="mode-icon"><use href="#i-ask"/></svg><span id="mode-name">…</span></button>
+          <button id="device-chip" class="device-chip" type="button" hidden><i></i><svg><use href="#i-monitor"/></svg><span></span></button>
           <span id="hint" class="hint">Enter — отправить · Shift+Enter — перенос</span>
           <button id="stop" class="send stop" type="button" title="Остановить" aria-label="Остановить" hidden><svg><use href="#i-stop"/></svg></button>
           <button id="send" class="send" type="submit" title="Отправить" aria-label="Отправить"><svg><use href="#i-send"/></svg></button>
@@ -154,6 +166,7 @@
       <button data-tab="models"><svg><use href="#i-cube"/></svg>Модели</button>
       <button data-tab="memory"><svg><use href="#i-memory"/></svg>Память</button>
       <button data-tab="tools"><svg><use href="#i-tools"/></svg>Инструменты</button>
+      <button data-tab="computer"><svg><use href="#i-monitor"/></svg>Компьютер</button>
       <button data-tab="schedules"><svg><use href="#i-clock"/></svg>Расписание</button>
       <button data-tab="usage"><svg><use href="#i-chart"/></svg>Расход</button>
       <button data-tab="plan"><svg><use href="#i-card"/></svg>Подписка</button>

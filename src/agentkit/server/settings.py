@@ -80,6 +80,15 @@ class Settings(BaseSettings):
     vision_models: str = ""
     max_upload_mb: int = 25
     scheduler: bool = True
+    # Компьютер пользователя через мост (bridge.py) — инструменты pc_*.
+    enable_devices: bool = True
+    # Проекты: инструкции, файлы и память для группы разговоров.
+    enable_projects: bool = True
+    project_inline_chars: int = 40_000  # столько текста файлов проекта кладётся прямо в промпт
+    max_project_file_mb: int = 50
+    # Песочница для run_python / run_bash (сервис sandbox в docker-compose). Пусто — выключена.
+    sandbox_url: str = ""
+    sandbox_token: str = ""
     max_output_chars: int = 30_000
 
     def model_list(self) -> list[str]:

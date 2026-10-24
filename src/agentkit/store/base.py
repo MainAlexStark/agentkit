@@ -24,6 +24,31 @@ class SessionRec:
     state: dict[str, Any] = field(default_factory=dict)
     created_at: float = 0.0
     updated_at: float = 0.0
+    project_id: str | None = None
+
+
+@dataclass
+class ProjectRec:
+    id: str
+    owner_id: str
+    name: str
+    description: str = ""
+    instructions: str = ""  # уходят в системный промпт каждого разговора проекта
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+
+@dataclass
+class ProjectFileRec:
+    id: str
+    project_id: str
+    name: str
+    path: str  # относительно папки проекта
+    size: int = 0
+    kind: str = "file"  # text | pdf | docx | xlsx | image | file
+    text_chars: int = 0  # сколько текста извлечено (0 — искать нечего)
+    added_by: str = ""
+    created_at: float = 0.0
 
 
 @dataclass

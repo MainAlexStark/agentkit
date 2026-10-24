@@ -84,16 +84,29 @@ def memory_tools(*, global_roles: tuple[str, ...] = ("admin",)) -> list[Tool]:
     # read_only=True: память агента — не данные пользователя; без этого каждое
     # «запомни» требовало бы карточку. Общая память страхуется needs_approval.
     @tool(title="Запомнить", needs_approval=needs_ok, read_only=True, concurrency_safe=False, group="memory", source="builtin",
-          describe=lambda a: [["Запомнить", a.get("text", "")], ["Для кого", "всех" if a.get("scope") == "global" else "меня"]])
+          describe=lambda a: [["Запомнить", a.get("text", "")],
+                              ["Для кого", {"global": "всех", "project": "проекта"}.get(a.get("scope", ""), "меня")]])
     async def memory_save(
         ctx: ToolContext,
         text: Annotated[str, "Что запомнить: одно правило или факт, коротко и самодостаточно"],
-        scope: Annotated[Literal["user", "global"], "user — только для этого человека, global — для всех"] = "user",
+        scope: Annotated[Literal["user", "global", "project"],
+                         "user — только для этого человека, project — для всех разговоров проекта, global — для всех"] = "user",
     ) -> ToolResult:
         """Сохраняет правило или факт в долговременную память; он попадёт в контекст всех следующих разговоров.
         Используй, когда человек просит запомнить, или явно задаёт постоянное правило («всегда…», «никогда…»).
-        Не сохраняй разовые детали текущей задачи."""
-        sc = "global" if scope == "global" else f"user:{ctx.user.id}"
+        Факты о работе проекта (в разговоре проекта) — scope=project. Не сохраняй разовые детали текущей задачи."""
+        if scope == "project":
+            from agentkit.projects import session_project_id  # noqa: PLC0415 — проекты подключаются не всегда
+
+            pid = await session_project_id(ctx.store, ctx.session_id)
+            if not pid:
+                return ToolResult.error("этот разговор не в проекте — сохрани как user")
+            _, role = await ctx.store.project_role(pid, ctx.user.id)
+            if role not in ("owner", "editor"):
+                return ToolResult.error("память проекта меняют только его редакторы — сохрани как user")
+            sc = f"project:{pid}"
+        else:
+            sc = "global" if scope == "global" else f"user:{ctx.user.id}"
         existing = await ctx.store.memory_list([sc])
         if any(m.text.strip().lower() == text.strip().lower() for m in existing):
             return ToolResult(content="Уже есть в памяти.")
@@ -106,9 +119,16 @@ def memory_tools(*, global_roles: tuple[str, ...] = ("admin",)) -> list[Tool]:
         id: Annotated[str, "id записи из раздела «Память» системного промпта"],
     ) -> ToolResult:
         """Удаляет запись из памяти (когда человек просит забыть или правило устарело)."""
-        mine = await ctx.store.memory_list([f"user:{ctx.user.id}"])
+        scopes = [f"user:{ctx.user.id}"]
+        if hasattr(ctx.store, "project_role"):
+            from agentkit.projects import session_project_id  # noqa: PLC0415
+
+            pid = await session_project_id(ctx.store, ctx.session_id)
+            if pid and (await ctx.store.project_role(pid, ctx.user.id))[1] in ("owner", "editor"):
+                scopes.append(f"project:{pid}")
+        mine = await ctx.store.memory_list(scopes)
         if not any(m.id == id for m in mine) and not ctx.user.has_role(*global_roles):
-            return ToolResult.error("можно удалять только свои записи")
+            return ToolResult.error("можно удалять только свои записи и записи своего проекта")
         ok = await ctx.store.memory_delete(id)
         return ToolResult(content="Удалено." if ok else "Такой записи нет.")
 
