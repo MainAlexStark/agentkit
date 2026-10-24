@@ -318,3 +318,17 @@ def test_devices_api(client):
     assert "Мост agentkit" in client.get("/bridge.py").text
     client.delete(f"/api/devices/{r['device']['id']}", headers=H)
     assert client.post("/api/bridge/poll", json={}, headers={"Authorization": f"Bearer {r['key']}"}).status_code == 401
+
+
+def test_connect_scripts_and_device_actions(client):
+    sh = client.get("/connect.sh").text
+    assert 'SERVER="http://testserver"' in sh and "--setup" in sh
+    bat = client.get("/connect.bat").text
+    assert "\r\n" in bat and "__KEY__" in bat and "http://testserver" in bat
+    r = client.post("/api/devices", json={"name": "Ноут"}, headers=H).json()
+    did = r["device"]["id"]
+    # офлайн — действия не уходят; неизвестные — отклоняются
+    assert client.post(f"/api/devices/{did}/action", json={"op": "pick_folder"}, headers=H).status_code == 409
+    assert client.post(f"/api/devices/{did}/action", json={"op": "run", "args": {"command": "x"}}, headers=H).status_code == 400
+    assert client.post(f"/api/devices/{did}/action", json={"op": "pick_folder"},
+                       headers={"Authorization": "Bearer t-bob"}).status_code == 404

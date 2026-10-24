@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import sys
 
@@ -104,7 +105,7 @@ def test_bridge_ops_stay_inside_folders(tmp_path):
         b.op_write("docs/a.md", "y")
     with pytest.raises(BridgeError, match="не открыта"):
         b.op_read("etc/passwd")
-    with pytest.raises(BridgeError, match="запрещены"):
+    with pytest.raises(BridgeError, match="не разрешены"):
         b.op_run("echo hi")
 
 
@@ -153,3 +154,34 @@ def test_sandbox_execute_reports_files(tmp_path):
     assert bad["exit_code"] == 3 and _result(bad).is_error
     with pytest.raises(ValueError):
         execute(tmp_path, "../etc", "python", "print(1)", 5)
+
+
+def test_bridge_setup_config_and_access_dialogs(tmp_path, monkeypatch):
+    import agentkit.bridge as br
+
+    cfg = tmp_path / "bridge-dev_1.json"
+    work = tmp_path / "Документы"
+    work.mkdir()
+    b = br.Bridge("https://agent.example", "dev_1.secret", [], False, config=cfg)
+    # окно выбора на компьютере: человек выбрал папку и разрешил запись
+    monkeypatch.setattr(br, "pick_folder", lambda prompt: str(work))
+    answers = iter([True])
+    monkeypatch.setattr(br, "confirm", lambda text: next(answers))
+    r = b.op_pick_folder(reason="найти договоры")
+    assert r == {"name": "Документы", "path": str(work.resolve()), "read_only": False}
+    saved = json.loads(cfg.read_text(encoding="utf-8"))
+    assert saved["key"] == "dev_1.secret" and saved["folders"][0]["read_only"] is False
+
+    # расширить доступ без согласия на компьютере нельзя, сузить — можно
+    monkeypatch.setattr(br, "confirm", lambda text: False)
+    with pytest.raises(br.BridgeError, match="нет"):
+        b.op_set_shell(enabled=True)
+    b.op_set_folder(name="Документы", read_only=True)
+    with pytest.raises(br.BridgeError, match="нет"):
+        b.op_set_folder(name="Документы", read_only=False)
+    b.op_remove_folder(name="Документы")
+    assert json.loads(cfg.read_text(encoding="utf-8"))["folders"] == []
+    # окно закрыли — доступа нет
+    monkeypatch.setattr(br, "pick_folder", lambda prompt: None)
+    with pytest.raises(br.BridgeError, match="закрыл"):
+        b.op_pick_folder()

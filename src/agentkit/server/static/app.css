@@ -884,3 +884,27 @@ button.link:hover { text-decoration: underline; }
 .compose-card textarea:focus-visible { box-shadow: none; }
 .proj-start .compose-bar { flex-wrap: nowrap; }
 .proj-start .compose-bar .help { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+/* подключение компьютера */
+.pair .segmented { justify-self: start; }
+.steps-howto.big { gap: 16px; padding-left: 22px; }
+.steps-howto.big li { padding-left: 4px; }
+.steps-howto.big b { display: block; font-size: 13.5px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
+.steps-howto.big .btn { margin-top: 6px; }
+.code-block.big pre { padding: 14px 120px 14px 14px; font-size: 12.5px; }
+.code-block.big .copy-big { position: absolute; top: 50%; right: 10px; transform: translateY(-50%); }
+.code-block.big .copy-big svg { width: 14px; height: 14px; }
+.folder-row { align-items: center; padding-left: 14px; }
+.tr-desc.mono { font-family: var(--mono); font-size: 11.5px; -webkit-line-clamp: 1; }
+.inline-switch { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.dev-foot { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-top: 1px solid var(--line); }
+.dev-card.disabled .dev-body { opacity: .75; }
+.spin.light { border-color: color-mix(in srgb, var(--bg) 35%, transparent); border-top-color: var(--bg); }
+.toast .spin { margin-top: 0; }
+@media (max-width: 760px) {
+  .code-block.big pre { padding-right: 14px; padding-bottom: 52px; }
+  .code-block.big .copy-big { top: auto; bottom: 10px; transform: none; }
+  .inline-switch span { display: none; }
+}
+.tab-intro .btn { white-space: nowrap; flex: none; }
+.code-block.big pre { padding-right: 150px; }
+@media (max-width: 760px) { .code-block.big pre { padding-right: 14px; } }

@@ -655,7 +655,7 @@ function toggle(on, onChange, label) {
   b.addEventListener("click", async e => {
     e.stopPropagation();
     on = !on; b.setAttribute("aria-checked", String(on));
-    try { await onChange(on, b); } catch (err) { on = !on; b.setAttribute("aria-checked", String(on)); toast(err.message); }
+    try { await onChange(on, b); } catch (err) { on = !on; b.setAttribute("aria-checked", String(on)); if (err.message) toast(err.message); }
   });
   return b;
 }
@@ -1632,87 +1632,138 @@ async function refreshDevices() {
   chip.hidden = !on.length;
   if (on.length) {
     chip.querySelector("span").textContent = on.length > 1 ? `${on.length} компьютера` : on[0].name;
-    chip.title = "Агент видит: " + on.map(d => `${d.name} — ${(d.info.folders || []).map(f => f.name).join(", ")}`).join("; ");
+    chip.title = "Агент видит: " + on.map(d => `${d.name} — ${(d.info.folders || []).map(f => f.name).join(", ") || "папок нет"}`).join("; ");
   }
   return S.devices;
 }
-const shq = s => /^[\w@%+=:,./~-]+$/.test(s) ? s : `'${s.replace(/'/g, "'\\''")}'`;
-function bridgeCommands(server, key, os) {
-  if (os === "win") return [`Invoke-WebRequest ${server}/bridge.py -OutFile bridge.py`,
-    `py bridge.py --server ${server} --key ${key} --folder "$HOME\\Documents"`];
-  return [`curl -fsSLo bridge.py ${server}/bridge.py`, `python3 bridge.py --server ${server} --key ${shq(key)} --folder ~/Documents`];
-}
-function codeBlock(lines) {
+const detectOS = () => /Win/i.test(navigator.userAgent) ? "win" : /Mac/i.test(navigator.userAgent) ? "mac" : "linux";
+const OS_NAMES = { win: "Windows", mac: "macOS", linux: "Linux" };
+function codeBlock(lines, big) {
   const text = lines.join("\n");
-  return h("div", { class: "code-block" }, h("pre", {}, text), copyBtn(() => text));
+  const b = h("button", { class: "btn primary sm copy-big", type: "button", onclick: () => {
+    navigator.clipboard?.writeText(text).then(() => { b.replaceChildren(icon("check"), "Скопировано"); setTimeout(() => b.replaceChildren(icon("copy"), "Скопировать"), 1600); });
+  } }, icon("copy"), "Скопировать");
+  return h("div", { class: "code-block" + (big ? " big" : "") }, h("pre", {}, text), big ? b : copyBtn(() => text));
+}
+async function downloadConnectBat(key) {
+  const tpl = await fetch("/connect.bat").then(r => r.text());
+  // Ключ подставляем здесь, в браузере: в адресе запроса и логах сервера его нет.
+  const blob = new Blob([tpl.replace(/__KEY__/g, key)], { type: "application/octet-stream" });
+  const u = URL.createObjectURL(blob);
+  const a = h("a", { href: u, download: "Подключить компьютер.bat" }); document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(u), 10000);
+}
+async function deviceAction(d, op, args, waitText) {
+  const t = waitText ? toastWait(waitText) : null;
+  try { const r = await api(`/api/devices/${d.id}/action`, { method: "POST", body: { op, args } }); return r.result; }
+  catch (e) { toast(e.message); return null; }
+  finally { t?.(); }
+}
+function toastWait(text) {
+  document.querySelector(".toast")?.remove();
+  clearTimeout(toastTimer);
+  const el = h("div", { class: "toast", role: "status" }, h("span", { class: "spin light" }), h("span", {}, text));
+  document.body.append(el);
+  return () => el.remove();
 }
 async function computerTab(body) {
   const devices = await refreshDevices();
   const slot = h("div");
-  const connect = () => {
-    const name = h("input", { placeholder: "Например: Рабочий ноутбук", value: "" });
-    const go = h("button", { class: "btn primary sm", type: "button", onclick: async () => {
-      go.disabled = true;
-      try { pairing(await api("/api/devices", { method: "POST", body: { name: name.value } })); } catch (e) { toast(e.message); go.disabled = false; }
-    } }, "Получить ключ");
-    slot.replaceChildren(h("div", { class: "sch-editor" },
-      h("div", { class: "ed-head" }, h("b", {}, "Подключить компьютер"), h("button", { class: "icon-btn", "aria-label": "Закрыть", onclick: () => slot.replaceChildren() }, icon("x"))),
-      fieldRow("Как назвать", name, "Чтобы различать, если компьютеров несколько"),
-      h("div", { class: "compose-bar" }, h("span", { class: "grow" }), go)));
-    name.focus();
-  };
-  const pairing = r => {
-    let os = /Win/.test(navigator.platform) ? "win" : "unix";
-    const cmds = h("div");
-    const drawCmds = () => cmds.replaceChildren(codeBlock(bridgeCommands(location.origin, r.key, os)));
-    const status = h("div", { class: "test-result" }, h("span", { class: "spin" }), h("div", {}, h("b", {}, "Ждём подключения…"), h("div", { class: "help" }, "Запустите команды в терминале — статус обновится сам")));
-    drawCmds();
-    slot.replaceChildren(h("div", { class: "sch-editor" },
-      h("div", { class: "ed-head" }, h("b", {}, `Подключить «${r.device.name}»`), h("button", { class: "icon-btn", "aria-label": "Закрыть", onclick: () => { clearInterval(timer); openSettings("computer"); } }, icon("x"))),
-      h("ol", { class: "steps-howto" },
-        h("li", {}, "Нужен Python 3.9+ (на macOS и Linux уже есть, на Windows — python.org)."),
-        h("li", {}, "Скачайте мост и запустите его в терминале:", segmented([["unix", "macOS / Linux"], ["win", "Windows"]], os, v => { os = v; drawCmds(); }), cmds),
-        h("li", {}, "В ", h("code", {}, "--folder"), " укажите папки, которые увидит агент (можно несколько; ", h("code", {}, ":ro"), " в конце — только чтение). ",
-          "Чтобы агент мог выполнять команды, добавьте ", h("code", {}, "--allow-shell"), " — каждая команда всё равно спросит подтверждение в чате.")),
-      h("div", { class: "help" }, "Ключ показывается один раз. Мост сам ходит на сервер — открывать порты не нужно. Остановить — Ctrl+C."),
-      status));
-    const timer = setInterval(async () => {
-      const list = await api("/api/devices").catch(() => []);
-      const d = list.find(x => x.id === r.device.id);
-      if (d?.online) {
-        clearInterval(timer);
-        status.className = "test-result ok";
-        status.replaceChildren(icon("check"), h("div", {}, h("b", {}, `Подключено: ${d.info.hostname || d.name}`),
-          h("div", { class: "help" }, `Папки: ${(d.info.folders || []).map(f => f.name).join(", ") || "—"} · команды ${d.info.shell ? "разрешены" : "запрещены"}`)));
-        refreshDevices();
-      }
+  let timer = null;
+  const stopTimer = () => { clearInterval(timer); timer = null; };
+
+  const connect = async () => {
+    const os = detectOS();
+    let r;
+    try { r = await api("/api/devices", { method: "POST", body: { name: os === "mac" ? "Mac" : os === "win" ? "Компьютер с Windows" : "Компьютер с Linux" } }); }
+    catch (e) { toast(e.message); return; }
+    let cur = os;
+    const steps = h("div");
+    const oneLiner = `curl -fsSL ${location.origin}/connect.sh | bash -s -- ${r.key}`;
+    const draw = () => steps.replaceChildren(cur === "win"
+      ? h("ol", { class: "steps-howto big" },
+        h("li", {}, h("b", {}, "Скачайте файл подключения"),
+          h("div", {}, h("button", { class: "btn primary", type: "button", onclick: () => downloadConnectBat(r.key) }, icon("download"), "Скачать «Подключить компьютер.bat»"))),
+        h("li", {}, h("b", {}, "Откройте его двойным щелчком"),
+          h("div", { class: "help" }, "Если Windows предупредит: «Подробнее» → «Выполнить в любом случае». Python, если его нет, поставится сам.")),
+        h("li", {}, h("b", {}, "Выберите папку в появившемся окне"),
+          h("div", { class: "help" }, "Только её и увидит агент. Потом можно добавить ещё — здесь или когда агент попросит.")))
+      : h("ol", { class: "steps-howto big" },
+        h("li", {}, h("b", {}, cur === "mac" ? "Откройте Терминал" : "Откройте терминал"),
+          h("div", { class: "help" }, cur === "mac" ? "⌘ + Пробел → наберите «Терминал» → Enter" : "Обычно Ctrl + Alt + T")),
+        h("li", {}, h("b", {}, "Вставьте эту строку и нажмите Enter"), codeBlock([oneLiner], true)),
+        h("li", {}, h("b", {}, "Выберите папку в появившемся окне"),
+          h("div", { class: "help" }, "Только её и увидит агент. Мост спросит, запускаться ли ему самому при входе — тогда Терминал можно закрыть."))));
+    const status = h("div", { class: "test-result" }, h("span", { class: "spin" }), h("div", {}, h("b", {}, "Ждём подключения…"), h("div", { class: "help" }, "Статус обновится сам")));
+    const manual = h("details", { class: "more-opts" }, h("summary", {}, "Вручную, без установки"),
+      h("p", { class: "help" }, "Скачать мост и запустить его с нужными папками (:ro — только чтение, --allow-shell — разрешить команды):"),
+      codeBlock([`curl -fsSLo bridge.py ${location.origin}/bridge.py`, `python3 bridge.py --server ${location.origin} --key ${r.key} --folder ~/Documents`]));
+    draw();
+    slot.replaceChildren(h("div", { class: "sch-editor pair" },
+      h("div", { class: "ed-head" }, h("b", {}, "Подключить компьютер"), h("button", { class: "icon-btn", "aria-label": "Закрыть", onclick: () => { stopTimer(); openSettings("computer"); } }, icon("x"))),
+      segmented([["win", "Windows"], ["mac", "macOS"], ["linux", "Linux"]], cur, v => { cur = v; draw(); }),
+      steps, status, manual));
+    stopTimer();
+    timer = setInterval(async () => {
+      if (!document.body.contains(status)) return stopTimer();
+      const d = (await api("/api/devices").catch(() => [])).find(x => x.id === r.device.id);
+      if (!d?.online) return;
+      const folders = d.info.folders || [];
+      status.className = "test-result ok";
+      status.replaceChildren(icon("check"), h("div", {}, h("b", {}, `Подключено: ${d.info.hostname || d.name}`),
+        h("div", { class: "help" }, folders.length ? `Агент видит: ${folders.map(f => f.name).join(", ")}` : "Ждём, пока выберете папку…")));
+      if (folders.length) { stopTimer(); refreshDevices(); setTimeout(() => document.body.contains(status) && openSettings("computer"), 2500); }
     }, 2000);
-    const stop = new MutationObserver(() => { if (!document.body.contains(status)) { clearInterval(timer); stop.disconnect(); } });
-    stop.observe(document.body, { childList: true, subtree: true });
   };
+
   const card = d => {
+    const info = d.info || {}, on = d.online;
     const more = h("button", { class: "icon-btn", title: "Ещё", "aria-label": "Действия" }, icon("dots"));
     more.addEventListener("click", e => { e.stopPropagation(); popMenu(more, [
       ["pen", "Переименовать", async () => { const v = prompt("Название компьютера", d.name); if (v == null) return; await api(`/api/devices/${d.id}`, { method: "PATCH", body: { name: v } }); openSettings("computer"); }],
-      ["trash", "Отключить и удалить ключ", async () => { if (!confirm(`Удалить «${d.name}»? Мост на нём остановится.`)) return; await api(`/api/devices/${d.id}`, { method: "DELETE" }); refreshDevices(); openSettings("computer"); }, true]]); });
-    const info = d.info || {};
-    return h("div", { class: "src-card dev-card" + (d.online ? "" : " disabled") },
+      ["trash", "Отключить компьютер", async () => { if (!confirm(`Отключить «${d.name}»? Мост на нём остановится и уберёт автозапуск.`)) return; await api(`/api/devices/${d.id}`, { method: "DELETE" }); refreshDevices(); openSettings("computer"); }, true]]); });
+    const rows = (info.folders || []).map(f => h("div", { class: "tool-row folder-row" },
+      h("div", { class: "tr-main" }, h("div", { class: "tr-title" }, icon("folder"), h("span", {}, f.name)), h("div", { class: "tr-desc mono" }, f.path)),
+      h("label", { class: "inline-switch", title: f.read_only ? "Сейчас только чтение" : "Агент может изменять файлы (с подтверждением в чате)" },
+        h("span", {}, "изменение"), on ? toggle(!f.read_only, async v => {
+          const res = await deviceAction(d, "set_folder", { name: f.name, read_only: !v }, v ? "Подтвердите на компьютере…" : null);
+          if (!res) throw new Error(""); refreshDevices();
+        }, "Разрешить изменение файлов") : h("span", { class: "tag" }, f.read_only ? "чтение" : "запись")),
+      on ? h("button", { class: "icon-btn", title: "Закрыть доступ к папке", "aria-label": "Закрыть доступ", onclick: async () => {
+        if (await deviceAction(d, "remove_folder", { name: f.name })) { await refreshDevices(); openSettings("computer"); } } }, icon("x")) : null));
+    const shellRow = h("div", { class: "tool-row folder-row" },
+      h("div", { class: "tr-main" }, h("div", { class: "tr-title" }, icon("terminal"), h("span", {}, "Команды")),
+        h("div", { class: "tr-desc" }, "Запуск программ и скриптов — каждая команда с подтверждением в чате")),
+      on ? toggle(!!info.shell, async v => {
+        const res = await deviceAction(d, "set_shell", { enabled: v }, v ? "Подтвердите на компьютере…" : null);
+        if (!res) throw new Error(""); refreshDevices();
+      }, "Разрешить команды") : h("span", { class: "tag" }, info.shell ? "разрешены" : "запрещены"));
+    const addBtn = h("button", { class: "btn sm", type: "button", disabled: !on, title: on ? "" : "Компьютер не на связи", onclick: async () => {
+      const res = await deviceAction(d, "pick_folder", { reason: "Вы нажали «Добавить папку» в чате" }, "Выберите папку в окне на компьютере…");
+      if (res) { toast(`Открыта папка «${res.name}»`); await refreshDevices(); openSettings("computer"); }
+    } }, icon("plus"), "Добавить папку");
+    return h("div", { class: "src-card dev-card open" + (on ? "" : " disabled") },
       h("div", { class: "src-top" }, h("div", { class: "src-head static" },
         h("span", { class: "src-icon" }, icon("monitor")),
         h("span", { class: "src-title" }, h("b", {}, d.name), h("span", { class: "src-sub" }, [info.hostname, info.platform].filter(Boolean).join(" · ") || "ещё не подключался")),
-        d.online ? h("span", { class: "pill ok" }, h("i"), "на связи") : h("span", { class: "pill" }, h("i"), d.last_seen ? `был ${rel(d.last_seen)}` : "ждёт моста")), h("div", { class: "src-actions" }, more)),
-      (info.folders || []).length ? h("div", { class: "src-body dev-body" }, info.folders.map(f => h("div", { class: "tool-row" },
-        h("div", { class: "tr-main" }, h("div", { class: "tr-title" }, icon("folder"), h("span", {}, f.name), h("code", {}, f.path))),
-        h("div", { class: "tr-tags" }, h("span", { class: "tag " + (f.read_only ? "ok" : "warn") }, f.read_only ? "только чтение" : "чтение и запись")))),
-        h("div", { class: "tool-row" }, h("div", { class: "tr-main" }, h("div", { class: "tr-title" }, icon("terminal"), h("span", {}, "Команды"))),
-          h("div", { class: "tr-tags" }, h("span", { class: "tag " + (info.shell ? "err" : "") }, info.shell ? "разрешены, с подтверждением" : "запрещены")))) : null);
+        on ? h("span", { class: "pill ok" }, h("i"), "на связи") : h("span", { class: "pill" }, h("i"), d.last_seen ? `был ${rel(d.last_seen)}` : "ждёт подключения")),
+        h("div", { class: "src-actions" }, more)),
+      d.last_seen ? h("div", { class: "src-body dev-body" }, ...rows,
+        !rows.length ? h("div", { class: "tool-row" }, h("div", { class: "tr-main" }, h("div", { class: "tr-desc" }, "Папок не открыто. Агент попросит сам, когда понадобится, или добавьте сейчас."))) : null,
+        shellRow,
+        h("div", { class: "dev-foot" }, addBtn, !on ? h("span", { class: "help" }, "Включите компьютер — мост подключится сам, если включён автозапуск") : null)) : null);
   };
+  const real = devices.filter(d => d.last_seen || d.online);
+  const pending = devices.filter(d => !d.last_seen && !d.online);
+  // Ключи, которые так и не подключились (закрыли окно на полпути), — тихо убираем.
+  for (const d of pending) if (Date.now() / 1000 - d.created_at > 3600) api(`/api/devices/${d.id}`, { method: "DELETE" }).catch(() => {});
   body.append(
-    h("div", { class: "tab-intro" }, h("p", { class: "lead-text" }, "Агент может работать с папками и программами на вашем компьютере через мост — маленькую программу, которую вы запускаете у себя. Что открыть, решаете вы при запуске."),
-      h("button", { class: "btn primary sm", type: "button", onclick: connect }, icon("plus"), "Подключить")),
+    h("div", { class: "tab-intro" }, h("p", { class: "lead-text" }, "Агент может работать с файлами и программами на вашем компьютере. Папки выбираете вы — в обычном окне на компьютере."),
+      h("button", { class: "btn primary sm", type: "button", onclick: connect }, icon("plus"), "Подключить компьютер")),
     slot,
-    devices.length ? h("div", { class: "src-list" }, devices.map(card))
-      : emptyBlock("monitor", "Компьютер не подключён", "Подключите, чтобы агент читал и правил ваши файлы, искал по папкам и запускал команды — всё с вашего подтверждения."));
+    real.length ? h("div", { class: "src-list" }, real.map(card))
+      : emptyBlock("monitor", "Компьютер не подключён", "Подключение — один файл на Windows или одна строка в Терминале на Mac. Агент будет читать и править файлы в папках, которые вы откроете, — каждое изменение с вашего подтверждения.",
+        h("button", { class: "btn primary sm", type: "button", onclick: connect }, icon("plus"), "Подключить компьютер")));
 }
 
 // ── всплывающие меню ────────────────────────────────────────────────

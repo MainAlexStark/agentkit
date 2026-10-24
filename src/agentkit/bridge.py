@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Мост agentkit: даёт агенту доступ к папкам и командной строке этого компьютера.
 
-Запуск (ключ — из «Настройки → Компьютер» в чате агента):
+Обычно его ставит файл «Подключить компьютер» из чата (Windows) или одна команда в
+Терминале (macOS, Linux) — они скачивают этот файл и запускают его с --setup:
+мост запоминает сервер и ключ, предлагает выбрать папку в обычном окне выбора и
+спрашивает, запускаться ли самому при входе в систему.
 
-    python3 bridge.py --server https://agent.example.ru --key dev_… --folder ~/Документы/работа
-    python3 bridge.py … --folder ~/проекты --folder ~/Загрузки:ro --allow-shell
+Папки добавляются только окном выбора на этом компьютере (из чата можно попросить
+его открыть, но выбирает человек здесь). Сделать папку изменяемой и разрешить
+команды тоже можно лишь подтверждением здесь. Сузить доступ можно и из чата.
 
-Мост сам подключается к серверу (длинный опрос) — порты открывать не нужно.
-Агенту доступны только перечисленные папки (:ro — только чтение); команды —
-только с --allow-shell. Каждое действие печатается здесь же. Ctrl+C — остановить.
+Вручную, без установки:
 
-Только стандартная библиотека Python 3.9+: файл можно скачать и запустить как есть.
+    python3 bridge.py --server https://agent.example.ru --key dev_… --folder ~/работа --folder ~/Загрузки:ro
+
+Мост сам ходит на сервер (длинный опрос) — порты открывать не нужно.
+Только стандартная библиотека Python 3.9+.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ import io
 import json
 import os
 import platform
+import shutil
 import socket
 import ssl
 import subprocess
@@ -31,7 +37,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.0"
+VERSION = "1.1"
+HOME_DIR = Path.home() / ".agentkit"
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".idea", ".cache", "Library", "AppData", "$RECYCLE.BIN"}
 MAX_READ = 5_000_000
 MAX_OUT = 60_000
@@ -47,12 +54,44 @@ class Folder:
 
 
 class Bridge:
-    def __init__(self, server: str, key: str, folders: list[Folder], allow_shell: bool):
+    def __init__(self, server: str, key: str, folders: list[Folder], allow_shell: bool,
+                 config: Path | None = None):
         self.server = server.rstrip("/")
         self.key = key
         self.folders = {f.name: f for f in folders}
         self.allow_shell = allow_shell
+        self.config = config
         self.ctx = ssl.create_default_context()
+        self._ssl_fixed = False
+        self._lock = threading.Lock()
+
+    def save(self) -> None:
+        if self.config is None:
+            return
+        data = {"server": self.server, "key": self.key, "shell": self.allow_shell,
+                "folders": [{"path": str(f.path), "read_only": f.read_only} for f in self.folders.values()]}
+        self.config.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.config.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        if os.name == "posix":
+            os.chmod(tmp, 0o600)  # в файле ключ
+        os.replace(tmp, self.config)
+
+    def add_folder(self, path: Path, read_only: bool) -> Folder:
+        path = path.resolve()
+        with self._lock:
+            for f in self.folders.values():
+                if f.path == path:
+                    f.read_only = read_only and f.read_only
+                    self.save()
+                    return f
+            base = path.name or "root"
+            name, n = base, 2
+            while name in self.folders:
+                name, n = f"{base}-{n}", n + 1
+            f = self.folders[name] = Folder(name, path, read_only)
+            self.save()
+        return f
 
     # ── сеть ─────────────────────────────────────────────────────────
     def post(self, path: str, body: dict, timeout: float) -> dict:
@@ -80,7 +119,11 @@ class Bridge:
                 delay = 1.0
             except urllib.error.HTTPError as e:
                 if e.code in (401, 403):
-                    log("ключ не подошёл: компьютер удалён в настройках или ключ скопирован не полностью")
+                    log("ключ не подошёл: компьютер удалён в настройках чата — мост отключается")
+                    if self.config is not None:
+                        # Компьютер удалили в чате — убираем и автозапуск, чтобы мост не стучался при каждом входе.
+                        remove_autostart(self.config)
+                        self.config.unlink(missing_ok=True)
                     sys.exit(2)
                 log(f"сервер ответил {e.code}, повтор через {delay:.0f} с")
                 time.sleep(delay)
@@ -88,7 +131,10 @@ class Bridge:
                 continue
             except (urllib.error.URLError, OSError, ValueError) as e:
                 reason = getattr(e, "reason", e)
-                if "CERTIFICATE_VERIFY_FAILED" in str(reason):
+                if "CERTIFICATE_VERIFY_FAILED" in str(reason) and not self._ssl_fixed:
+                    self._ssl_fixed = True
+                    if fix_ssl(self.ctx):
+                        continue  # подхватили системные сертификаты — сразу повторяем
                     log("не проверяется сертификат сервера. На macOS: запустите «Install Certificates.command» из папки Python")
                 else:
                     log(f"нет связи с сервером ({reason}), повтор через {delay:.0f} с")
@@ -220,14 +266,55 @@ class Bridge:
         p.write_text(text.replace(old, new, 1), encoding="utf-8")
         return {"path": self.rel(f, p)}
 
+    # ── доступ: расширить — только человек здесь, сузить — можно и из чата ──
+    def op_pick_folder(self, reason: str = "", read_only: bool | None = None) -> dict:
+        prompt = "Выберите папку, которую увидит агент" + (f"\n\nЗачем: {reason}" if reason else "")
+        path = pick_folder(prompt)
+        if not path:
+            raise BridgeError("человек закрыл окно выбора — доступ не дан")
+        ro = read_only if read_only is not None else not confirm(
+            f"Разрешить агенту изменять файлы в папке «{Path(path).name}»?\n\n"
+            "«Нет» — только чтение. Каждое изменение агент всё равно покажет в чате на подтверждение.")
+        f = self.add_folder(Path(path), ro)
+        log(f"открыта папка {f.name}: {f.path}{' (только чтение)' if f.read_only else ''}")
+        return {"name": f.name, "path": str(f.path), "read_only": f.read_only}
+
+    def op_remove_folder(self, name: str) -> dict:
+        with self._lock:
+            if self.folders.pop(name, None) is None:
+                raise BridgeError(f"папка «{name}» и так не открыта")
+            self.save()
+        log(f"закрыта папка {name}")
+        return {"ok": True}
+
+    def op_set_folder(self, name: str, read_only: bool) -> dict:
+        f = self.folders.get(name)
+        if f is None:
+            raise BridgeError(f"папка «{name}» не открыта")
+        if f.read_only and not read_only and not confirm(f"Разрешить агенту изменять файлы в папке «{f.name}»?\n{f.path}"):
+            raise BridgeError("на компьютере ответили «нет»")
+        f.read_only = read_only
+        self.save()
+        return {"name": f.name, "read_only": f.read_only}
+
+    def op_set_shell(self, enabled: bool) -> dict:
+        if enabled and not self.allow_shell and not confirm(
+                "Разрешить агенту выполнять команды на этом компьютере?\n\n"
+                "Каждую команду он сначала покажет в чате на подтверждение."):
+            raise BridgeError("на компьютере ответили «нет»")
+        self.allow_shell = bool(enabled)
+        self.save()
+        return {"shell": self.allow_shell}
+
     def op_run(self, command: str, cwd: str = "", timeout: int = 60) -> dict:
         if not self.allow_shell:
-            raise BridgeError("команды на этом компьютере запрещены (мост запущен без --allow-shell)")
+            raise BridgeError("команды на этом компьютере не разрешены — включите их в чате: Настройки → Компьютер")
         if cwd.strip(" ./"):
             f, d = self.resolve(cwd)
+        elif self.folders:
+            d = next(iter(self.folders.values())).path
         else:
-            f = next(iter(self.folders.values()))
-            d = f.path
+            d = Path.home()
         try:
             r = subprocess.run(command, shell=True, cwd=str(d), capture_output=True, timeout=max(1, min(timeout, 300)))
         except subprocess.TimeoutExpired as e:
@@ -268,13 +355,204 @@ def read_text(p: Path) -> str:
     return decode(raw)
 
 
+_LOG_FILE: Path | None = None
+
+
 def log(text: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {text}", flush=True)
+    line = f"[{time.strftime('%H:%M:%S')}] {text}"
+    if _LOG_FILE is not None:
+        with open(_LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(time.strftime("%Y-%m-%d ") + line + "\n")
+    else:
+        try:
+            print(line, flush=True)
+        except (UnicodeEncodeError, OSError):
+            print(line.encode("ascii", "replace").decode(), flush=True)
+
+
+# ── сертификаты: python.org на macOS и старые Windows не видят системные ──
+def fix_ssl(ctx: ssl.SSLContext) -> bool:
+    try:
+        import certifi  # noqa: PLC0415
+
+        ctx.load_verify_locations(certifi.where())
+        return True
+    except Exception:  # noqa: BLE001
+        pass
+    if sys.platform == "darwin":
+        try:
+            pem = subprocess.run(["security", "find-certificate", "-a", "-p",
+                                  "/System/Library/Keychains/SystemRootCertificates.keychain"],
+                                 capture_output=True, timeout=20).stdout.decode()
+            ctx.load_verify_locations(cadata=pem)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+    return False
+
+
+# ── окна на этом компьютере: выбор папки и вопрос «да/нет» ─────────────
+# Без tkinter: он есть не в каждом Python. Обычные системные окна — PowerShell,
+# osascript, zenity/kdialog; без графики — вопрос в консоли.
+def _ps(script: str, env: dict) -> str:
+    full = "[Console]::OutputEncoding=[Text.Encoding]::UTF8;Add-Type -AssemblyName System.Windows.Forms;" + script
+    r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", full], capture_output=True,
+                       env={**os.environ, **env}, timeout=3600, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return r.stdout.decode("utf-8", "replace").strip()
+
+
+def _osa(script: str) -> str | None:
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, timeout=3600)
+    return r.stdout.decode("utf-8", "replace").strip() if r.returncode == 0 else None
+
+
+def _q(s: str) -> str:  # строка для AppleScript
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def pick_folder(prompt: str) -> str | None:
+    try:
+        if os.name == "nt":
+            out = _ps("$f=New-Object System.Windows.Forms.FolderBrowserDialog;$f.Description=$env:AK_PROMPT;"
+                      "$f.ShowNewFolderButton=$true;$w=New-Object System.Windows.Forms.Form -Property @{TopMost=$true};"
+                      "if($f.ShowDialog($w) -eq 'OK'){$f.SelectedPath}", {"AK_PROMPT": prompt})
+            return out or None
+        if sys.platform == "darwin":
+            out = _osa(f"POSIX path of (choose folder with prompt {_q(prompt)} default location (path to home folder))")
+            return (out.rstrip("/") or "/") if out else None
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            for cmd in (["zenity", "--file-selection", "--directory", f"--title={prompt}"],
+                        ["kdialog", "--getexistingdirectory", str(Path.home()), "--title", prompt]):
+                if shutil.which(cmd[0]):
+                    r = subprocess.run(cmd, capture_output=True, timeout=3600)
+                    return (r.stdout.decode().strip() or None) if r.returncode == 0 else None
+    except Exception as e:  # noqa: BLE001
+        log(f"окно выбора папки не открылось ({e}) — спрошу здесь")
+    if sys.stdin and sys.stdin.isatty():
+        try:
+            v = input(f"{prompt}\nПуть к папке (пусто — отмена): ").strip()
+        except EOFError:
+            return None
+        p = Path(os.path.expanduser(v)) if v else None
+        return str(p) if p and p.is_dir() else None
+    return None
+
+
+def confirm(text: str) -> bool:
+    try:
+        if os.name == "nt":
+            out = _ps("$w=New-Object System.Windows.Forms.Form -Property @{TopMost=$true};"
+                      "[System.Windows.Forms.MessageBox]::Show($w,$env:AK_TEXT,'Агент','YesNo','Question')",
+                      {"AK_TEXT": text})
+            return out == "Yes"
+        if sys.platform == "darwin":
+            out = _osa(f"button returned of (display dialog {_q(text)} with title \"Агент\" "
+                       "buttons {\"Нет\", \"Да\"} default button \"Да\" with icon caution)")
+            return out == "Да"
+        if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) and shutil.which("zenity"):
+            return subprocess.run(["zenity", "--question", "--title=Агент", f"--text={text}"], timeout=3600).returncode == 0
+    except Exception as e:  # noqa: BLE001
+        log(f"окно с вопросом не открылось ({e}) — спрошу здесь")
+    if sys.stdin and sys.stdin.isatty():
+        try:
+            return input(f"{text}\n[д/н]: ").strip().lower() in ("д", "да", "y", "yes")
+        except EOFError:
+            return False
+    return False  # спросить некого — значит «нет»
+
+
+# ── автозапуск при входе в систему ──────────────────────────────────
+def _autostart_path(config: Path) -> Path:
+    tag = config.stem
+    if os.name == "nt":
+        return Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Programs/Startup" / f"agentkit-{tag}.vbs"
+    if sys.platform == "darwin":
+        return Path.home() / "Library/LaunchAgents" / f"ru.agentkit.{tag}.plist"
+    return Path.home() / ".config/autostart" / f"agentkit-{tag}.desktop"
+
+
+def install_autostart(config: Path, script: Path) -> Path:
+    target = _autostart_path(config)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    py = Path(sys.executable)
+    if os.name == "nt":
+        pyw = py.with_name("pythonw.exe")
+        pyw = pyw if pyw.exists() else py
+        # .vbs — чтобы при входе не висело чёрное окно консоли.
+        target.write_text(f'CreateObject("WScript.Shell").Run """{pyw}"" ""{script}"" --config ""{config}"" --background", 0, False\r\n',
+                          encoding="utf-16")
+        subprocess.Popen(["wscript", str(target)])
+    elif sys.platform == "darwin":
+        label = target.stem
+        args = "".join(f"<string>{a}</string>" for a in (str(py), str(script), "--config", str(config), "--background"))
+        target.write_text(f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>{label}</string>
+<key>ProgramArguments</key><array>{args}</array>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+</dict></plist>
+''', encoding="utf-8")
+        subprocess.run(["launchctl", "unload", str(target)], capture_output=True)
+        subprocess.run(["launchctl", "load", "-w", str(target)], capture_output=True)
+    else:
+        target.write_text(f"[Desktop Entry]\nType=Application\nName=Агент: мост\n"
+                          f"Exec={py} {script} --config {config} --background\nX-GNOME-Autostart-enabled=true\n", encoding="utf-8")
+        subprocess.Popen([str(py), str(script), "--config", str(config), "--background"], start_new_session=True)
+    return target
+
+
+def remove_autostart(config: Path) -> None:
+    target = _autostart_path(config)
+    if sys.platform == "darwin" and target.exists():
+        subprocess.run(["launchctl", "unload", "-w", str(target)], capture_output=True)
+    target.unlink(missing_ok=True)
+
+
+# ── один мост на ключ: второй экземпляр не нужен ───────────────────────
+def _pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes  # noqa: PLC0415
+
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(h)
+        return code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def take_lock(config: Path) -> bool:
+    lock = config.with_suffix(".pid")
+    try:
+        pid = int(lock.read_text().strip())
+        if pid != os.getpid() and _pid_alive(pid):
+            return False
+    except (OSError, ValueError):
+        pass
+    lock.write_text(str(os.getpid()))
+    return True
+
+
+def load_config(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def find_config() -> Path | None:
+    items = sorted(HOME_DIR.glob("bridge-*.json"), key=lambda p: -p.stat().st_mtime) if HOME_DIR.is_dir() else []
+    return items[0] if items else None
 
 
 def parse_folders(items: list[str]) -> list[Folder]:
     out: dict[str, Folder] = {}
-    for item in items or ["."]:
+    for item in items:
         ro = item.endswith(":ro")
         raw = item[:-3] if ro else item
         p = Path(os.path.expandvars(os.path.expanduser(raw))).resolve()
@@ -289,22 +567,78 @@ def parse_folders(items: list[str]) -> list[Folder]:
 
 
 def main(argv: list[str] | None = None) -> None:
+    global _LOG_FILE
     ap = argparse.ArgumentParser(description="Мост agentkit: папки и команды этого компьютера для агента")
-    ap.add_argument("--server", required=True, help="адрес сервиса агента, https://…")
+    ap.add_argument("--server", help="адрес сервиса агента, https://…")
     ap.add_argument("--key", default=os.environ.get("AGENTKIT_BRIDGE_KEY", ""), help="ключ из «Настройки → Компьютер»")
     ap.add_argument("--folder", action="append", default=[], help="открыть папку агенту (можно несколько; :ro — только чтение)")
-    ap.add_argument("--allow-shell", action="store_true", help="разрешить агенту выполнять команды (каждая — с вашим подтверждением в чате)")
+    ap.add_argument("--allow-shell", action="store_true", help="разрешить агенту выполнять команды (каждая — с подтверждением в чате)")
+    ap.add_argument("--setup", action="store_true", help="первый запуск: запомнить ключ, выбрать папку, автозапуск")
+    ap.add_argument("--config", type=Path, help="файл настроек моста (по умолчанию ~/.agentkit/bridge-<id>.json)")
+    ap.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--uninstall", action="store_true", help="убрать автозапуск и забыть ключ")
     a = ap.parse_args(argv)
-    if not a.key:
-        sys.exit("нужен ключ: --key или переменная AGENTKIT_BRIDGE_KEY")
-    folders = parse_folders(a.folder)
-    log(f"мост agentkit {VERSION} → {a.server}")
-    for f in folders:
-        log(f"  папка {f.name}: {f.path}{' (только чтение)' if f.read_only else ''}")
-    log(f"  команды: {'разрешены' if a.allow_shell else 'запрещены'}")
-    log("Ctrl+C — остановить")
+
+    cfg_path = a.config
+    if a.key:
+        cfg_path = cfg_path or HOME_DIR / f"bridge-{a.key.split('.')[0]}.json"
+    elif cfg_path is None:
+        cfg_path = find_config()
+    if a.uninstall:
+        if cfg_path:
+            remove_autostart(cfg_path)
+            cfg_path.unlink(missing_ok=True)
+        log("мост удалён с этого компьютера")
+        return
+    saved = load_config(cfg_path) if cfg_path and cfg_path.is_file() else {}
+    server = a.server or saved.get("server")
+    key = a.key or saved.get("key")
+    if not server or not key:
+        sys.exit("нужны --server и --key (или запустите файл «Подключить компьютер» из чата)")
+    if a.background:
+        HOME_DIR.mkdir(parents=True, exist_ok=True)
+        _LOG_FILE = HOME_DIR / "bridge.log"
+    folders = parse_folders(a.folder) if a.folder else [
+        Folder(f.name, f.path, f.read_only) for f in parse_folders([x["path"] + (":ro" if x.get("read_only") else "")
+                                                                   for x in saved.get("folders", []) if Path(x["path"]).is_dir()])]
+    bridge = Bridge(server, key, folders, a.allow_shell or bool(saved.get("shell")), config=cfg_path)
+    bridge.save()
+    if not take_lock(cfg_path):
+        log("мост уже работает на этом компьютере — второй не нужен")
+        return
+
+    if a.setup:
+        log(f"мост agentkit {VERSION} → {server}")
+        if not bridge.folders:
+            log("откройте агенту папку — появится обычное окно выбора")
+            while True:
+                path = pick_folder("Выберите папку, которую увидит агент (документы, проекты…)")
+                if not path:
+                    break
+                ro = not confirm(f"Разрешить агенту изменять файлы в папке «{Path(path).name}»?\n\n"
+                                 "«Нет» — только чтение. Изменения агент всё равно покажет в чате на подтверждение.")
+                f = bridge.add_folder(Path(path), ro)
+                log(f"  папка {f.name}: {f.path}{' (только чтение)' if f.read_only else ''}")
+                if not confirm("Открыть агенту ещё одну папку?"):
+                    break
+        if confirm("Запускать связь с агентом автоматически при входе в систему?\n\n"
+                   "Тогда это окно можно будет закрыть — мост будет работать незаметно в фоне."):
+            script = HOME_DIR / "bridge.py"
+            if Path(__file__).resolve() != script.resolve():
+                HOME_DIR.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(__file__, script)
+            cfg_path.with_suffix(".pid").unlink(missing_ok=True)  # фоновый экземпляр возьмёт замок сам
+            install_autostart(cfg_path, script)
+            log("готово: мост работает в фоне и запустится сам при входе. Окно можно закрыть.")
+            return
+        log("готово. Пока это окно открыто, агент видит компьютер. Закрыть — Ctrl+C или крестик.")
+    else:
+        log(f"мост agentkit {VERSION} → {server}")
+        for f in bridge.folders.values():
+            log(f"  папка {f.name}: {f.path}{' (только чтение)' if f.read_only else ''}")
+        log(f"  команды: {'разрешены' if bridge.allow_shell else 'запрещены'}")
     try:
-        Bridge(a.server, a.key, folders, a.allow_shell).loop()
+        bridge.loop()
     except KeyboardInterrupt:
         log("остановлено")
 

@@ -8,13 +8,17 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from agentkit.devices import DeviceHub
+from agentkit.devices import DeviceError, DeviceHub
 from agentkit.tools.base import User
 
 BRIDGE_FILE = Path(__file__).resolve().parent.parent / "bridge.py"
+CONNECT_DIR = Path(__file__).resolve().parent.parent / "connect"
+# Что можно попросить у моста из настроек чата. Расширение доступа (новая папка, запись,
+# команды) мост всё равно подтверждает окном на компьютере — сервер только просит.
+DEVICE_ACTIONS = {"pick_folder": 300, "remove_folder": 30, "set_folder": 300, "set_shell": 300}
 
 
 class ProjectIn(BaseModel):
@@ -36,6 +40,11 @@ class MemberIn(BaseModel):
 
 class DeviceIn(BaseModel):
     name: str = ""
+
+
+class DeviceAction(BaseModel):
+    op: str
+    args: dict[str, Any] = {}
 
 
 class BridgePoll(BaseModel):
@@ -213,6 +222,20 @@ def register(api: APIRouter, app: Any, svc: Any, auth: Any) -> None:
         await hub().delete(device_id)  # ключ перестаёт работать — мост увидит 401 и остановится
         return {"ok": True}
 
+    @api.post("/devices/{device_id}/action")
+    async def device_action(device_id: str, body: DeviceAction, user: User = Depends(auth)):
+        """Открыть / закрыть папку, разрешить команды — мост спросит человека на компьютере."""
+        d = await own_device(device_id, user)
+        if body.op not in DEVICE_ACTIONS:
+            raise HTTPException(400, "неизвестное действие")
+        if not DeviceHub.online(d):
+            raise HTTPException(409, "компьютер не на связи — запустите мост")
+        try:
+            res = await hub().call(d, body.op, body.args, timeout=DEVICE_ACTIONS[body.op])
+        except DeviceError as e:
+            raise HTTPException(409, str(e)) from None
+        return {"ok": True, "result": res}
+
     async def bridge_device(request: Request) -> dict[str, Any]:
         key = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
         d = await hub().auth(key) if key else None
@@ -237,3 +260,19 @@ def register(api: APIRouter, app: Any, svc: Any, auth: Any) -> None:
     @app.get("/bridge.py")
     async def bridge_script():
         return FileResponse(BRIDGE_FILE, media_type="text/x-python", filename="bridge.py")
+
+    def base_url(request: Request) -> str:
+        # Адрес, по которому человек открыл чат, — он же доступен и с его компьютера.
+        # (public_url бывает localhost по умолчанию, а за Caddy uvicorn видит https через proxy-headers.)
+        return str(request.base_url).rstrip("/")
+
+    @app.get("/connect.sh")
+    async def connect_sh(request: Request):
+        text = (CONNECT_DIR / "connect.sh").read_text(encoding="utf-8").replace("__SERVER__", base_url(request))
+        return PlainTextResponse(text, media_type="text/x-shellscript", headers={"Cache-Control": "no-cache"})
+
+    @app.get("/connect.bat")
+    async def connect_bat(request: Request):
+        """Шаблон для Windows: ключ подставляет страница настроек — в URL и логах сервера его нет."""
+        text = (CONNECT_DIR / "connect.bat").read_text(encoding="utf-8").replace("__SERVER__", base_url(request))
+        return PlainTextResponse(text.replace("\r\n", "\n").replace("\n", "\r\n"), headers={"Cache-Control": "no-cache"})

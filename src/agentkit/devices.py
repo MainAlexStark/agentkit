@@ -20,7 +20,8 @@ from agentkit.tools.base import Tool, ToolContext, ToolResult, User, tool
 
 ONLINE_WINDOW = 45.0  # мост опрашивает раз в ≤25 с — если 45 с тишины, считаем отключённым
 POLL_WAIT = 25.0
-DEVICE_TOOLS = {"pc_list", "pc_read", "pc_search", "pc_write", "pc_edit", "pc_run"}
+DEVICE_TOOLS = {"pc_list", "pc_read", "pc_search", "pc_write", "pc_edit", "pc_run", "pc_request_access"}
+FOLDER_TOOLS = {"pc_list", "pc_read", "pc_search", "pc_write", "pc_edit"}
 NS = "devices"
 
 
@@ -138,6 +139,11 @@ class DeviceHub:
                          f"команды — {'можно' if info.get('shell') else 'запрещены'}")
         if not any((d.get("info") or {}).get("shell") for d in on):
             hide.add("pc_run")
+        if not any((d.get("info") or {}).get("folders") for d in on):
+            hide |= FOLDER_TOOLS
+            lines.append("Папок пока не открыто: если нужны файлы с компьютера, попроси доступ через pc_request_access.")
+        else:
+            lines.append("Нужна другая папка — попроси доступ через pc_request_access (человек выберет её у себя).")
         if len(on) > 1:
             lines.append("Компьютеров несколько — укажи device, иначе берётся последний активный.")
         return TurnContext(text="\n".join(lines), hide_tools=hide)
@@ -238,7 +244,22 @@ def device_tools(hub: DeviceHub) -> list[Tool]:
                 f"stderr:\n{r.get('stderr', '')}" if r.get("stderr") else ""]
         return ToolResult(content="\n".join(b for b in body if b), is_error=r.get("code") not in (0, None), data=r)
 
-    return [pc_list, pc_read, pc_search, pc_write, pc_edit, pc_run]
+    @tool(title="Доступ к папке на компьютере", read_only=True, group="device", source="builtin", timeout=330)
+    async def pc_request_access(
+        ctx: ToolContext,
+        reason: Annotated[str, "Зачем нужна папка — человек увидит это в окне выбора, например «чтобы найти договоры за 2025 год»"],
+        device: Annotated[str, "Какой компьютер (если их несколько); пусто — последний активный"] = "",
+    ) -> ToolResult:
+        """Просит человека открыть папку: на его компьютере появляется обычное окно выбора папки.
+        Используй, когда нужных файлов нет в уже открытых папках. Ждёт, пока человек выберет (до 5 минут)."""
+        try:
+            r = await run(ctx, device, "pick_folder", {"reason": reason}, timeout=300)
+        except Exception as e:  # noqa: BLE001
+            return err(e)
+        mode = "только чтение" if r.get("read_only") else "чтение и запись"
+        return ToolResult(content=f"Открыта папка «{r['name']}» ({mode}). Пути: {r['name']}/…", data=r)
+
+    return [pc_list, pc_read, pc_search, pc_write, pc_edit, pc_run, pc_request_access]
 
 
 def _size(n: int) -> str:
