@@ -1921,7 +1921,12 @@ async function boot() {
   applyTheme(store.get("agent_theme") || "auto");
   applyPrefs();
   if (!S.token) { $("#login").hidden = false; return; }
-  try { S.config = await api("/api/config"); } catch { return; }
+  try { S.config = await api("/api/config"); } catch (e) {
+    // 401 уже вернул на вход; остальное (сервер лежит, прокси) — не оставляем пустую страницу.
+    $("#login").hidden = false; $("#app").hidden = true;
+    $("#login-error").textContent = S.token ? `Сервер не ответил: ${e.message}. Обновите страницу.` : "";
+    return;
+  }
   S.me = await api("/api/me");
   const name = S.config.name;
   document.title = name;

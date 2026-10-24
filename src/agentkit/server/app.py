@@ -691,15 +691,34 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
 
     @app.get("/")
     async def index():
-        return FileResponse(static / "index.html")
+        # Ссылки на app.js/app.css — с версией по содержимому файлов, а сама страница не кэшируется.
+        # Иначе после обновления Chrome эвристически берёт старый app.js из кэша к новой
+        # разметке (Safari перепроверяет чаще) — и интерфейс ломается только в одном браузере.
+        text = (static / "index.html").read_text(encoding="utf-8")
+        for name in ("app.js", "app.css"):
+            f = static / name
+            if f.is_file():
+                st = f.stat()
+                ver = f"{int(st.st_mtime)}-{st.st_size}"
+                text = text.replace(f'"/static/{name}"', f'"/static/{name}?v={ver}"')
+        return HTMLResponse(text, headers={"Cache-Control": "no-cache"})
 
-    app.mount("/static", StaticFiles(directory=static), name="static")
+    app.mount("/static", _RevalidatedStatic(directory=static), name="static")
 
     @app.exception_handler(ValueError)
     async def value_error(_, exc: ValueError):
         return JSONResponse({"detail": str(exc)}, status_code=400)
 
     return app
+
+
+class _RevalidatedStatic(StaticFiles):
+    """Статика всегда перепроверяется (ETag → 304): без этого браузер держит старый файл неделями."""
+
+    def file_response(self, *args: Any, **kwargs: Any):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
 
 
 def _oauth_page(ok: bool, text: str) -> str:
