@@ -129,6 +129,8 @@ class Agent:
         self.rules = rules
         self.memory_scopes = memory_scopes or (lambda u: ["global", f"user:{u.id}"])
         self.tracers = tracers or []
+        # Каталог моделей знает, кто умеет картинки, точнее шаблонов; сервис подставляет его сюда.
+        self.vision_for: Callable[[str], bool | None] | None = None
         # Субагент не может остановиться ради подтверждения: продолжить его
         # прогон было бы некому. Вместо «спросить» он получает отказ.
         self.can_ask = can_ask
@@ -479,7 +481,9 @@ class Agent:
         if not any(isinstance(m.content, list) for m in msgs):
             return msgs
         ws = self.workspace_for(session_id)
-        vision = is_vision(self.router.resolve(model), self.config.vision_models)
+        mid = self.router.resolve(model)
+        known = self.vision_for(mid) if self.vision_for else None
+        vision = known if known is not None else is_vision(mid, self.config.vision_models)
         return [replace(m, content=expand_parts(m.content, ws, vision=vision)) if isinstance(m.content, list) else m
                 for m in msgs]
 

@@ -292,3 +292,28 @@ async def test_spec_tool_filter(store, user):
     child = agent.child(AgentSpec(name="x", tools=["read_output", "todo_*"]))
     names = {t.name for t in child.tools.all()}
     assert "task" not in names and "todo_write" in names and "memory_save" not in names
+
+
+async def test_model_catalog_keeps_snapshot_on_failure():
+    from agentkit import FakeLLM, ModelRouter
+    from agentkit.llm.catalog import ModelCatalog
+
+    fake = FakeLLM()
+    calls = {"n": 0}
+
+    async def list_models():
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("openrouter недоступен")
+        return [{"id": "x/a", "name": "X: A", "pricing": {"prompt": "-1"}, "supported_parameters": ["tools"]},
+                {"id": "x/a:batch", "supported_parameters": ["tools"]},
+                {"id": "x/b", "supported_parameters": []}]
+
+    fake.list_models = list_models
+    cat = ModelCatalog(ModelRouter({"or": fake}), configured=["or:x/conf"])
+    await cat.refresh()
+    ids = [m.id for m in cat.models()]
+    assert ids == ["or:x/a", "or:x/conf"]  # без tools и :batch — нет; из настроек — заглушка
+    assert cat.get("or:x/a").price_in is None and cat.get("or:x/a").name == "A"
+    await cat.refresh(force=True)
+    assert "or" in cat.errors and [m.id for m in cat.models()][0] == "or:x/a"

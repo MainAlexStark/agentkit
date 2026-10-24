@@ -75,12 +75,31 @@ class MemoryIn(BaseModel):
     scope: str = "user"  # user | global
 
 
+class MemoryPatch(BaseModel):
+    text: str
+
+
+class ModelPrefs(BaseModel):
+    favorites: list[str] | None = None
+    only_favorites: bool | None = None
+    default: str | None = None
+
+
+class ModelPolicy(BaseModel):
+    ids: list[str] | None = None  # None — снять ограничение (действует AGENT_MODELS_ALLOW)
+
+
 class ScheduleIn(BaseModel):
+    id: str | None = None  # есть — правка существующей задачи
     name: str
     cron: str
     prompt: str
     enabled: bool = True
     keep_session: bool = False
+
+
+class SchedulePatch(BaseModel):
+    enabled: bool
 
 
 class HeadlessRun(BaseModel):
@@ -151,7 +170,11 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
     @api.get("/config")
     async def config(user: User = Depends(auth)):
         s = svc.settings
-        return {"name": s.name, "models": s.model_list(), "default_model": s.model_main,
+        prefs = await svc.model_prefs(user)
+        policy = await svc.model_policy()
+        favs = [m for m in prefs["favorites"] if svc.model_allowed(m, policy)]
+        return {"name": s.name, "models": favs or [s.model_main],
+                "default_model": prefs["default"] if svc.model_allowed(prefs["default"], policy) else s.model_main,
                 "modes": [m.value for m in Mode if m != Mode.BYPASS or user.has_role("admin")],
                 "default_mode": s.default_mode, "is_admin": user.has_role("admin"),
                 "description": svc.domain.description or s.description,
@@ -168,7 +191,8 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
 
     @api.post("/sessions")
     async def create_session(body: NewSession, user: User = Depends(auth)):
-        state = {k: v for k, v in {"model": body.model, "mode": _check_mode(body.mode, user)}.items() if v}
+        state = {k: v for k, v in {"model": await svc.check_model(body.model),
+                                   "mode": _check_mode(body.mode, user)}.items() if v}
         s = await svc.store.create_session(user.id, title=body.title, agent=svc.agent.spec.name, state=state)
         return {"id": s.id}
 
@@ -196,7 +220,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         if body.model is not None or body.mode is not None:
             state = dict(s.state or {})
             if body.model is not None:
-                state["model"] = body.model
+                state["model"] = await svc.check_model(body.model)
             if body.mode is not None:
                 state["mode"] = _check_mode(body.mode, user)
             await svc.store.set_state(session_id, state)
@@ -215,10 +239,11 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         """Если агент занят — сообщение встаёт в очередь, и он подхватит его между шагами (queued: true)."""
         await own_session(session_id, user)
         mode = _check_mode(body.mode, user)
+        model = await svc.check_model(body.model)
         content = _content(session_id, body)
         if not content:
             raise HTTPException(400, "пустое сообщение")
-        return await svc.send(session_id, user, content, model=body.model, mode=mode)
+        return await svc.send(session_id, user, content, model=model, mode=mode)
 
     @api.post("/sessions/{session_id}/cancel")
     async def cancel(session_id: str, user: User = Depends(auth)):
@@ -280,11 +305,12 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         else:
             sid = (await svc.store.create_session(user.id, title=body.text[:80])).id
         mode = _check_mode(body.mode, user)
+        model = await svc.check_model(body.model)
         try:
             # Через RunManager, а не напрямую: прогон виден в веб-чате, его можно
             # остановить, и второй запрос в ту же сессию получит 409, а не гонку.
             run_id = await svc.runs.start(
-                sid, lambda: svc.agent.run(sid, user, body.text, model=body.model, mode=mode, trigger="api"),
+                sid, lambda: svc.agent.run(sid, user, body.text, model=model, mode=mode, trigger="api"),
                 cancel=svc.agent.cancel)
         except Busy:
             raise HTTPException(409, "в сессии уже идёт прогон") from None
@@ -311,11 +337,25 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
                                          created_by=user.id)
         return rec.__dict__
 
+    async def own_memory(memory_id: str, user: User) -> None:
+        """Своё правит каждый, общее («для всех») — только админ."""
+        items = {m.id: m for m in await svc.store.memory_list(["global", f"user:{user.id}"])}
+        if memory_id not in items:
+            raise HTTPException(404, "нет такой записи")
+        if items[memory_id].scope != f"user:{user.id}":
+            require_admin(user)
+
+    @api.patch("/memory/{memory_id}")
+    async def memory_edit(memory_id: str, body: MemoryPatch, user: User = Depends(auth)):
+        await own_memory(memory_id, user)
+        if not body.text.strip():
+            raise HTTPException(400, "пустая запись — удалите её вместо этого")
+        await svc.store.memory_update(memory_id, body.text.strip())
+        return {"ok": True}
+
     @api.delete("/memory/{memory_id}")
     async def memory_delete(memory_id: str, user: User = Depends(auth)):
-        mine = {m.id for m in await svc.store.memory_list([f"user:{user.id}"])}
-        if memory_id not in mine:
-            require_admin(user)
+        await own_memory(memory_id, user)
         return {"ok": await svc.store.memory_delete(memory_id)}
 
     # ── инструменты, MCP, расход ─────────────────────────────────────
@@ -326,10 +366,56 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
                        "destructive": t.destructive, "deferred": t.deferred, "group": t.group, "source": t.source}
                       for t in svc.registry.all()],
             "mcp": [{"name": s.name, "ok": s.ok, "tools": s.tools, "error": s.error, "needs_auth": s.needs_auth,
-                     "oauth": s.oauth} for s in svc.mcp.status.values()],
+                     "oauth": s.oauth, "server": s.server_info.get("name") or "",
+                     "version": s.server_info.get("version") or "",
+                     # адрес — только админу: в нём бывают внутренние хосты
+                     "transport": (("http" if c.url else "stdio") if (c := svc.mcp.config(s.name)) else ""),
+                     "address": ((c.url or c.command or "") if c and user.has_role("admin") else "")}
+                    for s in svc.mcp.status.values()],
             "skills": [{"name": k.name, "description": k.description} for k in (svc.agent.skills.skills.values()
                                                                                if svc.agent.skills else [])],
         }
+
+    # ── модели ───────────────────────────────────────────────────────
+    @api.get("/models")
+    async def models(refresh: bool = False, user: User = Depends(auth)):
+        """Каталог моделей. Обычный пользователь видит только разрешённые; админ — все, с отметкой."""
+        admin = user.has_role("admin")
+        await svc.catalog.refresh(force=refresh and admin)
+        policy = await svc.model_policy()
+        items = []
+        for m in svc.catalog.models():
+            ok = svc.model_allowed(m.id, policy)
+            if ok or admin:
+                items.append({**m.to_dict(), "allowed": ok})
+        prefs = await svc.model_prefs(user)
+        out: dict[str, Any] = {"models": items, **prefs, "main": svc.settings.model_main,
+                               "fetched_at": svc.catalog.fetched_at}
+        if admin:
+            out["policy"] = {"custom": policy is not None, "patterns": svc.settings.models_allow,
+                             "errors": svc.catalog.errors}
+        return out
+
+    @api.put("/models/prefs")
+    async def models_prefs(body: ModelPrefs, user: User = Depends(auth)):
+        cur = await svc.store.kv_get("model_prefs", user.id) or {}
+        if body.favorites is not None:
+            cur["favorites"] = list(dict.fromkeys(body.favorites))[:200]
+        if body.only_favorites is not None:
+            cur["only_favorites"] = body.only_favorites
+        if body.default is not None:
+            cur["default"] = await svc.check_model(body.default) or ""
+        await svc.store.kv_set("model_prefs", user.id, cur)
+        return await svc.model_prefs(user)
+
+    @api.put("/models/policy")
+    async def models_policy(body: ModelPolicy, user: User = Depends(auth)):
+        require_admin(user)
+        if body.ids is None:
+            await svc.store.kv_delete("config", "models_allowed")
+        else:
+            await svc.store.kv_set("config", "models_allowed", {"ids": sorted(set(body.ids))})
+        return {"ok": True}
 
     @api.post("/reload")
     async def reload(user: User = Depends(auth)):
@@ -347,26 +433,63 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
     async def schedules(user: User = Depends(auth)):
         return [s.__dict__ for s in await svc.store.schedule_list(user_id=None if user.has_role("admin") else user.id)]
 
+    async def own_schedule(schedule_id: str, user: User) -> ScheduleRec:
+        s = {x.id: x for x in await svc.store.schedule_list()}.get(schedule_id)
+        if s is None or (s.user_id != user.id and not user.has_role("admin")):
+            raise HTTPException(404, "нет такого расписания")
+        return s
+
+    @api.get("/schedules/preview")
+    async def schedule_preview(cron: str, user: User = Depends(auth)):
+        """Ближайшие запуски — чтобы человек видел, что именно он настроил, до сохранения."""
+        if not validate_cron(cron):
+            return {"ok": False, "next": []}
+        out, t = [], time.time()
+        for _ in range(3):
+            t = next_run(cron, svc.settings.tz, t)
+            out.append(t)
+        return {"ok": True, "next": out}
+
     @api.post("/schedules")
     async def add_schedule(body: ScheduleIn, user: User = Depends(auth)):
+        if not body.name.strip() or not body.prompt.strip():
+            raise HTTPException(400, "нужны название и задание для агента")
         if not validate_cron(body.cron):
             raise HTTPException(400, "неверное cron-выражение (5 полей: минута час день месяц день_недели)")
         from agentkit.messages import new_id
 
-        sid = None
-        if body.keep_session:
+        old = await own_schedule(body.id, user) if body.id else None
+        sid = old.session_id if old else None
+        if body.keep_session and not sid:
             sid = (await svc.store.create_session(user.id, title=f"⏰ {body.name}")).id
-        rec = ScheduleRec(id=new_id("sc_"), name=body.name, cron=body.cron, prompt=body.prompt, user_id=user.id,
-                          enabled=body.enabled, session_id=sid, next_run_at=next_run(body.cron, svc.settings.tz))
+        elif not body.keep_session:
+            sid = None
+        rec = ScheduleRec(id=old.id if old else new_id("sc_"), name=body.name.strip(), cron=body.cron.strip(),
+                          prompt=body.prompt.strip(), user_id=old.user_id if old else user.id, enabled=body.enabled,
+                          session_id=sid, last_run_at=old.last_run_at if old else None,
+                          next_run_at=next_run(body.cron, svc.settings.tz))
         await svc.store.schedule_upsert(rec)
         return rec.__dict__
 
+    @api.patch("/schedules/{schedule_id}")
+    async def patch_schedule(schedule_id: str, body: SchedulePatch, user: User = Depends(auth)):
+        s = await own_schedule(schedule_id, user)
+        s.enabled = body.enabled
+        # После паузы считаем от «сейчас»: иначе включённая задача сразу сработала бы за пропущенное.
+        s.next_run_at = next_run(s.cron, svc.settings.tz) if body.enabled else s.next_run_at
+        await svc.store.schedule_upsert(s)
+        return s.__dict__
+
+    @api.post("/schedules/{schedule_id}/run")
+    async def run_schedule(schedule_id: str, user: User = Depends(auth)):
+        s = await own_schedule(schedule_id, user)
+        if not await svc.scheduler.run_now(s):
+            raise HTTPException(409, "задача уже выполняется")
+        return {"ok": True}
+
     @api.delete("/schedules/{schedule_id}")
     async def del_schedule(schedule_id: str, user: User = Depends(auth)):
-        items = {s.id: s for s in await svc.store.schedule_list()}
-        s = items.get(schedule_id)
-        if s is None or (s.user_id != user.id and not user.has_role("admin")):
-            raise HTTPException(404, "нет такого расписания")
+        await own_schedule(schedule_id, user)
         await svc.store.schedule_delete(schedule_id)
         return {"ok": True}
 

@@ -459,7 +459,7 @@ function updateSend() { $("#send").disabled = !$("#input").value.trim() && !S.at
 // ── действия ────────────────────────────────────────────────────────
 async function ensureSession() {
   if (S.sessionId) return S.sessionId;
-  const s = await api("/api/sessions", { method: "POST", body: { model: $("#model").value, mode: $("#mode").value } });
+  const s = await api("/api/sessions", { method: "POST", body: { model: S.model, mode: $("#mode").value } });
   S.sessionId = s.id; S.lastSeq = 0;
   history.replaceState(null, "", `#${s.id}`);
   return s.id;
@@ -479,7 +479,7 @@ async function send(text) {
   if (wasRunning) S.queued.push(el);
   scroll(true);
   try {
-    const r = await api(`/api/sessions/${sid}/messages`, { method: "POST", body: { text, files, model: $("#model").value, mode: $("#mode").value } });
+    const r = await api(`/api/sessions/${sid}/messages`, { method: "POST", body: { text, files, model: S.model, mode: $("#mode").value } });
     if (!r.queued) { setRunning(true); follow(); }
     else if (!wasRunning) { S.queued.push(el); el.classList.add("queued"); setRunning(true); follow(); }
   } catch (e) { alertMsg(e.message); }
@@ -596,7 +596,7 @@ async function openSession(id) {
   let s;
   try { s = await api(`/api/sessions/${id}`); } catch { S.sessionId = null; history.replaceState(null, "", "#"); return; }
   $("#chat-title").textContent = s.title || "Новый разговор";
-  if (s.state?.model) $("#model").value = s.state.model;
+  if (s.state?.model) setModel(s.state.model);
   if (s.state?.mode) $("#mode").value = s.state.mode;
   if (!s.messages.length) box().replaceChildren(emptyState());
   for (const m of s.messages) {
@@ -623,69 +623,555 @@ async function openSession(id) {
   loadSessions();
 }
 
-// ── панели ──────────────────────────────────────────────────────────
+// ── общие элементы настроек ─────────────────────────────────────────
 const row = (main, ...right) => h("div", { class: "row" }, h("div", { class: "grow" }, main), ...right);
-const panels = {
-  async memory(body) {
-    const items = await api("/api/memory");
-    const input = h("textarea", { rows: 2, placeholder: "Правило или факт, например: «отчёты присылай по пятницам»" });
-    const scope = S.config.is_admin ? h("select", {}, h("option", { value: "user" }, "Только для меня"), h("option", { value: "global" }, "Для всех")) : null;
-    body.append(h("div", { class: "form" }, input, h("div", { class: "actions" }, scope,
-      h("button", { class: "btn primary", onclick: async () => { if (!input.value.trim()) return; await api("/api/memory", { method: "POST", body: { text: input.value, scope: scope?.value || "user" } }); openSettings("memory"); } }, "Добавить"))));
-    if (!items.length) body.append(h("p", { class: "muted" }, "Пока пусто. Скажите агенту «запомни: …» — правило появится здесь и будет учитываться в каждом разговоре."));
-    for (const m of items) body.append(row(m.text,
-      h("span", { class: "badge" }, m.scope === "global" ? "для всех" : "моё"),
-      h("button", { class: "icon-btn", title: "Удалить", onclick: async () => { await api(`/api/memory/${m.id}`, { method: "DELETE" }); openSettings("memory"); } }, icon("x"))));
-  },
-  async tools(body) {
-    const d = await api("/api/tools");
-    if (S.config.is_admin) body.append(h("div", { class: "form" }, h("div", { class: "actions" },
-      h("span", { class: "muted", style: "flex:1;font-size:12.5px" }, "mcp.json и skills читаются при старте"),
-      h("button", { class: "btn sm", onclick: async () => { await api("/api/reload", { method: "POST" }); openSettings("tools"); } }, "Перечитать"))));
-    if (d.mcp.length) {
-      body.append(h("div", { class: "section-title" }, "MCP-серверы"));
-      for (const s of d.mcp) {
-        let action = null;
-        if (S.config.is_admin && s.needs_auth) action = h("button", { class: "btn primary sm", onclick: () => mcpConnect(s.name) }, "Подключить");
-        else if (S.config.is_admin && s.oauth) action = h("button", { class: "btn ghost sm", onclick: async () => {
-          if (!confirm(`Отключить ${s.name}? Токены будут отозваны.`)) return;
-          await api(`/api/mcp/${encodeURIComponent(s.name)}/connect`, { method: "DELETE" }); openSettings("tools"); } }, "Отключить");
-        body.append(row([h("div", {}, h("b", {}, s.name), s.oauth ? h("span", { class: "muted" }, " · OAuth") : null),
-          !s.ok && s.error ? h("div", { class: "sub-text" }, s.error) : null],
-          h("span", { class: "badge " + (s.ok ? "ok" : s.needs_auth ? "warn" : "err") }, s.ok ? `${s.tools} ${plural(s.tools, "инструмент", "инструмента", "инструментов")}` : s.needs_auth ? "нужен вход" : "нет связи"),
-          action));
-      }
+function toggle(on, onChange, label) {
+  const b = h("button", { type: "button", class: "switch", role: "switch", "aria-checked": String(!!on), "aria-label": label || "" });
+  b.addEventListener("click", async e => {
+    e.stopPropagation();
+    on = !on; b.setAttribute("aria-checked", String(on));
+    try { await onChange(on, b); } catch (err) { on = !on; b.setAttribute("aria-checked", String(on)); toast(err.message); }
+  });
+  return b;
+}
+const switchRow = (title, help, on, onChange) => h("div", { class: "switch-row" },
+  h("div", {}, h("div", { class: "sr-title" }, title), help ? h("div", { class: "help" }, help) : null), toggle(on, onChange, title));
+const emptyBlock = (ic, title, text, ...extra) => h("div", { class: "empty-block" },
+  h("div", { class: "eb-icon" }, icon(ic)), h("b", {}, title), text ? h("p", {}, text) : null, ...extra);
+function searchBox(placeholder, onInput) {
+  const input = h("input", { type: "search", placeholder, "aria-label": placeholder });
+  input.addEventListener("input", () => onInput(input.value.trim().toLowerCase()));
+  return [h("label", { class: "search-box" }, icon("search"), input), input];
+}
+function chip(label, on, onChange, ic) {
+  const b = h("button", { type: "button", class: "chip" + (on ? " on" : ""), "aria-pressed": String(!!on) }, ic ? icon(ic) : null, label);
+  b.addEventListener("click", () => { on = !on; b.classList.toggle("on", on); b.setAttribute("aria-pressed", String(on)); onChange(on); });
+  return b;
+}
+let toastTimer = null;
+function toast(text, action) {
+  document.querySelector(".toast")?.remove();
+  const el = h("div", { class: "toast", role: "status" }, h("span", {}, text),
+    action ? h("button", { class: "toast-btn", onclick: () => { el.remove(); action[1](); } }, action[0]) : null);
+  document.body.append(el);
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => el.remove(), 6000);
+}
+function rel(ts) {
+  const d = ts * 1000 - Date.now(), a = Math.abs(d) / 60000;
+  const n = a < 60 ? Math.max(1, Math.round(a)) : a < 1440 ? Math.round(a / 60) : Math.round(a / 1440);
+  const s = a < 1 ? "меньше минуты" : a < 60 ? `${n} мин` : a < 1440 ? `${n} ч` : `${n} ${plural(n, "день", "дня", "дней")}`;
+  return d > 0 ? `через ${s}` : `${s} назад`;
+}
+const fmtWhen = ts => new Date(ts * 1000).toLocaleString("ru-RU", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+const fmtDay = ts => new Date(ts * 1000).toLocaleDateString("ru-RU", { day: "numeric", month: "short", year: new Date(ts * 1000).getFullYear() === new Date().getFullYear() ? undefined : "numeric" });
+function popMenu(btn, items) {
+  closeMenus();
+  const pop = $("#popover");
+  pop.replaceChildren(...items.map(([ic, label, fn, danger]) => h("button", { class: "menu-item" + (danger ? " danger" : ""), role: "menuitem",
+    onclick: () => { closeMenus(); fn(); } }, icon(ic), label)));
+  const r = btn.getBoundingClientRect();
+  pop.style.left = `${Math.max(8, Math.min(r.right - 200, innerWidth - 216))}px`; pop.style.top = `${r.bottom + 4}px`;
+  pop.hidden = false; pop._owner = btn; btn.setAttribute("aria-expanded", "true");
+}
+
+// ── модели ──────────────────────────────────────────────────────────
+const VENDORS = { anthropic: "Anthropic", openai: "OpenAI", google: "Google", "x-ai": "xAI", "meta-llama": "Meta", mistralai: "Mistral",
+  deepseek: "DeepSeek", qwen: "Qwen", moonshotai: "Moonshot", "z-ai": "Z.ai", yandex: "Яндекс", cohere: "Cohere", amazon: "Amazon",
+  microsoft: "Microsoft", nvidia: "NVIDIA", perplexity: "Perplexity", minimax: "MiniMax", openrouter: "OpenRouter", ollama: "Ollama" };
+const vendorName = v => VENDORS[v] || (v ? v.charAt(0).toUpperCase() + v.slice(1) : "");
+const shortModel = id => id.replace(/^[^:/]+:/, "").replace(/^[^/]+\//, "");
+const modelInfo = id => S.catalog?.models.find(m => m.id === id);
+const modelName = id => modelInfo(id)?.name || shortModel(id);
+const fmtCtx = n => !n ? "—" : n >= 1e6 ? `${+(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1000)}K`;
+const fmtUsd = x => x >= 10 ? x.toFixed(0) : x >= 1 ? (+x.toFixed(2)).toString() : (+x.toFixed(3)).toString();
+const fmtPrice = m => m.price_in == null ? "—" : !m.price_in && !m.price_out ? "бесплатно" : `$${fmtUsd(m.price_in)} / $${fmtUsd(m.price_out)}`;
+function caps(m) {
+  return [m?.vision ? h("span", { class: "cap", title: "Понимает картинки" }, icon("eye")) : null,
+    m?.reasoning ? h("span", { class: "cap", title: "Умеет рассуждать перед ответом" }, icon("spark")) : null];
+}
+function setModel(id, { save = false } = {}) {
+  S.model = id;
+  $("#model-name").textContent = modelName(id);
+  $("#model-btn").title = `Модель: ${id}`;
+  if (save && S.sessionId) api(`/api/sessions/${S.sessionId}`, { method: "PATCH", body: { model: id } }).catch(e => toast(e.message));
+}
+async function loadCatalog(refresh = false) {
+  S.catalog = await api("/api/models" + (refresh ? "?refresh=1" : ""));
+  if (S.model) setModel(S.model);
+  return S.catalog;
+}
+const usable = () => (S.catalog?.models || S.config.models.map(id => ({ id, name: shortModel(id), vendor: "" }))).filter(m => m.allowed !== false);
+async function savePrefs(patch) {
+  const r = await api("/api/models/prefs", { method: "PUT", body: patch });
+  if (S.catalog) Object.assign(S.catalog, r);
+  S.config.models = r.favorites; S.config.default_model = r.default;
+  return r;
+}
+async function toggleFav(id) {
+  const favs = S.catalog?.favorites || S.config.models;
+  const next = favs.includes(id) ? favs.filter(x => x !== id) : [...favs, id];
+  await savePrefs({ favorites: next });
+  return next.includes(id);
+}
+function starBtn(id, onDone) {
+  const on = () => (S.catalog?.favorites || S.config.models).includes(id);
+  const b = h("button", { type: "button", class: "star" + (on() ? " on" : ""), "aria-pressed": String(on()),
+    title: on() ? "Убрать из избранных" : "В избранные" }, icon("star"));
+  b.addEventListener("click", async e => {
+    e.stopPropagation();
+    try { const v = await toggleFav(id); b.classList.toggle("on", v); b.setAttribute("aria-pressed", String(v)); b.title = v ? "Убрать из избранных" : "В избранные"; onDone?.(v); }
+    catch (err) { toast(err.message); }
+  });
+  return b;
+}
+
+function openModelPicker() {
+  const pop = $("#model-pop"), btn = $("#model-btn");
+  if (!pop.hidden) { closeMenus(); return; }
+  closeMenus();
+  if (!S.catalog) loadCatalog().then(() => !pop.hidden && draw()).catch(() => {});
+  const input = h("input", { type: "search", placeholder: "Найти модель…", "aria-label": "Найти модель" });
+  const list = h("div", { class: "model-list", role: "listbox" });
+  let active = 0, opts = [];
+  const option = m => {
+    const el = h("div", { class: "model-opt" + (m.id === S.model ? " on" : ""), role: "option", "aria-selected": String(m.id === S.model),
+      onclick: () => { setModel(m.id, { save: true }); closeMenus(); btn.focus(); } },
+      h("div", { class: "mo-main" }, h("div", { class: "mo-name" }, h("span", {}, m.name || shortModel(m.id)), ...caps(m)),
+        h("div", { class: "mo-meta" }, [vendorName(m.vendor), m.context_window ? fmtCtx(m.context_window) : "", m.price_in != null ? fmtPrice(m) : ""].filter(Boolean).join(" · "))),
+      m.id === S.model ? h("span", { class: "mo-check" }, icon("check")) : null,
+      starBtn(m.id, () => draw()));
+    opts.push(el);
+    return el;
+  };
+  const draw = () => {
+    const q = input.value.trim().toLowerCase();
+    const all = usable(), favs = S.catalog?.favorites || S.config.models;
+    const only = S.catalog?.only_favorites;
+    const byId = new Map(all.map(m => [m.id, m]));
+    const favModels = favs.map(id => byId.get(id)).filter(Boolean);
+    if (S.model && !favs.includes(S.model) && byId.has(S.model)) favModels.unshift(byId.get(S.model));
+    opts = [];
+    const out = [];
+    const match = m => !q || `${m.name} ${m.id} ${vendorName(m.vendor)}`.toLowerCase().includes(q);
+    const f = favModels.filter(match);
+    if (f.length) out.push(h("div", { class: "pop-label" }, "Избранные"), ...f.map(option));
+    if (!only) {
+      const rest = all.filter(m => !favs.includes(m.id) && m.id !== S.model && match(m))
+        .sort((a, b) => (b.created || 0) - (a.created || 0));
+      const shown = rest.slice(0, q ? 80 : 30);
+      if (shown.length) out.push(h("div", { class: "pop-label" }, q ? "Все модели" : "Новые в каталоге"), ...shown.map(option));
+      if (rest.length > shown.length) out.push(h("div", { class: "pop-hint" }, `Ещё ${rest.length - shown.length} — уточните поиск`));
+    }
+    if (!out.length) out.push(h("div", { class: "pop-hint" }, q ? "Ничего не нашлось" : "Нет избранных моделей — отметьте их звёздочкой в настройках"));
+    list.replaceChildren(...out);
+    active = Math.max(0, opts.findIndex(o => o.classList.contains("on")));
+    mark();
+  };
+  const mark = () => opts.forEach((o, i) => o.classList.toggle("active", i === active));
+  input.addEventListener("input", () => { draw(); active = 0; mark(); });
+  input.addEventListener("keydown", e => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault(); active = (active + (e.key === "ArrowDown" ? 1 : -1) + opts.length) % Math.max(1, opts.length); mark();
+      opts[active]?.scrollIntoView({ block: "nearest" });
+    }
+    if (e.key === "Enter") { e.preventDefault(); opts[active]?.click(); }
+  });
+  pop.replaceChildren(h("label", { class: "pop-search" }, icon("search"), input), list,
+    h("div", { class: "pop-foot" }, h("button", { class: "menu-item", onclick: () => { closeMenus(); openSettings("models"); } }, icon("gear"), "Настроить список моделей")));
+  draw();
+  const r = btn.getBoundingClientRect();
+  pop.style.left = `${Math.max(8, Math.min(r.left, innerWidth - 376))}px`;
+  pop.style.bottom = `${innerHeight - r.top + 6}px`;
+  pop.hidden = false; btn.setAttribute("aria-expanded", "true");
+  input.focus();
+}
+
+const MODEL_SORTS = [["new", "Новые"], ["name", "По названию"], ["cheap", "Дешевле"], ["ctx", "Больше контекст"]];
+const settingLine = (title, help, control) => h("div", { class: "setting-line" },
+  h("div", { class: "sl-text" }, h("div", { class: "sr-title" }, title), help ? h("div", { class: "help" }, help) : null), control);
+async function modelsTab(body) {
+  const c = await loadCatalog();
+  const admin = S.config.is_admin;
+  const st = { q: "", fav: false, vision: false, reasoning: false, free: false, vendor: "", sort: "new", limit: 100 };
+  let custom = !!c.policy?.custom;
+  const allowed = new Set(c.models.filter(m => m.allowed).map(m => m.id));
+  let saveTimer = null;
+  const savePolicy = () => {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(async () => {
+      try { await api("/api/models/policy", { method: "PUT", body: { ids: custom ? [...allowed] : null } }); await loadCatalog(); }
+      catch (e) { toast(e.message); }
+    }, 350);
+  };
+
+  // по умолчанию и «только избранные»
+  const defSel = h("select", { "aria-label": "Модель по умолчанию" });
+  const fillDefault = () => {
+    const ids = [...new Set([c.default, ...c.favorites])].filter(id => c.models.some(m => m.id === id && m.allowed));
+    defSel.replaceChildren(...ids.map(id => h("option", { value: id }, `${modelName(id)}  ·  ${vendorName(modelInfo(id)?.vendor)}`)));
+    defSel.value = c.default;
+  };
+  fillDefault();
+  defSel.addEventListener("change", async () => { try { await savePrefs({ default: defSel.value }); setModel(defSel.value); toast("Модель по умолчанию сохранена"); } catch (e) { toast(e.message); } });
+
+  // каталог
+  const list = h("div", { class: "mtable", role: "table" });
+  const vendors = [...new Set(c.models.map(m => m.vendor))].sort((a, b) => vendorName(a).localeCompare(vendorName(b)));
+  const vendorSel = h("select", { class: "mini-select", "aria-label": "Компания" }, h("option", { value: "" }, "Все компании"),
+    ...vendors.map(v => h("option", { value: v }, `${vendorName(v)} · ${c.models.filter(m => m.vendor === v).length}`)));
+  vendorSel.addEventListener("change", () => { st.vendor = vendorSel.value; st.limit = 100; draw(); });
+  const sortSel = h("select", { class: "mini-select", "aria-label": "Сортировка" }, ...MODEL_SORTS.map(([v, l]) => h("option", { value: v }, l)));
+  sortSel.addEventListener("change", () => { st.sort = sortSel.value; draw(); });
+  const [search] = searchBox(`Найти среди ${c.models.length} моделей`, q => { st.q = q; st.limit = 100; draw(); });
+  const filters = h("div", { class: "toolbar" }, search, vendorSel, sortSel,
+    h("div", { class: "chips" },
+      chip("Избранные", false, v => { st.fav = v; draw(); }, "star"),
+      chip("Картинки", false, v => { st.vision = v; draw(); }, "eye"),
+      chip("Рассуждения", false, v => { st.reasoning = v; draw(); }, "spark"),
+      chip("Бесплатные", false, v => { st.free = v; draw(); })));
+  const bulk = h("div", { class: "bulk" });
+
+  const draw = () => {
+    const favs = new Set(S.catalog.favorites);
+    let items = c.models.filter(m => (!st.q || `${m.name} ${m.id} ${vendorName(m.vendor)}`.toLowerCase().includes(st.q))
+      && (!st.fav || favs.has(m.id)) && (!st.vision || m.vision) && (!st.reasoning || m.reasoning)
+      && (!st.free || (m.price_in === 0 && m.price_out === 0)) && (!st.vendor || m.vendor === st.vendor));
+    const cmp = { new: (a, b) => (b.created || 0) - (a.created || 0), name: (a, b) => a.name.localeCompare(b.name),
+      cheap: (a, b) => (a.price_in ?? 1e9) - (b.price_in ?? 1e9), ctx: (a, b) => (b.context_window || 0) - (a.context_window || 0) }[st.sort];
+    items.sort((a, b) => (favs.has(b.id) - favs.has(a.id)) || cmp(a, b));
+    const total = items.length;
+    const head = h("div", { class: "mrow mhead" + (admin && custom ? " with-access" : ""), role: "row" },
+      h("span", {}), h("span", {}, "Модель"), h("span", { class: "c-vendor" }, "Компания"), h("span", { class: "c-num" }, "Контекст"),
+      h("span", { class: "c-num", title: "Долларов за миллион токенов: вход / выход" }, "Цена за 1M"), admin && custom ? h("span", { class: "c-num" }, "Доступ") : null);
+    const rows = items.slice(0, st.limit).map(m => { const r = h("div", { class: "mrow" + (admin && custom ? " with-access" : "") + (admin && custom && !allowed.has(m.id) ? " off" : ""), role: "row", title: m.description || "" },
+      starBtn(m.id, () => fillDefault()),
+      h("div", { class: "mrow-main" }, h("div", { class: "mrow-name" }, h("span", {}, m.name), ...caps(m),
+        m.id === c.main ? h("span", { class: "tag" }, "основная") : null),
+        h("div", { class: "mrow-id" }, m.id.replace(/^openrouter:/, ""))),
+      h("span", { class: "c-vendor" }, vendorName(m.vendor)),
+      h("span", { class: "c-num" }, fmtCtx(m.context_window)),
+      h("span", { class: "c-num price" }, fmtPrice(m)),
+      admin && custom ? h("span", { class: "c-num" }, m.id === c.main ? h("span", { class: "help" }, "всегда") : toggle(allowed.has(m.id), on => {
+        on ? allowed.add(m.id) : allowed.delete(m.id); m.allowed = on;
+        r.classList.toggle("off", !on); savePolicy();
+      }, "Доступна всем")) : null); return r; });
+    list.replaceChildren(head, ...rows,
+      total > st.limit ? h("button", { class: "btn ghost block more-btn", onclick: () => { st.limit += 200; draw(); } }, `Показать ещё ${Math.min(200, total - st.limit)} из ${total - st.limit}`) : null,
+      !total ? emptyBlock("search", "Ничего не нашлось", "Попробуйте другое название или снимите фильтры") : null);
+    bulk.replaceChildren(admin && custom && total ? h("div", { class: "bulk-bar" },
+      h("span", { class: "help" }, `Доступно ${allowed.size} из ${c.models.length}. Найдено: ${total}`),
+      h("button", { class: "btn sm", onclick: () => { items.forEach(m => allowed.add(m.id)); draw(); savePolicy(); } }, "Открыть найденные"),
+      h("button", { class: "btn sm", onclick: () => { items.forEach(m => m.id !== c.main && allowed.delete(m.id)); draw(); savePolicy(); } }, "Скрыть найденные")) : "");
+  };
+
+  const fetched = c.fetched_at ? `обновлён ${rel(c.fetched_at)}` : "ещё не загружен";
+  const errors = Object.entries(c.policy?.errors || {});
+  body.append(
+    group(null, null,
+      settingLine("Модель по умолчанию", "С неё начинается новый разговор", defSel),
+      settingLine("Только избранные", "Остальные модели не предлагаются в чате", toggle(c.only_favorites, async on => { await savePrefs({ only_favorites: on }); }, "Только избранные")),
+      admin ? settingLine("Доступ для пользователей", c.policy?.patterns ? h("span", {}, "Сейчас по AGENT_MODELS_ALLOW: ", h("code", {}, c.policy.patterns))
+        : "Основная модель доступна всегда — на ней работают сжатие истории и расписание",
+      segmented([["all", c.policy?.patterns ? "По настройке" : "Все модели"], ["custom", "Только отмеченные"]], custom ? "custom" : "all", v => {
+        custom = v === "custom";
+        if (custom && allowed.size === c.models.length) { allowed.clear(); [c.main, ...c.favorites].forEach(id => allowed.add(id)); }
+        draw(); savePolicy();
+      })) : null),
+    group(null, null,
+      h("div", { class: "group-head" }, h("h4", {}, "Каталог"),
+        h("span", { class: "help" }, `${c.models.length} ${plural(c.models.length, "модель", "модели", "моделей")} с поддержкой инструментов · ${fetched}`),
+        admin ? h("button", { class: "btn ghost sm", onclick: async e => { e.currentTarget.disabled = true; await loadCatalog(true); openSettings("models"); } }, icon("refresh"), "Обновить") : null),
+      errors.length ? h("div", { class: "inline-alert" }, errors.map(([p, e]) => `${p}: ${e}`).join("; ")) : null,
+      filters, bulk, list));
+  draw();
+}
+
+// ── память ──────────────────────────────────────────────────────────
+const MEMORY_EXAMPLES = ["Отвечай коротко, по пунктам", "Суммы — в рублях с пробелами: 12 500 ₽", "Наш основной склад — в Кирове"];
+async function memoryTab(body) {
+  const items = await api("/api/memory");
+  const admin = S.config.is_admin;
+  const own = m => m.scope === `user:${S.me.id}`;
+  let scope = "user", filter = "all", q = "";
+  const input = h("textarea", { rows: 2, placeholder: "Что запомнить? Например: «отчёты присылай по пятницам»" });
+  const addBtn = h("button", { class: "btn primary sm", type: "button", disabled: true }, "Запомнить");
+  input.addEventListener("input", () => { addBtn.disabled = !input.value.trim(); input.style.height = "auto"; input.style.height = input.scrollHeight + 2 + "px"; });
+  const add = async () => {
+    const text = input.value.trim(); if (!text) return;
+    addBtn.disabled = true;
+    try { await api("/api/memory", { method: "POST", body: { text, scope } }); openSettings("memory"); } catch (e) { toast(e.message); addBtn.disabled = false; }
+  };
+  addBtn.addEventListener("click", add);
+  input.addEventListener("keydown", e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); add(); } });
+  const compose = h("div", { class: "compose-card" }, input, h("div", { class: "compose-bar" },
+    admin ? segmented([["user", "Только мне"], ["global", "Всем пользователям"]], "user", v => (scope = v)) : h("span", { class: "help" }, "Видно только вам"),
+    h("span", { class: "grow" }), h("span", { class: "help kbd-hint" }, "Ctrl + Enter"), addBtn));
+
+  const list = h("div", { class: "mem-list" });
+  const card = m => {
+    const canEdit = own(m) || admin;
+    const text = h("div", { class: "mem-text" }, m.text);
+    const el = h("div", { class: "mem-card" }, h("div", { class: "mem-dot " + (m.scope === "global" ? "shared" : "") }), h("div", { class: "mem-body" }, text,
+      h("div", { class: "mem-meta" }, h("span", { class: "tag" + (m.scope === "global" ? " shared" : "") }, m.scope === "global" ? "для всех" : "только мне"),
+        m.created_at ? h("span", {}, fmtDay(m.created_at)) : null,
+        m.scope === "global" && m.created_by ? h("span", {}, `добавил ${m.created_by}`) : null)),
+      canEdit ? h("div", { class: "mem-actions" },
+        h("button", { class: "icon-btn", title: "Изменить", "aria-label": "Изменить", onclick: () => edit() }, icon("pen")),
+        h("button", { class: "icon-btn", title: "Удалить", "aria-label": "Удалить", onclick: () => remove() }, icon("trash"))) : null);
+    const edit = () => {
+      const ta = h("textarea", { rows: 3 }); ta.value = m.text;
+      const done = () => text.replaceChildren(m.text);
+      const save = async () => {
+        const v = ta.value.trim(); if (!v || v === m.text) return done();
+        try { await api(`/api/memory/${m.id}`, { method: "PATCH", body: { text: v } }); m.text = v; done(); } catch (e) { toast(e.message); }
+      };
+      ta.addEventListener("keydown", e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) save(); if (e.key === "Escape") { e.stopPropagation(); done(); } });
+      text.replaceChildren(h("div", { class: "mem-edit" }, ta, h("div", { class: "compose-bar" }, h("span", { class: "grow" }),
+        h("button", { class: "btn ghost sm", onclick: done }, "Отмена"), h("button", { class: "btn primary sm", onclick: save }, "Сохранить"))));
+      ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
+    };
+    const remove = async () => {
+      try { await api(`/api/memory/${m.id}`, { method: "DELETE" }); } catch (e) { toast(e.message); return; }
+      items.splice(items.indexOf(m), 1); draw();
+      toast("Запись удалена", ["Вернуть", async () => { await api("/api/memory", { method: "POST", body: { text: m.text, scope: m.scope === "global" ? "global" : "user" } }); openSettings("memory"); }]);
+    };
+    return el;
+  };
+  const seg = h("div");
+  const draw = () => {
+    const mine = items.filter(own).length, shared = items.filter(m => m.scope === "global").length;
+    seg.replaceChildren(segmented([["all", `Все · ${items.length}`], ["mine", `Мои · ${mine}`], ["global", `Общие · ${shared}`]], filter, v => { filter = v; draw(); }));
+    const shown = items.filter(m => (filter === "all" || (filter === "mine" ? own(m) : m.scope === "global")) && (!q || m.text.toLowerCase().includes(q)))
+      .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+    list.replaceChildren(...shown.map(card));
+    if (!items.length) list.replaceChildren(emptyBlock("memory", "Пока ничего не запомнено",
+      "Правила и факты отсюда агент учитывает в каждом разговоре. Можно и прямо в чате: «запомни: …».",
+      h("div", { class: "examples" }, MEMORY_EXAMPLES.map(x => h("button", { class: "chip", type: "button", onclick: () => { input.value = x; input.dispatchEvent(new Event("input")); input.focus(); } }, x)))));
+    else if (!shown.length) list.replaceChildren(h("p", { class: "muted center" }, "Ничего не нашлось"));
+  };
+  const [search] = searchBox("Поиск по памяти", v => { q = v; draw(); });
+  body.append(h("p", { class: "lead-text tab-lead" }, "Агент помнит это во всех разговорах. Добавляйте правила, факты о работе и предпочтения."),
+    compose, items.length ? h("div", { class: "toolbar" }, search, seg) : null, list);
+  draw();
+}
+
+// ── инструменты ─────────────────────────────────────────────────────
+const TOOL_GROUPS = { core: "Основные", files: "Файлы", web: "Интернет", memory: "Память", shell: "Команды" };
+const openSources = new Set(["domain"]);
+async function toolsTab(body) {
+  const d = await api("/api/tools");
+  const admin = S.config.is_admin;
+  let q = "";
+  const access = t => t.read_only ? ["eye", "чтение", "ok"] : t.destructive ? ["shield", "необратимо", "err"] : ["pen", "изменяет", "warn"];
+  const toolRow = t => {
+    const [ic, label, cls] = access(t);
+    return h("div", { class: "tool-row" },
+      h("div", { class: "tr-main" }, h("div", { class: "tr-title" }, h("span", {}, toolTitle(t.name, t.title)), h("code", {}, t.name)),
+        t.description ? h("div", { class: "tr-desc" }, t.description.replace(/^\[[^\]]+\]\s*/, "")) : null),
+      h("div", { class: "tr-tags" }, t.deferred ? h("span", { class: "tag", title: "Описание подгружается, когда агенту понадобится инструмент — экономит контекст" }, "по запросу") : null,
+        h("span", { class: "tag " + cls, title: { ok: "Только читает данные", warn: "Изменяет данные — спросит подтверждение", err: "Необратимое действие — всегда с подтверждением" }[cls] }, icon(ic), label)));
+  };
+  const card = ({ key, ic, title, sub, status, actions, tools, extra }) => {
+    const matched = tools.filter(t => !q || `${t.name} ${t.title} ${t.description}`.toLowerCase().includes(q));
+    if (q && !matched.length && !title.toLowerCase().includes(q)) return null;
+    const open = q ? true : openSources.has(key);
+    const el = h("div", { class: "src-card" + (open ? " open" : "") });
+    const headBtn = h("button", { class: "src-head", type: "button", "aria-expanded": String(open), onclick: () => {
+      const o = !el.classList.contains("open"); el.classList.toggle("open", o); headBtn.setAttribute("aria-expanded", String(o));
+      o ? openSources.add(key) : openSources.delete(key);
+    } },
+      h("span", { class: "src-icon" }, icon(ic)),
+      h("span", { class: "src-title" }, h("b", {}, title), h("span", { class: "src-sub" }, sub)),
+      status || null,
+      (tools.length || extra) ? h("span", { class: "src-chev" }, icon("chev")) : null);
+    el.append(h("div", { class: "src-top" }, headBtn, actions ? h("div", { class: "src-actions" }, actions) : null),
+      h("div", { class: "src-body" }, extra || null, ...matched.map(toolRow)));
+    return el;
+  };
+  const count = n => `${n} ${plural(n, "инструмент", "инструмента", "инструментов")}`;
+  const pill = (cls, text) => h("span", { class: "pill " + cls }, h("i"), text);
+  const cards = h("div", { class: "src-list" });
+  const draw = () => {
+    const domain = d.tools.filter(t => t.source === "domain");
+    const builtin = d.tools.filter(t => t.source === "builtin");
+    const out = [];
+    if (domain.length) out.push(card({ key: "domain", ic: "cube", title: "Инструменты агента", sub: count(domain.length), tools: domain }));
+    for (const s of d.mcp) {
+      const tools = d.tools.filter(t => t.group === `mcp:${s.name}`);
+      let action = null;
+      if (admin && s.needs_auth) action = h("button", { class: "btn primary sm", onclick: () => mcpConnect(s.name) }, icon("plug"), "Подключить");
+      else if (admin && s.oauth) action = h("button", { class: "btn ghost sm", onclick: async () => {
+        if (!confirm(`Отключить ${s.name}? Токены будут отозваны.`)) return;
+        await api(`/api/mcp/${encodeURIComponent(s.name)}/connect`, { method: "DELETE" }); openSettings("tools"); } }, "Отключить");
+      const sub = s.ok ? [count(s.tools), s.server && s.server !== s.name ? s.server : "", s.version ? `v${s.version}` : "", s.oauth ? "OAuth" : ""].filter(Boolean).join(" · ")
+        : s.needs_auth ? "Нужно войти — подключение по OAuth" : (s.error || "нет связи");
+      out.push(card({ key: "mcp:" + s.name, ic: s.transport === "stdio" ? "tools" : "globe", title: s.name, sub, tools, actions: action,
+        status: s.ok ? pill("ok", "подключён") : s.needs_auth ? pill("warn", "нужен вход") : pill("err", "ошибка"),
+        extra: admin && s.address ? h("div", { class: "src-addr" }, h("code", {}, s.address)) : null }));
+    }
+    if (builtin.length) {
+      const groups = [...new Set(builtin.map(t => t.group || "core"))];
+      out.push(card({ key: "builtin", ic: "gear", title: "Встроенные", sub: `${count(builtin.length)} · ${groups.map(g => TOOL_GROUPS[g] || g).join(", ")}`, tools: builtin }));
     }
     if (d.skills.length) {
-      body.append(h("div", { class: "section-title" }, "Skills"));
-      for (const k of d.skills) body.append(row([h("b", {}, k.name), h("div", { class: "sub-text" }, k.description)]));
+      const matched = d.skills.filter(k => !q || `${k.name} ${k.description}`.toLowerCase().includes(q));
+      if (!q || matched.length) out.push(card({ key: "skills", ic: "book", title: "Навыки", sub: `${d.skills.length} ${plural(d.skills.length, "навык", "навыка", "навыков")} — длинные инструкции, которые агент открывает по необходимости`, tools: [],
+        extra: h("div", {}, matched.map(k => h("div", { class: "tool-row" }, h("div", { class: "tr-main" }, h("div", { class: "tr-title" }, h("span", {}, k.name)), h("div", { class: "tr-desc" }, k.description))))) }));
     }
-    const filter = h("input", { class: "field filter", placeholder: `Найти среди ${d.tools.length} инструментов` });
-    const list = h("div");
-    const draw = () => {
-      const q = filter.value.trim().toLowerCase();
-      list.replaceChildren(...d.tools.filter(t => !q || (t.name + t.title + t.description).toLowerCase().includes(q)).map(t => row(
-        [h("div", {}, h("b", {}, toolTitle(t.name, t.title)), " ", h("code", {}, t.name)), h("div", { class: "sub-text" }, t.description)],
-        t.deferred ? h("span", { class: "badge", title: "Схема подгружается по запросу агента" }, "по запросу") : null,
-        h("span", { class: "badge " + (t.read_only ? "ok" : t.destructive ? "err" : "warn") }, t.read_only ? "чтение" : t.destructive ? "необратимо" : "запись"))));
+    cards.replaceChildren(...out.filter(Boolean));
+    if (!cards.childElementCount) cards.append(h("p", { class: "muted center" }, "Ничего не нашлось"));
+  };
+  const okMcp = d.mcp.filter(s => s.ok).length;
+  const [search] = searchBox(`Найти среди ${d.tools.length} инструментов`, v => { q = v; draw(); });
+  body.append(
+    h("div", { class: "tiles" },
+      h("div", { class: "tile" }, h("b", {}, d.tools.length), h("span", {}, plural(d.tools.length, "инструмент", "инструмента", "инструментов"))),
+      h("div", { class: "tile" }, h("b", {}, d.mcp.length ? `${okMcp}/${d.mcp.length}` : "0"), h("span", {}, "MCP-серверов на связи")),
+      h("div", { class: "tile" }, h("b", {}, d.tools.filter(t => !t.read_only).length), h("span", {}, "изменяют данные — с подтверждением"))),
+    h("div", { class: "toolbar" }, search, admin ? h("button", { class: "btn sm", title: "Перечитать mcp.json и папку навыков без перезапуска", onclick: async e => {
+      e.currentTarget.disabled = true; await api("/api/reload", { method: "POST" }); openSettings("tools"); toast("Инструменты перечитаны"); } }, icon("refresh"), "Перечитать") : null),
+    cards);
+  draw();
+}
+
+// ── расписание ──────────────────────────────────────────────────────
+const WEEKDAYS = [[1, "Пн"], [2, "Вт"], [3, "Ср"], [4, "Чт"], [5, "Пт"], [6, "Сб"], [0, "Вс"]];
+const WD_NAMES = { 0: "вс", 1: "пн", 2: "вт", 3: "ср", 4: "чт", 5: "пт", 6: "сб", 7: "вс" };
+const pad = n => String(n).padStart(2, "0");
+function parseCron(cron) {
+  const c = (cron || "").trim().replace(/\s+/g, " ");
+  let m;
+  if ((m = c.match(/^(\d+) (\d+) \* \* \*$/))) return { freq: "daily", time: `${pad(m[2])}:${pad(m[1])}` };
+  if ((m = c.match(/^(\d+) (\d+) \* \* 1-5$/))) return { freq: "weekdays", time: `${pad(m[2])}:${pad(m[1])}` };
+  if ((m = c.match(/^(\d+) (\d+) \* \* ([0-7](?:,[0-7])*)$/))) return { freq: "weekly", time: `${pad(m[2])}:${pad(m[1])}`, days: m[3].split(",").map(x => +x % 7) };
+  if ((m = c.match(/^(\d+) \* \* \* \*$/))) return { freq: "hourly", minute: +m[1] };
+  if ((m = c.match(/^(\d+) (\d+) (\d+) \* \*$/))) return { freq: "monthly", time: `${pad(m[2])}:${pad(m[1])}`, dom: +m[3] };
+  return { freq: "custom", cron: c };
+}
+function buildCron(st) {
+  const [hh, mm] = (st.time || "09:00").split(":").map(Number);
+  switch (st.freq) {
+    case "daily": return `${mm} ${hh} * * *`;
+    case "weekdays": return `${mm} ${hh} * * 1-5`;
+    case "weekly": return `${mm} ${hh} * * ${(st.days?.length ? [...st.days].sort((a, b) => ((a || 7) - (b || 7))) : [1]).join(",")}`;
+    case "hourly": return `${st.minute || 0} * * * *`;
+    case "monthly": return `${mm} ${hh} ${st.dom || 1} * *`;
+    default: return st.cron || "";
+  }
+}
+function describeCron(cron) {
+  const p = parseCron(cron), t = p.time?.replace(/^0(\d)/, "$1");
+  switch (p.freq) {
+    case "daily": return `Каждый день в ${t}`;
+    case "weekdays": return `По будням в ${t}`;
+    case "weekly": return p.days.length === 7 ? `Каждый день в ${t}` : `По ${[...p.days].sort((a, b) => (a || 7) - (b || 7)).map(d => WD_NAMES[d]).join(", ")} в ${t}`;
+    case "hourly": return `Каждый час в :${pad(p.minute)}`;
+    case "monthly": return `Каждый месяц ${p.dom}-го в ${t}`;
+    default: return `По расписанию ${cron}`;
+  }
+}
+const SCHEDULE_EXAMPLES = [
+  { name: "Утренняя сводка", cron: "0 9 * * 1-5", prompt: "Собери, что важно сделать сегодня, и пришли коротким списком." },
+  { name: "Итоги недели", cron: "0 17 * * 5", prompt: "Подведи итоги недели: что сделано, что зависло, что запланировать." },
+];
+function scheduleEditor(rec, onClose) {
+  const st = parseCron(rec?.cron || "0 9 * * 1-5");
+  if (st.freq === "custom" && !rec?.cron) st.freq = "weekdays";
+  const name = h("input", { value: rec?.name || "", placeholder: "Например: утренняя сводка" });
+  const prompt = h("textarea", { rows: 3, placeholder: "Что сделать агенту — так же, как написали бы в чате" });
+  prompt.value = rec?.prompt || "";
+  const time = h("input", { type: "time", value: st.time || "09:00", "aria-label": "Время" });
+  const minute = h("input", { type: "number", min: 0, max: 59, value: st.minute ?? 0, class: "num", "aria-label": "Минута" });
+  const dom = h("input", { type: "number", min: 1, max: 28, value: st.dom ?? 1, class: "num", "aria-label": "Число месяца" });
+  const cron = h("input", { value: rec?.cron || "", placeholder: "мин час день месяц день_недели", class: "mono", "aria-label": "Cron" });
+  const days = new Set(st.days || [1]);
+  const dayChips = h("div", { class: "day-chips" }, WEEKDAYS.map(([v, l]) => chip(l, days.has(v), on => { on ? days.add(v) : days.delete(v); update(); })));
+  const controls = h("div", { class: "when-controls" });
+  const preview = h("div", { class: "when-preview" });
+  let keep = !!rec?.session_id;
+  const current = () => buildCron({ ...st, time: time.value, minute: +minute.value, dom: +dom.value, days: [...days], cron: cron.value });
+  let timer = null;
+  const update = () => {
+    const parts = { daily: [time], weekdays: [time], weekly: [dayChips, h("span", { class: "help" }, "в"), time], hourly: [h("span", { class: "help" }, "в минуту"), minute],
+      monthly: [dom, h("span", { class: "help" }, "числа в"), time], custom: [cron, h("a", { href: "https://crontab.guru", target: "_blank", rel: "noopener", class: "help" }, "подсказка")] }[st.freq];
+    if (controls._freq !== st.freq) { controls.replaceChildren(...parts); controls._freq = st.freq; }
+    const c = current();
+    if (st.freq !== "custom") cron.value = c;
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      if (!c.trim()) { preview.replaceChildren(); return; }
+      const r = await api(`/api/schedules/preview?cron=${encodeURIComponent(c)}`).catch(() => ({ ok: false }));
+      preview.className = "when-preview" + (r.ok ? "" : " bad");
+      preview.replaceChildren(r.ok ? h("span", {}, h("b", {}, describeCron(c)), " · ближайшие: ", r.next.map(fmtWhen).join(" · ")) : "Не получается разобрать расписание — 5 полей: минута, час, день, месяц, день недели");
+    }, 200);
+  };
+  for (const el of [time, minute, dom, cron]) el.addEventListener("input", update);
+  const save = h("button", { class: "btn primary sm", type: "button", onclick: async () => {
+    save.disabled = true;
+    try {
+      await api("/api/schedules", { method: "POST", body: { id: rec?.id || null, name: name.value, cron: current(), prompt: prompt.value, enabled: rec?.enabled ?? true, keep_session: keep } });
+      onClose(true);
+    } catch (e) { toast(e.message); save.disabled = false; }
+  } }, rec?.id ? "Сохранить" : "Создать");
+  const el = h("div", { class: "sch-editor" },
+    h("div", { class: "ed-head" }, h("b", {}, rec?.id ? "Изменить задачу" : "Новая задача"), h("button", { class: "icon-btn", "aria-label": "Закрыть", onclick: () => onClose(false) }, icon("x"))),
+    fieldRow("Название", name),
+    fieldRow("Задание для агента", prompt),
+    h("div", { class: "field-row" }, h("label", {}, "Когда"),
+      segmented([["daily", "Каждый день"], ["weekdays", "По будням"], ["weekly", "По дням недели"], ["hourly", "Каждый час"], ["monthly", "Раз в месяц"], ["custom", "Cron"]],
+        st.freq, v => { st.freq = v; update(); }),
+      controls, preview),
+    switchRow("Один разговор для всех запусков", "Агент будет видеть прошлые результаты. Иначе каждый запуск — новый разговор.", keep, on => { keep = on; }),
+    h("div", { class: "compose-bar" }, h("span", { class: "grow" }), h("button", { class: "btn ghost sm", type: "button", onclick: () => onClose(false) }, "Отмена"), save));
+  update();
+  setTimeout(() => (rec?.id ? prompt : name).focus(), 0);
+  return el;
+}
+async function schedulesTab(body) {
+  const items = await api("/api/schedules");
+  const slot = h("div");
+  const openEditor = rec => {
+    slot.replaceChildren(scheduleEditor(rec, saved => { slot.replaceChildren(); if (saved) openSettings("schedules"); }));
+    slot.scrollIntoView({ block: "nearest" });
+  };
+  const card = s => {
+    const more = h("button", { class: "icon-btn", title: "Ещё", "aria-label": "Действия", "aria-haspopup": "menu", "aria-expanded": "false" }, icon("dots"));
+    const runNow = async () => {
+      try { await api(`/api/schedules/${s.id}/run`, { method: "POST" }); toast(`«${s.name}» запущена — результат появится в разговоре`); setTimeout(loadSessions, 800); }
+      catch (e) { toast(e.message); }
     };
-    filter.addEventListener("input", draw);
-    body.append(h("div", { class: "section-title" }, "Инструменты"), filter, list);
-    draw();
-  },
-  async schedules(body) {
-    const items = await api("/api/schedules");
-    const name = h("input", { placeholder: "Название, например «Утренний отчёт»" });
-    const cron = h("input", { placeholder: "Когда: cron, например 45 8 * * 1-5 — по будням в 8:45" });
-    const prompt = h("textarea", { rows: 3, placeholder: "Что сделать агенту" });
-    body.append(h("div", { class: "form" }, name, cron, prompt, h("div", { class: "actions" }, h("button", { class: "btn primary", onclick: async () => {
-      try { await api("/api/schedules", { method: "POST", body: { name: name.value, cron: cron.value, prompt: prompt.value } }); openSettings("schedules"); }
-      catch (e) { alert(e.message); } } }, "Добавить"))));
-    if (!items.length) body.append(h("p", { class: "muted" }, "Задач по расписанию нет. Результат каждого запуска появится отдельным разговором."));
-    for (const s of items) body.append(row([h("b", {}, s.name), h("div", { class: "sub-text" }, s.prompt),
-      h("div", { class: "sub-text" }, h("code", {}, s.cron), s.next_run_at ? " · следующий запуск " + new Date(s.next_run_at * 1000).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" }) : "")],
-      h("button", { class: "icon-btn", title: "Удалить", onclick: async () => { await api(`/api/schedules/${s.id}`, { method: "DELETE" }); openSettings("schedules"); } }, icon("x"))));
-  },
+    more.addEventListener("click", e => { e.stopPropagation(); popMenu(more, [["play", "Запустить сейчас", runNow], ["pen", "Изменить", () => openEditor(s)],
+      ["trash", "Удалить", async () => { if (!confirm(`Удалить задачу «${s.name}»?`)) return; await api(`/api/schedules/${s.id}`, { method: "DELETE" }); openSettings("schedules"); }, true]]); });
+    const meta = h("div", { class: "sch-meta" });
+    const drawMeta = () => meta.replaceChildren(...[
+      s.enabled && s.next_run_at ? h("span", {}, icon("clock"), `Следующий ${rel(s.next_run_at)}`, h("span", { class: "faint" }, ` · ${fmtWhen(s.next_run_at)}`)) : h("span", {}, icon("pause"), "На паузе"),
+      s.last_run_at ? h("span", {}, `Последний ${rel(s.last_run_at)}`) : h("span", { class: "faint" }, "Ещё не запускалась"),
+      s.session_id ? h("button", { class: "link", onclick: () => { closeSettings(); openSession(s.session_id); } }, "Открыть разговор") : null].filter(Boolean));
+    drawMeta();
+    const el = h("div", { class: "sch-card" + (s.enabled ? "" : " paused") },
+      h("div", { class: "sch-head" }, h("span", { class: "sch-icon" }, icon("clock")),
+        h("div", { class: "sch-title" }, h("b", {}, s.name), h("span", {}, describeCron(s.cron))),
+        h("button", { class: "btn ghost sm run-btn", title: "Запустить сейчас", onclick: runNow }, icon("play"), "Запустить"),
+        toggle(s.enabled, async on => {
+          const r = await api(`/api/schedules/${s.id}`, { method: "PATCH", body: { enabled: on } });
+          Object.assign(s, r); el.classList.toggle("paused", !on); drawMeta();
+        }, "Включена"), more),
+      h("div", { class: "sch-prompt" }, s.prompt), meta);
+    return el;
+  };
+  body.append(
+    h("div", { class: "tab-intro" }, h("p", { class: "lead-text" }, "Агент сам выполняет задания в заданное время. Результат каждого запуска — в разговоре с ⏰ в списке слева."),
+      h("button", { class: "btn primary sm", onclick: () => openEditor(null) }, icon("plus"), "Новая задача")),
+    slot);
+  if (!items.length) body.append(emptyBlock("clock", "Задач пока нет", "Например, утренняя сводка по будням или итоги недели в пятницу.",
+    h("div", { class: "examples" }, SCHEDULE_EXAMPLES.map(x => h("button", { class: "chip", type: "button", onclick: () => openEditor(x) }, `${x.name} — ${describeCron(x.cron).toLowerCase()}`)))));
+  else body.append(h("div", { class: "sch-list" }, items.map(card)));
+}
+
+const panels = {
+  memory: memoryTab,
+  tools: toolsTab,
+  schedules: schedulesTab,
   async usage(body) {
     const u = await api("/api/usage?days=30");
     const fmt = n => Number(n || 0).toLocaleString("ru-RU");
@@ -699,7 +1185,7 @@ const panels = {
     const models = Object.entries(u.cost_by_model || {}).sort((a, b) => b[1] - a[1]);
     if (models.length) {
       body.append(h("div", { class: "section-title" }, "По моделям"));
-      for (const [m, c] of models) body.append(row(h("code", {}, m), h("span", {}, `$${c.toFixed(4)}`)));
+      for (const [m, c] of models) body.append(row(h("span", {}, modelName(m), " ", h("code", {}, m)), h("span", {}, `$${c.toFixed(4)}`)));
     }
   },
 };
@@ -707,6 +1193,7 @@ const panels = {
 // ── всплывающие меню ────────────────────────────────────────────────
 function closeMenus() {
   $("#user-menu").hidden = true; $("#user-btn").setAttribute("aria-expanded", "false");
+  $("#model-pop").hidden = true; $("#model-btn").setAttribute("aria-expanded", "false");
   const pop = $("#popover");
   if (!pop.hidden) { pop.hidden = true; pop._owner?.setAttribute("aria-expanded", "false"); }
 }
@@ -802,6 +1289,7 @@ const tabs = {
           segmented([["enter", "Enter"], ["ctrl", "Ctrl + Enter"]], prefs.send, v => { store.set("agent_send_key", v); applyPrefs(); }),
           h("div", { class: "help" }, "Ctrl + Enter удобнее, если часто пишете в несколько строк"))));
   },
+  models: modelsTab,
   memory: (b) => panels.memory(b),
   tools: (b) => panels.tools(b),
   schedules: (b) => panels.schedules(b),
@@ -843,7 +1331,7 @@ const tabs = {
         } }, "Удалить"))));
   },
 };
-const TAB_TITLES = { general: "Общие", memory: "Память", tools: "Инструменты", schedules: "Расписание", usage: "Расход", plan: "Подписка", account: "Аккаунт" };
+const TAB_TITLES = { general: "Общие", models: "Модели", memory: "Память", tools: "Инструменты", schedules: "Расписание", usage: "Расход", plan: "Подписка", account: "Аккаунт" };
 
 function themeCards() {
   const cur = store.get("agent_theme") || "auto";
@@ -903,8 +1391,8 @@ async function boot() {
   renderMe();
   api("/api/plan").then(p => { $("#me-plan").textContent = p.name; $("#menu-plan").textContent = p.name; }).catch(() => {});
   if (S.config.help_url) { $("#menu-help").href = S.config.help_url; $("#menu-help").hidden = false; }
-  $("#model").replaceChildren(...S.config.models.map(m => h("option", { value: m }, m.replace(/^[^:]+:/, "").replace(/^[^/]+\//, ""))));
-  $("#model").value = S.config.default_model;
+  setModel(S.config.default_model);
+  loadCatalog().catch(() => {}); // имена и цены моделей — не задерживая старт
   const modeNames = { default: "Спрашивать", accept_edits: "Правки без вопросов", plan: "Только план", readonly: "Только чтение", auto: "Авто", bypass: "Без вопросов" };
   const modeHelp = { default: "Любое изменение данных — через карточку подтверждения", accept_edits: "Файлы рабочей папки агент правит сам, остальное — с подтверждением",
     plan: "Агент только изучает и предлагает план, ничего не меняет", readonly: "Только чтение", auto: "Изменения без подтверждения, кроме отмеченных как опасные",
@@ -946,10 +1434,11 @@ $("#menu").addEventListener("click", () => toggleSidebar(true));
 $("#scrim").addEventListener("click", () => toggleSidebar(false));
 $("#session-filter").addEventListener("input", renderSessions);
 $("#toggle-tasks").addEventListener("click", () => ($("#tasks").hidden = !$("#tasks").hidden));
-for (const id of ["model", "mode"]) $("#" + id).addEventListener("change", () => S.sessionId && api(`/api/sessions/${S.sessionId}`, { method: "PATCH", body: { [id]: $("#" + id).value } }));
+$("#mode").addEventListener("change", () => S.sessionId && api(`/api/sessions/${S.sessionId}`, { method: "PATCH", body: { mode: $("#mode").value } }));
+$("#model-btn").addEventListener("click", e => { e.stopPropagation(); openModelPicker(); });
 document.addEventListener("keydown", e => {
   if (e.key === "Escape") {
-    if (!$("#user-menu").hidden || !$("#popover").hidden) closeMenus();
+    if (!$("#user-menu").hidden || !$("#popover").hidden || !$("#model-pop").hidden) closeMenus();
     else if (!$("#settings").hidden) closeSettings();
     else toggleSidebar(false);
   }

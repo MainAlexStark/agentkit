@@ -177,3 +177,70 @@ def test_profile_and_plan(client):
     assert "Обращаться: Алекс" in system and "Коротко" in system
     plan = client.get("/api/plan", headers=H).json()
     assert plan["name"] and "usage" in plan
+
+
+def test_models_catalog_prefs_and_policy(client):
+    # Каталог провайдера в формате OpenRouter: одна модель без инструментов — агенту не годится.
+    async def list_models():
+        return [
+            {"id": "a/smart", "name": "A: Smart", "context_length": 200000, "pricing": {"prompt": "0.000003", "completion": "0.000015"},
+             "architecture": {"input_modalities": ["text", "image"]}, "supported_parameters": ["tools", "reasoning"]},
+            {"id": "b/cheap", "name": "B: Cheap", "context_length": 32000, "pricing": {"prompt": "0", "completion": "0"},
+             "supported_parameters": ["tools"]},
+            {"id": "c/chat", "name": "C: Chat only", "supported_parameters": ["temperature"]},
+        ]
+    client.fake.list_models = list_models
+    bob = {"Authorization": "Bearer t-bob"}
+    d = client.get("/api/models?refresh=1", headers=H).json()
+    ids = {m["id"]: m for m in d["models"]}
+    assert "fake:a/smart" in ids and "fake:c/chat" not in ids
+    smart = ids["fake:a/smart"]
+    assert smart["name"] == "Smart" and smart["vision"] and smart["reasoning"] and smart["price_in"] == 3.0
+
+    # избранное — у каждого своё
+    r = client.put("/api/models/prefs", json={"favorites": ["fake:b/cheap"], "only_favorites": True}, headers=bob)
+    assert r.json()["favorites"] == ["fake:b/cheap"] and r.json()["only_favorites"]
+    assert client.get("/api/config", headers=bob).json()["models"] == ["fake:b/cheap"]
+    assert client.get("/api/models", headers=H).json()["only_favorites"] is False
+
+    # админ оставил только одну модель — остальные пропадают у пользователей и не проходят в API
+    assert client.put("/api/models/policy", json={"ids": ["fake:a/smart"]}, headers=bob).status_code == 403
+    client.put("/api/models/policy", json={"ids": ["fake:a/smart"]}, headers=H)
+    seen = {m["id"] for m in client.get("/api/models", headers=bob).json()["models"]}
+    assert "fake:b/cheap" not in seen and "fake:a/smart" in seen
+    sid = client.post("/api/sessions", json={}, headers=bob).json()["id"]
+    r = client.post(f"/api/sessions/{sid}/messages", json={"text": "x", "model": "fake:b/cheap"}, headers=bob)
+    assert r.status_code == 400 and "недоступна" in r.json()["detail"]
+    assert client.post(f"/api/sessions/{sid}/messages", json={"text": "x", "model": "nope:z"}, headers=bob).status_code == 400
+    admin_view = {m["id"]: m["allowed"] for m in client.get("/api/models", headers=H).json()["models"]}
+    assert admin_view["fake:b/cheap"] is False
+    client.put("/api/models/policy", json={"ids": None}, headers=H)
+    assert "fake:b/cheap" in {m["id"] for m in client.get("/api/models", headers=bob).json()["models"]}
+
+
+def test_memory_edit_and_schedule_lifecycle(client):
+    bob = {"Authorization": "Bearer t-bob"}
+    m = client.post("/api/memory", json={"text": "Кратко"}, headers=bob).json()
+    assert client.patch(f"/api/memory/{m['id']}", json={"text": "Очень кратко"}, headers=bob).status_code == 200
+    assert client.get("/api/memory", headers=bob).json()[0]["text"] == "Очень кратко"
+    g = client.post("/api/memory", json={"text": "Общее", "scope": "global"}, headers=H).json()
+    assert client.patch(f"/api/memory/{g['id']}", json={"text": "x"}, headers=bob).status_code == 403
+
+    p = client.get("/api/schedules/preview", params={"cron": "0 9 * * 1-5"}, headers=bob).json()
+    assert p["ok"] and len(p["next"]) == 3 and p["next"][0] < p["next"][1]
+    assert client.get("/api/schedules/preview", params={"cron": "x"}, headers=bob).json()["ok"] is False
+    s = client.post("/api/schedules", json={"name": "Утро", "cron": "0 9 * * *", "prompt": "обзор"}, headers=bob).json()
+    s2 = client.post("/api/schedules", json={"id": s["id"], "name": "Утро", "cron": "30 9 * * *", "prompt": "обзор",
+                                             "keep_session": True}, headers=bob).json()
+    assert s2["id"] == s["id"] and s2["cron"] == "30 9 * * *" and s2["session_id"]
+    assert client.patch(f"/api/schedules/{s['id']}", json={"enabled": False}, headers=bob).json()["enabled"] is False
+    client.fake.push("Обзор готов")
+    assert client.post(f"/api/schedules/{s['id']}/run", headers=bob).status_code == 200
+    wait_idle(client, s2["session_id"], headers=bob)
+    for _ in range(100):
+        msgs = client.get(f"/api/sessions/{s2['session_id']}", headers=bob).json()["messages"]
+        if msgs and msgs[-1]["content"] == "Обзор готов":
+            break
+        time.sleep(0.02)
+    assert msgs[-1]["content"] == "Обзор готов"
+    assert client.delete(f"/api/schedules/{s['id']}", headers={"Authorization": "Bearer t-alex"}).status_code == 200

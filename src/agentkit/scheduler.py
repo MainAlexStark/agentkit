@@ -92,6 +92,16 @@ class Scheduler:
                 asyncio.create_task(self._fire(s))
         return fired
 
+    async def run_now(self, s: ScheduleRec) -> bool:
+        """Запуск вне расписания («Запустить сейчас»). False — эта задача уже выполняется."""
+        if s.id in self._running:
+            return False
+        self._running.add(s.id)
+        s.last_run_at = time.time()
+        await self.store.schedule_upsert(s)
+        asyncio.create_task(self._fire(s))
+        return True
+
     async def _fire(self, s: ScheduleRec) -> None:
         try:
             user = self.user_for(s.user_id)

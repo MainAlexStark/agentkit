@@ -37,8 +37,12 @@ class Settings(BaseSettings):
     ollama_url: str = ""
     model_main: str = "openrouter:anthropic/claude-sonnet-4.5"
     model_small: str = "openrouter:anthropic/claude-haiku-4.5"
-    # Модели в выпадающем списке чата, через запятую. Пусто — только main.
+    # Избранные модели по умолчанию (пока пользователь не выбрал свои), через запятую. Пусто — только main.
     models: str = ""
+    # Какие модели каталога доступны пользователям: шаблоны через запятую
+    # («openrouter:anthropic/*,openrouter:openai/gpt-5*»); пусто — все с поддержкой инструментов.
+    # Админ может сузить список в настройках чата — тогда действует его выбор.
+    models_allow: str = ""
     # Запасные: "openrouter:a=openrouter:b|yandex:c;…"
     fallbacks: str = ""
     context_window: int = 200_000

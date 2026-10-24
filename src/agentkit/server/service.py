@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import fnmatch
 import json
 import logging
 import os
@@ -21,6 +23,7 @@ from agentkit.builder import make_router, standard_tools
 from agentkit.bus import Bus, make_bus
 from agentkit.events import EventType, RunStatus
 from agentkit.hooks import Hooks
+from agentkit.llm.catalog import ModelCatalog
 from agentkit.llm.router import ModelRouter
 from agentkit.mcp import MCPManager, MCPServerConfig
 from agentkit.messages import Usage
@@ -91,6 +94,7 @@ class AgentService:
         self.runs: RunManager | None = None
         self.scheduler: Scheduler | None = None
         self.registry: ToolRegistry | None = None
+        self.catalog: ModelCatalog | None = None
 
     async def start(self) -> None:
         s = self.settings
@@ -109,9 +113,11 @@ class AgentService:
         self.runs.on_idle = self._drain_inbox
         await self._fail_orphans()
         await self._build_agent()
+        # Планировщик создаётся всегда — «Запустить сейчас» работает и при выключенном
+        # AGENT_SCHEDULER; тикать по расписанию он начинает только если включён.
+        self.scheduler = Scheduler(self.store, lambda name: self.agent, self.user_for, tz=s.tz,
+                                   runner=self._scheduled_run)
         if s.scheduler:
-            self.scheduler = Scheduler(self.store, lambda name: self.agent, self.user_for, tz=s.tz,
-                                       runner=self._scheduled_run)
             self.scheduler.start()
         if self.domain.on_start:
             res = self.domain.on_start(self)
@@ -141,6 +147,14 @@ class AgentService:
         self.agent = assemble_agent(self.settings, self.domain, self.store, router=self._router,
                                     mcp_tools=mcp_tools, mcp_instructions=self.mcp.instructions)
         self.registry = self.agent.tools
+        s = self.settings
+        if self.catalog is None:
+            self.catalog = ModelCatalog(self.agent.router, configured=[s.model_main, s.model_small, *s.model_list()])
+            # Каталог — сетевой запрос на секунды; старт сервиса его не ждёт.
+            self._catalog_task = asyncio.create_task(self.catalog.refresh())
+        else:
+            self.catalog.router = self.agent.router
+        self.agent.vision_for = self.catalog.vision
         log.info("агент готов: %d инструментов (MCP: %s)", len(self.registry),
                  ", ".join(f"{k}={'ok' if v.ok else 'ошибка'}" for k, v in self.mcp.status.items()) or "нет")
 
@@ -198,6 +212,46 @@ class AgentService:
                     break
         return RunOutcome(run_id=run.id if run else "", status=RunStatus(run.status) if run else RunStatus.ERROR,
                           text=text, usage=Usage(**(run.usage or {})) if run else Usage(), events=[])
+
+    # ── модели: избранное пользователя и список доступных ────────────
+    async def model_prefs(self, user: User) -> dict[str, Any]:
+        """Избранные модели, «показывать только избранные» и модель по умолчанию — у каждого свои."""
+        p = await self.store.kv_get("model_prefs", user.id) or {}
+        return {"favorites": p.get("favorites", self.settings.model_list()),
+                "only_favorites": bool(p.get("only_favorites", False)),
+                "default": p.get("default") or self.settings.model_main}
+
+    async def model_policy(self) -> list[str] | None:
+        """Список, который админ оставил в настройках; None — действует AGENT_MODELS_ALLOW."""
+        v = await self.store.kv_get("config", "models_allowed")
+        return v.get("ids") if isinstance(v, dict) else None
+
+    def model_allowed(self, model_id: str, policy: list[str] | None) -> bool:
+        s = self.settings
+        mid = self.agent.router.resolve(model_id)
+        # Основную и малую модели не отключить: на них работают сжатие истории, субагенты и расписание.
+        if mid in (self.agent.router.resolve("main"), self.agent.router.resolve("small"), s.model_main, s.model_small):
+            return True
+        if policy is not None:
+            return mid in policy
+        patterns = [x.strip() for x in s.models_allow.split(",") if x.strip()]
+        return not patterns or any(fnmatch.fnmatchcase(mid, p) for p in patterns)
+
+    async def check_model(self, model: str | None) -> str | None:
+        """Модель из запроса пользователя: провайдер должен существовать, а модель — быть разрешена.
+
+        Проверка на сервере, а не только в выпадающем списке: иначе любой мог бы прислать
+        в API самую дорогую модель каталога.
+        """
+        if not model:
+            return None
+        from agentkit.llm.router import split_model
+
+        mid = self.agent.router.resolve(model)
+        provider, _ = split_model(mid, self.agent.router.default_provider)
+        if provider not in self.agent.router.providers or not self.model_allowed(mid, await self.model_policy()):
+            raise ValueError(f"модель {model} недоступна — выберите другую в списке моделей")
+        return model
 
     def user_for(self, user_id: str) -> User:
         for u in self.auth.users.values():

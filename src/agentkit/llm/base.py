@@ -78,5 +78,13 @@ class ModelInfo:
     context_window: int = 128_000
     vision: bool = False
     tools: bool = True
-    price_in: float | None = None  # за 1M токенов
+    price_in: float | None = None  # $ за 1M токенов
     price_out: float | None = None
+    provider: str = ""  # «openrouter», «yandex»…
+    vendor: str = ""  # чья модель: «anthropic», «openai»… (у OpenRouter — до «/»)
+    description: str = ""
+    created: float = 0.0  # когда появилась в каталоге (для сортировки «новые»)
+    reasoning: bool = False
+
+    def to_dict(self) -> dict:
+        return dict(self.__dict__)
