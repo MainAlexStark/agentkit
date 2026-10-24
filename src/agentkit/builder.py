@@ -12,6 +12,7 @@ from agentkit.tools.core import core_tools, memory_tools
 from agentkit.tools.files import file_tools
 from agentkit.tools.registry import ToolRegistry
 from agentkit.tools.shell import shell_tool
+from agentkit.tools.visual import visual_tool
 from agentkit.tools.web import TavilySearch, web_fetch_tool, web_search_tool
 
 
@@ -56,9 +57,12 @@ def standard_tools(
     memory: bool = True,
     memory_global_roles: tuple[str, ...] = ("admin",),
     subagents: bool = True,
+    visuals: bool = True,
     extra: Iterable[Tool] = (),
 ) -> ToolRegistry:
     reg = ToolRegistry(core_tools())
+    if visuals:
+        reg.add(visual_tool())
     if files:
         reg.extend(file_tools(read_only=files_read_only))
     if shell:

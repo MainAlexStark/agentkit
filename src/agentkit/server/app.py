@@ -695,7 +695,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         # Иначе после обновления Chrome эвристически берёт старый app.js из кэша к новой
         # разметке (Safari перепроверяет чаще) — и интерфейс ломается только в одном браузере.
         text = (static / "index.html").read_text(encoding="utf-8")
-        for name in ("app.js", "app.css"):
+        for name in ("app.js", "app.css", "viz.js"):
             f = static / name
             if f.is_file():
                 st = f.stat()

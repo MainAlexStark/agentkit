@@ -310,6 +310,7 @@ function widget(w) {
     const imgs = (w.items || []).filter(a => a.type === "image");
     return imgs.length ? h("div", { class: "msg assistant" }, imgs.map(a => h("img", { class: "thumb", src: `data:${a.mime};base64,${a.data}` }))) : null;
   }
+  if (w.type === "visual") return h("div", { class: "msg assistant viz-msg" }, VIZ.render(w));
   if (w.type === "files") {
     const isImg = n => /\.(png|jpe?g|gif|webp)$/i.test(n);
     return h("div", { class: "msg assistant" }, h("div", { class: "files out-files" },
@@ -545,7 +546,7 @@ async function doRewind(seq, text) {
 
 // ── сессии ──────────────────────────────────────────────────────────
 async function loadSessions() {
-  S.sessions = await api("/api/sessions");
+  [S.sessions, S.projects] = await Promise.all([api("/api/sessions"), api("/api/projects").catch(() => S.projects || [])]);
   const cur = S.sessions.find(s => s.id === S.sessionId);
   if (cur) $("#chat-title").textContent = cur.title;
   renderSessions();
@@ -576,7 +577,48 @@ function renderSessions() {
     }
   }
   if (!out.length) out.push(h("div", { class: "group-label" }, q ? "Ничего не найдено" : "Разговоров пока нет"));
-  $("#sessions").replaceChildren(...out);
+  $("#sessions").replaceChildren(...(q ? [] : projectsSection()), ...out);
+}
+
+// ── проекты в боковой панели (как в Claude): раскрываются в свои разговоры ──
+const sideState = {
+  get open() { return store.get("side_projects") !== "0"; },
+  set open(v) { store.set("side_projects", v ? "1" : "0"); },
+  expanded: new Set((() => { try { return JSON.parse(store.get("side_expanded") || "[]"); } catch { return []; } })()),
+  save() { store.set("side_expanded", JSON.stringify([...this.expanded])); },
+  all: false,
+};
+function projectsSection() {
+  const list = S.projects || [];
+  const open = sideState.open;
+  const head = h("div", { class: "side-sec" },
+    h("button", { class: "side-sec-toggle", type: "button", "aria-expanded": String(open), onclick: () => { sideState.open = !open; renderSessions(); } },
+      h("span", {}, "Проекты"), icon("chev", "chev" + (open ? " open" : ""))),
+    h("button", { class: "icon-btn sm", type: "button", title: "Все проекты", "aria-label": "Все проекты", onclick: () => { toggleSidebar(false); openProjects(); } }, icon("folder")),
+    h("button", { class: "icon-btn sm", type: "button", title: "Новый проект", "aria-label": "Новый проект", onclick: () => newProjectForm() }, icon("plus")));
+  if (!open) return [head];
+  const curProject = S.view?.startsWith("project:") ? S.view.slice(8) : S.sessions.find(x => x.id === S.sessionId)?.project_id;
+  const shown = sideState.all ? list : list.slice(0, 5);
+  const rows = shown.map(p => {
+    const chats = S.sessions.filter(x => x.project_id === p.id);
+    const exp = sideState.expanded.has(p.id) || (curProject === p.id && S.sessionId && chats.some(c => c.id === S.sessionId));
+    const tog = h("button", { class: "proj-tog", type: "button", "aria-label": exp ? "Свернуть" : "Показать разговоры", title: exp ? "Свернуть" : "Разговоры проекта",
+      onclick: e => { e.stopPropagation(); exp ? sideState.expanded.delete(p.id) : sideState.expanded.add(p.id); sideState.save(); renderSessions(); } },
+      icon("folder", "fold"), icon("chev", "chev" + (exp ? " open" : "")));
+    const item = h("div", { class: "session proj-item" + (S.view === "project:" + p.id ? " active" : curProject === p.id ? " within" : ""), role: "button", tabindex: "0", title: p.name,
+      onclick: () => { toggleSidebar(false); openProject(p.id); }, onkeydown: e => { if (e.key === "Enter" && e.target === item) openProject(p.id); } },
+      tog, h("span", {}, p.name), p.role !== "owner" || p.shared ? h("small", { class: "s-proj", title: p.role !== "owner" ? `Открыт вам: ${ROLE_NAMES[p.role]}` : "Общий проект" }, icon("users")) : null);
+    if (!exp) return item;
+    const sub = chats.slice(0, 8).map(c => h("div", { class: "session nested" + (c.id === S.sessionId ? " active" : ""), role: "button", tabindex: "0", title: c.title,
+      onclick: () => { toggleSidebar(false); openSession(c.id); } }, h("span", {}, c.title), c.running ? h("i", { class: "dot" }) : null));
+    return h("div", { class: "proj-group" }, item,
+      sub.length ? sub : h("button", { class: "session nested new", type: "button", onclick: () => openProject(p.id) }, icon("plus"), h("span", {}, "Новый разговор")),
+      chats.length > 8 ? h("button", { class: "side-more nested", type: "button", onclick: () => openProject(p.id) }, `Все ${chats.length}`) : null);
+  });
+  if (!list.length) rows.push(h("button", { class: "side-empty", type: "button", onclick: () => newProjectForm() }, icon("plus"), "Создать проект"));
+  if (list.length > 5) rows.push(h("button", { class: "side-more", type: "button", onclick: () => { sideState.all = !sideState.all; renderSessions(); } },
+    sideState.all ? "Свернуть" : `Ещё ${list.length - 5}`));
+  return [head, ...rows, h("div", { class: "side-sec plain" }, h("span", { class: "side-sec-label" }, "Недавние"))];
 }
 
 function greeting() {
@@ -1375,7 +1417,7 @@ function showPage(on) {
   $("#messages").hidden = on;
   $(".composer-wrap").hidden = on;
   if (on) { $("#below").hidden = true; $("#to-bottom").hidden = true; toggleTasks(false); }
-  $("#nav-projects").classList.toggle("on", on);
+  if (!on) S.view = null;
 }
 function setCrumb(project) {
   const c = $("#crumb");
@@ -1386,7 +1428,7 @@ const ROLE_NAMES = { owner: "владелец", editor: "редактор", view
 const fileIcon = kind => ({ pdf: "file", docx: "file", xlsx: "chart", image: "eye", text: "file" }[kind] || "file");
 
 async function openProjects() {
-  S.stream?.abort(); S.sessionId = null; renderSessions();
+  S.stream?.abort(); S.sessionId = null; S.view = "projects"; renderSessions();
   history.replaceState(null, "", "#projects");
   showPage(true); setCrumb(null);
   $("#chat-title").textContent = "Проекты";
@@ -1422,7 +1464,7 @@ function newProjectForm() {
   const create = h("button", { class: "btn primary", type: "button", onclick: async () => {
     if (!name.value.trim()) { name.focus(); return; }
     create.disabled = true;
-    try { const p = await api("/api/projects", { method: "POST", body: { name: name.value, description: desc.value } }); close(); openProject(p.id); }
+    try { const p = await api("/api/projects", { method: "POST", body: { name: name.value, description: desc.value } }); close(); await loadSessions(); openProject(p.id); }
     catch (e) { toast(e.message); create.disabled = false; }
   } }, "Создать");
   const m = h("div", { class: "modal", id: "modal2", onmousedown: e => { if (e.target.id === "modal2") close(); } },
@@ -1435,7 +1477,7 @@ function newProjectForm() {
 }
 
 async function openProject(id) {
-  S.stream?.abort(); S.sessionId = null; renderSessions();
+  S.stream?.abort(); S.sessionId = null; S.view = "project:" + id; renderSessions();
   history.replaceState(null, "", `#p/${id}`);
   showPage(true); setCrumb(null);
   const page = $("#page");
@@ -2011,7 +2053,6 @@ $("#input").addEventListener("keydown", e => {
 $("#input").addEventListener("input", autosize);
 $("#stop").addEventListener("click", () => S.sessionId && api(`/api/sessions/${S.sessionId}/cancel`, { method: "POST" }));
 $("#new-chat").addEventListener("click", newChat);
-$("#nav-projects").addEventListener("click", () => { toggleSidebar(false); openProjects(); });
 // Ссылки вида …/#p/<id> и кнопка «назад» браузера. Свои переходы идут через replaceState и сюда не попадают.
 window.addEventListener("hashchange", () => S.config && route(location.hash.slice(1)));
 $("#device-chip").addEventListener("click", () => openSettings("computer"));

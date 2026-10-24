@@ -185,3 +185,25 @@ def test_bridge_setup_config_and_access_dialogs(tmp_path, monkeypatch):
     monkeypatch.setattr(br, "pick_folder", lambda prompt: None)
     with pytest.raises(br.BridgeError, match="закрыл"):
         b.op_pick_folder()
+
+
+async def test_show_visual_validates_and_returns_widget(store):
+    from agentkit.tools.visual import visual_tool
+
+    t = visual_tool()
+    ctx = ToolContext(session_id="s", run_id="r", user=User(id="u"), agent=None, store=store, emit=None)
+    ok = await t.call({"title": "Поверки", "blocks": [
+        {"type": "kpi", "label": "За октябрь", "value": 412, "delta": 12.4},
+        {"type": "chart", "kind": "line", "x": ["сен", "окт"], "series": [{"name": "Вода", "values": [281, 302]}]},
+    ]}, ctx)
+    assert not ok.is_error and ok.ui[0]["type"] == "visual" and "Показано" in ok.content
+    bad = await t.call({"blocks": [{"type": "chart", "kind": "bar", "x": ["a", "b"], "series": [{"name": "s", "values": [1]}]}]}, ctx)
+    assert bad.is_error and "1 значений" in bad.content
+    pie = await t.call({"blocks": [{"type": "chart", "kind": "donut", "x": list("abcdefghi"),
+                                    "series": [{"name": "s", "values": [1] * 9}]}]}, ctx)
+    assert pie.is_error and "Прочее" in pie.content
+    html = await t.call({"title": "схема", "html": "<svg></svg>"}, ctx)
+    assert html.ui[0]["html"] == "<svg></svg>"
+    # схема без $ref — её понимают все провайдеры
+    import json as _json
+    assert "$ref" not in _json.dumps(t.schema())
