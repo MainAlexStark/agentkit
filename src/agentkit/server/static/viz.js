@@ -361,11 +361,17 @@ addEventListener("load",p);new ResizeObserver(p).observe(document.body);setTimeo
     const blocks = spec.html ? [htmlFrame(spec, opts)] : (spec.blocks || []).map(b =>
       b.type === "kpi" ? kpi(b) : b.type === "chart" ? chart(b, opts) : b.type === "table" ? table(b) : b.type === "text" ? text(b) : null);
     const allKpi = !spec.html && (spec.blocks || []).every(b => b.type === "kpi");
+    // Один блок — во всю ширину ответа; нечётный последний график — тоже, чтобы не висел половинкой.
+    const nonKpi = blocks.filter(x => x && !x.classList.contains("kpi"));
+    if (nonKpi.length === 1 || (nonKpi.length % 2 === 1 && nonKpi.at(-1)?.classList.contains("chart"))) nonKpi.at(-1).classList.add("wide");
     const card = el("div", { class: "viz" + (opts.expanded ? " expanded" : "") },
-      spec.title || !opts.expanded ? el("div", { class: "viz-top" }, el("b", {}, spec.title || ""),
-        opts.expanded ? null : el("button", { class: "viz-mini icon", type: "button", title: "Во весь экран", "aria-label": "Во весь экран", onclick: () => expand(spec) },
-          sv("svg", { viewBox: "0 0 24 24" }, sv("path", { d: "M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" })))) : null,
+      spec.title ? el("div", { class: "viz-top" }, el("b", {}, spec.title)) : null,
+      opts.expanded ? null : el("button", { class: "viz-mini icon viz-expand", type: "button", title: "Во весь экран", "aria-label": "Во весь экран", onclick: () => expand(spec) },
+        sv("svg", { viewBox: "0 0 24 24" }, sv("path", { d: "M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" }))),
       el("div", { class: "viz-grid" + (allKpi ? " kpis" : "") }, blocks));
+    // Без общего заголовка кнопка «на весь экран» встаёт рядом с «Таблица» первого графика, а не поверх неё.
+    const ex = card.querySelector(":scope > .viz-expand"), head = card.querySelector(".viz-head");
+    if (ex && !spec.title && head) { ex.classList.remove("viz-expand"); head.append(ex); }
     return card;
   }
 

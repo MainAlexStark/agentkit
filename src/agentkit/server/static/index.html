@@ -148,6 +148,17 @@
     <div id="below" class="below" hidden></div>
   </main>
 
+  <aside id="preview" class="preview" hidden aria-label="Предпросмотр файла">
+    <div class="pv-resize" id="pv-resize" title="Потяните, чтобы изменить ширину"></div>
+    <div class="pv-head">
+      <span class="pv-icon" id="pv-icon"></span>
+      <div class="pv-title"><b id="pv-name"></b><small id="pv-meta"></small></div>
+      <button id="pv-download" class="icon-btn" type="button" title="Скачать" aria-label="Скачать"><svg><use href="#i-download"/></svg></button>
+      <button id="pv-close" class="icon-btn" type="button" title="Закрыть" aria-label="Закрыть предпросмотр"><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div id="pv-body" class="pv-body"></div>
+  </aside>
+
   <aside id="tasks" class="tasks" hidden>
     <div class="tasks-head"><h4><svg><use href="#i-tasks"/></svg>Задачи</h4><span id="tasks-progress" class="muted"></span>
       <button id="tasks-close" class="icon-btn" type="button" title="Скрыть" aria-label="Скрыть задачи"><svg><use href="#i-x"/></svg></button></div>

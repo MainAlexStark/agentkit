@@ -73,7 +73,10 @@ async def write_file(
     await checkpoint(ctx, p)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
-    return ToolResult(content=f"Записан {path} ({len(content)} символов).")
+    # Карточка файла в чате (и предпросмотр сбоку): написанный файл — обычно результат работы.
+    r = rel(ctx, p)
+    return ToolResult(content=f"Записан {path} ({len(content)} символов).",
+                      ui=[{"type": "files", "files": [{"path": r, "name": p.name, "size": p.stat().st_size}]}])
 
 
 @tool(title="Правка файла", group="files", source="builtin",

@@ -160,11 +160,11 @@ function fileView(f) {
   if (f.kind === "image") {
     const img = h("img", { class: "thumb", alt: f.name, title: f.name });
     blobURL(f.path).then(u => { img.src = u; }).catch(() => {});
-    img.addEventListener("click", () => blobURL(f.path).then(u => window.open(u)));
+    img.addEventListener("click", () => openPreview(f));
     return img;
   }
-  return h("button", { class: "file-chip", title: "Скачать", type: "button", onclick: () => blobURL(f.path).then(u => {
-    const a = h("a", { href: u, download: f.name }); document.body.append(a); a.click(); a.remove(); }) },
+  return h("button", { class: "file-chip", title: canPreview(f.name) ? "Открыть" : "Скачать", type: "button",
+    onclick: () => canPreview(f.name) ? openPreview(f) : downloadFile(f) },
     icon("file"), h("span", {}, f.name), h("small", {}, humanSize(f.size)));
 }
 
@@ -243,8 +243,16 @@ function updateGroup(g) {
   g.head.querySelector(".time").textContent = ms ? secs(ms) : "";
 }
 
+// Инструменты, которые сами по себе — часть ответа (график, дашборд): без строки «1 действие»,
+// чтобы текст, визуализация и снова текст читались одним целым.
+const SILENT_TOOLS = new Set(["show_visual"]);
 function stepRow(id, name, args, title, agent) {
   if (S.steps.has(id)) return S.steps.get(id);
+  if (SILENT_TOOLS.has(name) && !agent) {
+    const ghost = { el: h("div"), st: h("span"), time: h("span"), detail: h("div"), title: "", state: "run", ms: 0, group: null, silent: true };
+    S.steps.set(id, ghost);
+    return ghost;
+  }
   const st = h("span", { class: "st run" });
   const ttl = toolTitle(name, title);
   const time = h("span", { class: "step-time" });
@@ -311,11 +319,7 @@ function widget(w) {
     return imgs.length ? h("div", { class: "msg assistant" }, imgs.map(a => h("img", { class: "thumb", src: `data:${a.mime};base64,${a.data}` }))) : null;
   }
   if (w.type === "visual") return h("div", { class: "msg assistant viz-msg" }, VIZ.render(w));
-  if (w.type === "files") {
-    const isImg = n => /\.(png|jpe?g|gif|webp)$/i.test(n);
-    return h("div", { class: "msg assistant" }, h("div", { class: "files out-files" },
-      (w.files || []).map(f => fileView({ ...f, kind: isImg(f.name) ? "image" : "file" }))));
-  }
+  if (w.type === "files") return h("div", { class: "msg assistant file-cards" }, (w.files || []).map(fileCard));
   if (w.type === "choices") return null; // вопрос рисуется по событию ask_user
   return null;
 }
@@ -405,7 +409,16 @@ function onEvent(ev) {
       for (const tc of d.tool_calls || []) stepRow(tc.id, tc.function.name, safeJSON(tc.function.arguments));
       break;
     case "tool_call": stepRow(d.id, d.name, d.args, d.title, ev.agent); break;
-    case "tool_result": stepResult(d.id, d.content, d.is_error, ev.agent ? [] : d.ui, d.elapsed_ms); break;
+    case "tool_result": {
+      stepResult(d.id, d.content, d.is_error, ev.agent ? [] : d.ui, d.elapsed_ms);
+      // Готовый файл — сразу в панель сбоку (только вживую, не при открытии старого разговора).
+      const files = (ev.agent ? [] : d.ui || []).filter(w => w.type === "files").flatMap(w => w.files || []);
+      // Из нескольких — главный: документ важнее таблицы, таблица важнее картинки.
+      const rank = n => ["pdf", "html", "htm", "docx", "xlsx", "md", "csv", "svg", "png", "jpg", "jpeg", "webp"].indexOf(extOf(n));
+      const pick = files.filter(f => AUTO_OPEN.has(extOf(f.name))).sort((a, b) => rank(a.name) - rank(b.name))[0];
+      if (pick && !d.is_error) openPreview(pick);
+      break;
+    }
     case "subagent_started": {
       const step = S.steps.get(d.tool_call_id);
       const sub = h("div", { class: "sub" }, h("div", { class: "sub-title" }, `${d.type}: ${d.description}`));
@@ -652,6 +665,7 @@ function resetView() {
   box().replaceChildren(emptyState());
   S.tasksShown = false; renderTodos([]); toggleTasks(false); setRunning(false);
   S.queued = []; S.attachments = []; renderAttachments();
+  if (S.preview) closePreview();
 }
 
 async function openSession(id) {
@@ -1808,6 +1822,197 @@ async function computerTab(body) {
         h("button", { class: "btn primary sm", type: "button", onclick: connect }, icon("plus"), "Подключить компьютер")));
 }
 
+// ── файлы: карточки в чате и панель предпросмотра сбоку ────────────────
+const FILE_TYPES = {
+  pdf: ["PDF", "pdf"], html: ["HTML", "html"], htm: ["HTML", "html"], md: ["Markdown", "md"], txt: ["Текст", "text"],
+  csv: ["CSV", "table"], tsv: ["TSV", "table"], xlsx: ["Excel", "sheets"], xls: ["Excel", ""], docx: ["Word", "doc"], doc: ["Word", ""],
+  pptx: ["PowerPoint", ""], json: ["JSON", "code"], xml: ["XML", "code"], yaml: ["YAML", "code"], yml: ["YAML", "code"],
+  py: ["Python", "code"], js: ["JavaScript", "code"], ts: ["TypeScript", "code"], sql: ["SQL", "code"], log: ["Журнал", "code"], sh: ["Shell", "code"],
+  png: ["Картинка", "image"], jpg: ["Картинка", "image"], jpeg: ["Картинка", "image"], gif: ["Картинка", "image"], webp: ["Картинка", "image"], svg: ["SVG", "image"],
+  zip: ["Архив", ""],
+};
+// Что открывать само, когда агент закончил файл: то, что человек и так открыл бы посмотреть.
+const AUTO_OPEN = new Set(["pdf", "html", "htm", "md", "csv", "xlsx", "docx", "png", "jpg", "jpeg", "svg", "webp"]);
+const extOf = name => (String(name).match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase();
+const typeOf = name => FILE_TYPES[extOf(name)] || [extOf(name).toUpperCase() || "Файл", ""];
+const canPreview = name => !!typeOf(name)[1];
+
+async function fileBlob(path) {
+  const r = await fetch(`/api/sessions/${S.sessionId}/files?path=${encodeURIComponent(path)}`, { headers: { Authorization: `Bearer ${S.token}` } });
+  if (!r.ok) throw new Error("файл недоступен");
+  return r.blob();
+}
+async function downloadFile(f) {
+  try {
+    const u = await blobURL(f.path);
+    const a = h("a", { href: u, download: f.name }); document.body.append(a); a.click(); a.remove();
+  } catch (e) { toast(e.message); }
+}
+function fileTile(name) {
+  const ext = extOf(name);
+  return h("span", { class: "ftile ft-" + (typeOf(name)[1] || "other") + " ext-" + ext }, (ext || "?").slice(0, 4).toUpperCase());
+}
+// Карточка файла в чате: тип, размер, «Открыть» в панели и «Скачать».
+function fileCard(f) {
+  const [label, kind] = typeOf(f.name);
+  if (kind === "image") {
+    const img = h("img", { class: "fc-img", alt: f.name });
+    blobURL(f.path).then(u => { img.src = u; }).catch(() => img.remove());
+    return h("button", { class: "file-card image", type: "button", title: "Открыть", onclick: () => openPreview(f) }, img,
+      h("span", { class: "fc-cap" }, h("span", {}, f.name), h("small", {}, humanSize(f.size))));
+  }
+  return h("div", { class: "file-card" + (kind ? " can" : ""), role: kind ? "button" : null, tabindex: kind ? "0" : null,
+    onclick: e => { if (kind && !e.target.closest(".fc-dl")) openPreview(f); },
+    onkeydown: e => { if (kind && e.key === "Enter") openPreview(f); } },
+    fileTile(f.name),
+    h("span", { class: "fc-text" }, h("b", {}, f.name), h("small", {}, [label, humanSize(f.size)].filter(Boolean).join(" · "))),
+    kind ? h("span", { class: "fc-open" }, "Открыть") : null,
+    h("button", { class: "icon-btn fc-dl", type: "button", title: "Скачать", "aria-label": "Скачать", onclick: () => downloadFile(f) }, icon("download")));
+}
+
+S.preview = null;
+async function openPreview(f) {
+  if (!S.sessionId) return;
+  const [label, kind] = typeOf(f.name);
+  S.preview = f;
+  toggleTasks(false);
+  const pv = $("#preview");
+  pv.hidden = false;
+  if (innerWidth <= 960) $("#scrim").hidden = false;
+  $("#pv-icon").replaceChildren(fileTile(f.name));
+  $("#pv-name").textContent = f.name;
+  $("#pv-meta").textContent = [label, humanSize(f.size)].filter(Boolean).join(" · ");
+  $("#pv-download").onclick = () => downloadFile(f);
+  const body = $("#pv-body");
+  body.className = "pv-body pv-" + (kind || "none");
+  body.replaceChildren(h("div", { class: "pv-loading" }, h("span", { class: "spin" }), "Открываю…"));
+  try {
+    body.replaceChildren(await previewContent(f, kind));
+  } catch (e) {
+    body.replaceChildren(h("div", { class: "pv-empty" }, fileTile(f.name), h("b", {}, "Не получилось показать"), h("p", {}, e.message),
+      h("button", { class: "btn sm", type: "button", onclick: () => downloadFile(f) }, icon("download"), "Скачать")));
+  }
+}
+function closePreview() {
+  $("#preview").hidden = true; S.preview = null;
+  if (innerWidth <= 960 && $("#tasks").hidden && !$("#sidebar").classList.contains("open")) $("#scrim").hidden = true;
+}
+
+async function previewContent(f, kind) {
+  if (kind === "image") {
+    const img = h("img", { alt: f.name }); img.src = await blobURL(f.path);
+    return h("div", { class: "pv-image" }, img);
+  }
+  if (kind === "pdf") {
+    // Встроенный просмотрщик есть в настольных браузерах; на Android и в части мобильных — нет:
+    // тогда рисуем страницы сами через pdf.js (подгружается только в этом случае).
+    if (navigator.pdfViewerEnabled !== false) return h("iframe", { class: "pv-frame", src: await blobURL(f.path), title: f.name });
+    return pdfPages(await (await fileBlob(f.path)).arrayBuffer());
+  }
+  if (kind === "html") {
+    // Свой HTML — в песочнице без доступа к странице чата: никакого blob-URL с нашим происхождением,
+    // иначе скрипты файла прочитали бы токен из localStorage.
+    const text = await (await fileBlob(f.path)).text();
+    return h("iframe", { class: "pv-frame white", sandbox: "allow-scripts allow-popups allow-forms", srcdoc: text, title: f.name });
+  }
+  if (kind === "md") {
+    const d = h("div", { class: "md pv-doc" }); renderMd(d, await (await fileBlob(f.path)).text()); return d;
+  }
+  if (kind === "table") {
+    const text = await (await fileBlob(f.path)).text();
+    return sheetView([{ name: f.name, rows: parseCSV(text, extOf(f.name) === "tsv" ? "\t" : null) }]);
+  }
+  if (kind === "code" || kind === "text") {
+    const text = await (await fileBlob(f.path)).text();
+    return h("pre", { class: "pv-code" + (kind === "text" ? " wrap" : "") }, text.length > 400000 ? text.slice(0, 400000) + "\n…" : text);
+  }
+  if (kind === "sheets" || kind === "doc") {
+    const d = await api(`/api/sessions/${S.sessionId}/files/preview?path=${encodeURIComponent(f.path)}`);
+    if (d.kind === "sheets") return sheetView(d.sheets);
+    const doc = h("div", { class: "md pv-doc" });
+    for (const b of d.blocks) {
+      if (b.type === "h") doc.append(h("h" + Math.min(4, b.level + 1), {}, b.text));
+      else if (b.type === "p") doc.append(h("p", {}, b.text));
+      else doc.append(h("table", {}, h("tbody", {}, b.rows.map(r => h("tr", {}, r.map(c => h("td", {}, c)))))));
+    }
+    return doc;
+  }
+  throw new Error("Для этого типа файла предпросмотра нет — скачайте его.");
+}
+const PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/";
+let pdfjsReady = null;
+function loadPdfJs() {
+  pdfjsReady ??= new Promise((ok, fail) => {
+    const sc = h("script", { src: PDFJS + "pdf.min.js" });
+    sc.onload = () => { window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS + "pdf.worker.min.js"; ok(window.pdfjsLib); };
+    sc.onerror = () => { pdfjsReady = null; fail(new Error("Браузер не показывает PDF, а просмотрщик не загрузился — скачайте файл.")); };
+    document.head.append(sc);
+  });
+  return pdfjsReady;
+}
+async function pdfPages(buf) {
+  const lib = await loadPdfJs();
+  const doc = await lib.getDocument({ data: buf }).promise;
+  const wrap = h("div", { class: "pv-pdf" });
+  const width = Math.min(900, ($("#pv-body").clientWidth || innerWidth) - 24);
+  for (let i = 1; i <= Math.min(doc.numPages, 50); i++) {
+    const page = await doc.getPage(i);
+    const vp0 = page.getViewport({ scale: 1 });
+    const scale = (width / vp0.width) * (devicePixelRatio || 1);
+    const vp = page.getViewport({ scale });
+    const c = h("canvas", { width: Math.floor(vp.width), height: Math.floor(vp.height) });
+    c.style.width = `${width}px`; c.style.maxWidth = "100%"; c.style.height = "auto";
+    await page.render({ canvasContext: c.getContext("2d"), viewport: vp }).promise;
+    wrap.append(c);
+  }
+  if (doc.numPages > 50) wrap.append(h("p", { class: "muted center" }, `Показаны 50 страниц из ${doc.numPages} — остальное в скачанном файле`));
+  return wrap;
+}
+function parseCSV(text, sep) {
+  const first = text.split("\n", 1)[0];
+  sep = sep || ([";", ",", "\t"].map(c => [c, first.split(c).length]).sort((a, b) => b[1] - a[1])[0][0]);
+  const rows = []; let row = [], cell = "", q = false;
+  for (let i = 0; i < text.length && rows.length < 1000; i++) {
+    const c = text[i];
+    if (q) { if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += c; continue; }
+    if (c === '"') q = true;
+    else if (c === sep) { row.push(cell); cell = ""; }
+    else if (c === "\n" || c === "\r") { if (c === "\r" && text[i + 1] === "\n") i++; row.push(cell); rows.push(row); row = []; cell = ""; }
+    else cell += c;
+  }
+  if (cell || row.length) { row.push(cell); rows.push(row); }
+  return rows;
+}
+function sheetView(sheets) {
+  const holder = h("div", { class: "pv-sheet" });
+  const draw = i => {
+    const rows = sheets[i].rows || [];
+    const width = Math.max(0, ...rows.map(r => r.length));
+    const num = c => /^-?[\d\s]+([.,]\d+)?$/.test(String(c).trim()) && String(c).trim() !== "";
+    holder.replaceChildren(h("table", {},
+      rows.length ? h("thead", {}, h("tr", {}, h("th", { class: "rn" }, ""), Array.from({ length: width }, (_, ci) => h("th", {}, rows[0][ci] ?? "")))) : null,
+      h("tbody", {}, rows.slice(1).map((r, ri) => h("tr", {}, h("td", { class: "rn" }, ri + 2),
+        Array.from({ length: width }, (_, ci) => h("td", { class: num(r[ci] ?? "") ? "num" : "" }, r[ci] ?? "")))))));
+  };
+  const tabs = sheets.length > 1 ? h("div", { class: "pv-tabs" }, sheets.map((s, i) => h("button", { type: "button", class: i ? "" : "on",
+    onclick: e => { e.currentTarget.parentElement.querySelectorAll("button").forEach(b => b.classList.remove("on")); e.currentTarget.classList.add("on"); draw(i); } }, s.name))) : null;
+  draw(0);
+  return h("div", { class: "pv-sheet-wrap" }, holder, tabs);
+}
+// Ширина панели — тянуть за левый край; запоминается.
+(() => {
+  const pv = $("#preview"), grip = $("#pv-resize");
+  const apply = w => pv.style.setProperty("--pv-w", `${Math.max(340, Math.min(w, innerWidth - 520))}px`);
+  const saved = +store.get("agent_pv_w"); if (saved) apply(saved);
+  grip.addEventListener("pointerdown", e => {
+    e.preventDefault(); grip.setPointerCapture(e.pointerId); pv.classList.add("resizing");
+    const move = ev => apply(innerWidth - ev.clientX);
+    const up = ev => { grip.removeEventListener("pointermove", move); grip.removeEventListener("pointerup", up); pv.classList.remove("resizing"); store.set("agent_pv_w", String(innerWidth - ev.clientX)); };
+    grip.addEventListener("pointermove", move); grip.addEventListener("pointerup", up);
+  });
+})();
+$("#pv-close").addEventListener("click", closePreview);
+
 // ── всплывающие меню ────────────────────────────────────────────────
 function closeMenus() {
   $("#user-menu").hidden = true; $("#user-btn").setAttribute("aria-expanded", "false");
@@ -1992,6 +2197,7 @@ function autosize() { const t = $("#input"); t.style.height = "auto"; t.style.he
 function logout() { store.set("agent_token", null); S.token = null; closeSettings(); closeMenus(); $("#app").hidden = true; $("#login").hidden = false; }
 function toggleSidebar(open) { $("#sidebar").classList.toggle("open", open); $("#scrim").hidden = !open; }
 function toggleTasks(open = $("#tasks").hidden) {
+  if (open && S.preview) closePreview(); // сбоку — одна панель за раз
   $("#tasks").hidden = !open;
   $("#toggle-tasks").classList.toggle("on", open); $("#toggle-tasks").setAttribute("aria-expanded", String(open));
   // На узком экране панель — поверх чата: нужен фон, по которому её можно закрыть.
@@ -2067,7 +2273,7 @@ $("#settings-close").addEventListener("click", closeSettings);
 $("#settings").addEventListener("mousedown", e => { if (e.target.id === "settings") closeSettings(); });
 document.addEventListener("click", e => { if (!e.target.closest(".menu, #user-btn, .more")) closeMenus(); });
 $("#menu").addEventListener("click", () => toggleSidebar(true));
-$("#scrim").addEventListener("click", () => { toggleSidebar(false); if (!$("#tasks").hidden && innerWidth <= 960) toggleTasks(false); });
+$("#scrim").addEventListener("click", () => { toggleSidebar(false); if (!$("#tasks").hidden && innerWidth <= 960) toggleTasks(false); if (S.preview && innerWidth <= 960) closePreview(); });
 $("#session-filter").addEventListener("input", renderSessions);
 $("#toggle-tasks").addEventListener("click", () => { S.tasksShown = true; toggleTasks(); });
 $("#tasks-close").addEventListener("click", () => toggleTasks(false));
@@ -2079,6 +2285,7 @@ document.addEventListener("keydown", e => {
   if (e.key === "Escape") {
     if (!$("#user-menu").hidden || !$("#popover").hidden || !$("#model-pop").hidden || !$("#mode-pop").hidden) closeMenus();
     else if (!$("#settings").hidden) closeSettings();
+    else if (S.preview) closePreview();
     else toggleSidebar(false);
   }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); newChat(); }

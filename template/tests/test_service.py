@@ -332,3 +332,19 @@ def test_connect_scripts_and_device_actions(client):
     assert client.post(f"/api/devices/{did}/action", json={"op": "run", "args": {"command": "x"}}, headers=H).status_code == 400
     assert client.post(f"/api/devices/{did}/action", json={"op": "pick_folder"},
                        headers={"Authorization": "Bearer t-bob"}).status_code == 404
+
+
+def test_file_preview_for_word(client, tmp_path):
+    docx = pytest.importorskip("docx")
+    sid = client.post("/api/sessions", json={}, headers=H).json()["id"]
+    d = docx.Document()
+    d.add_heading("Отчёт", level=1)
+    d.add_paragraph("Поверок за октябрь: 412")
+    ws = tmp_path / "workspaces" / sid
+    ws.mkdir(parents=True, exist_ok=True)
+    d.save(ws / "отчёт.docx")
+    (ws / "x.bin").write_bytes(b"\0\1")
+    r = client.get(f"/api/sessions/{sid}/files/preview", params={"path": "отчёт.docx"}, headers=H).json()
+    assert r["kind"] == "doc" and r["blocks"][0] == {"type": "h", "level": 1, "text": "Отчёт"}
+    assert client.get(f"/api/sessions/{sid}/files/preview", params={"path": "x.bin"}, headers=H).status_code == 415
+    assert client.get(f"/api/sessions/{sid}/files/preview", params={"path": "../a.db"}, headers=H).status_code == 404

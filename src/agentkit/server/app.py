@@ -560,6 +560,48 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
             raise HTTPException(413, f"файл больше {svc.settings.max_upload_mb} МБ")
         return save_upload(_workspace(session_id), file.filename or "file", data, file.content_type or "")
 
+    @api.get("/sessions/{session_id}/files/preview")
+    async def preview(session_id: str, path: str, user: User = Depends(auth)):
+        """Excel и Word для панели предпросмотра: браузер их не показывает, отдаём таблицу или текст."""
+        await own_session(session_id, user)
+        ws = _workspace(session_id).resolve()
+        p = (ws / path).resolve()
+        if ws not in p.parents or not p.is_file():
+            raise HTTPException(404, "нет файла")
+        ext = p.suffix.lower()
+        try:
+            if ext == ".xlsx":
+                import openpyxl
+
+                wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
+                sheets = []
+                for ws_ in wb.worksheets[:10]:
+                    rows = []
+                    for row in ws_.iter_rows(values_only=True):
+                        if len(rows) >= 500:
+                            break
+                        rows.append(["" if v is None else str(v) for v in row])
+                    while rows and not any(rows[-1]):
+                        rows.pop()
+                    sheets.append({"name": ws_.title, "rows": rows})
+                return {"kind": "sheets", "sheets": sheets}
+            if ext == ".docx":
+                import docx
+
+                d = docx.Document(str(p))
+                blocks: list[dict[str, Any]] = []
+                for para in d.paragraphs:
+                    style = (para.style.name or "").lower() if para.style is not None else ""
+                    level = int(style.split()[-1]) if style.startswith("heading") and style.split()[-1].isdigit() else 0
+                    if para.text.strip():
+                        blocks.append({"type": "h" if level else "p", "level": level, "text": para.text})
+                for t in d.tables:
+                    blocks.append({"type": "table", "rows": [[c.text for c in r.cells] for r in t.rows][:300]})
+                return {"kind": "doc", "blocks": blocks}
+        except ImportError as e:
+            raise HTTPException(501, f"для предпросмотра нужен пакет {e.name}") from None
+        raise HTTPException(415, "для этого типа предпросмотра нет")
+
     @api.get("/sessions/{session_id}/files")
     async def download(session_id: str, path: str, user: User = Depends(auth)):
         await own_session(session_id, user)
