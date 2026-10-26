@@ -47,6 +47,7 @@ const S = {
   attachments: [],
   uploading: 0,
   queued: [],        // сообщения, отправленные во время работы агента
+  turnFiles: new Map(), // path → файл, созданный за текущий ответ; в ленту — по окончании ответа
 };
 
 // ── API ─────────────────────────────────────────────────────────────
@@ -152,7 +153,7 @@ function mcpChip(servers) {
 }
 
 function traceNew() {
-  const t = { steps: [], notes: 0, thoughts: 0, thought: null, mcp: new Set(), live: false, state: "thinking", t0: Date.now(), wall: 0 };
+  const t = { steps: [], notes: 0, thoughts: 0, thought: null, mcp: new Set(), live: false, state: "thinking", t0: Date.now(), wallMs: 0 };
   t.ic = h("span", { class: "trace-ic", "aria-hidden": "true" });
   t.label = h("span", { class: "trace-label", "aria-live": "polite" });
   t.chip = h("span", { class: "trace-chip" });
@@ -201,7 +202,7 @@ function traceRender(t) {
   if (errs) t.label.append(h("span", { class: "errs" }, ` · ${errs} ${plural(errs, "ошибка", "ошибки", "ошибок")}`));
   if (waiting) t.label.append(" · ждёт подтверждения");
   if (t.mcp.size) t.chip.append(mcpChip([...t.mcp].join(", ")));
-  const ms = t.wall ? t.wall * 1000 : t.steps.reduce((a, s) => a + (s.ms || 0), 0);
+  const ms = t.wallMs || t.steps.reduce((a, s) => a + (s.ms || 0), 0);
   t.time.textContent = ms ? secs(ms) : "";
 }
 
@@ -212,7 +213,7 @@ function traceLive() {
   t.time.textContent = "";
   clearInterval(S.workTimer);
   S.workTimer = setInterval(() => {
-    const s = Math.floor((Date.now() - t.t0) / 1000);
+    const s = Math.floor((t.wallMs + Date.now() - t.t0) / 1000);
     t.time.textContent = s < 3 ? "" : fmtDur(s);
   }, 1000);
   traceRender(t);
@@ -223,15 +224,54 @@ function traceState(state) {
   t.state = state;
   traceRender(t);
 }
-// Ход закрывается следующим сообщением человека или концом прогона. Шаги закрытого хода
-// ещё могут обновиться (действие подтвердили позже) — тогда перерисовывается его сводка.
-function traceClose() {
+// Конец прогона — пауза, а не конец хода: после подтверждения действия агент продолжает
+// новым прогоном, и без паузы ответ рассыпался бы на несколько строк «N действий».
+function tracePause() {
   const t = S.trace; if (!t) return;
-  S.trace = null;
-  if (t.live) { t.wall = Math.round((Date.now() - t.t0) / 1000); t.live = false; clearInterval(S.workTimer); }
+  if (t.live) { t.wallMs += Date.now() - t.t0; t.live = false; clearInterval(S.workTimer); }
   thoughtEnd(t);
-  if (!t.steps.length && !t.notes && !t.thoughts) { t.el.remove(); return; }
   traceRender(t);
+}
+// Ход закрывается следующим сообщением человека. Шаги закрытого хода ещё могут
+// обновиться (действие подтвердили позже) — тогда перерисовывается его сводка.
+function traceClose() {
+  tracePause();
+  const t = S.trace;
+  S.trace = null;
+  flushFiles();
+  if (t && !t.steps.length && !t.notes && !t.thoughts) t.el.remove();
+}
+
+// ── файлы ответа ────────────────────────────────────────────────────
+// В ленту попадают только файлы, которые остались к концу ответа: агент по ходу пишет
+// черновики и проверочные файлы и сам их удаляет — их карточки в чате были бы мусором.
+// Все файлы по-прежнему видны в ходе работы, у шага, который их создал.
+async function fileExists(path) {
+  const ctrl = new AbortController();
+  try {
+    const r = await fetch(`/api/sessions/${S.sessionId}/files?path=${encodeURIComponent(path)}`,
+      { headers: { Authorization: `Bearer ${S.token}` }, signal: ctrl.signal });
+    ctrl.abort(); // хватает заголовков — сам файл не качаем
+    return r.ok;
+  } catch { return false; }
+}
+// Карточки встают сразу (место в ленте — под ответом), а удалённые файлы потом убираются.
+function flushFiles({ open = false } = {}) {
+  const files = [...S.turnFiles.values()];
+  S.turnFiles = new Map();
+  if (!files.length) return;
+  const cards = files.map(f => { const c = fileCard(f); c.hidden = true; return [f, c]; });
+  const slot = add(h("div", { class: "msg assistant file-cards" }, cards.map(([, c]) => c)));
+  Promise.all(cards.map(async ([f, c]) => (await fileExists(f.path)) ? (c.hidden = false, f) : (c.remove(), null))).then(kept => {
+    kept = kept.filter(Boolean);
+    if (!kept.length) { slot.remove(); return; }
+    scroll();
+    // Готовый файл — сразу в панель сбоку (только вживую). Из нескольких — главный:
+    // документ важнее таблицы, таблица важнее картинки.
+    const rank = n => ["pdf", "html", "htm", "docx", "xlsx", "md", "csv", "svg", "png", "jpg", "jpeg", "webp"].indexOf(extOf(n));
+    const pick = kept.filter(f => AUTO_OPEN.has(extOf(f.name))).sort((a, b) => rank(a.name) - rank(b.name))[0];
+    if (open && pick) openPreview(pick);
+  });
 }
 
 // Промежуточная реплика перед действиями — в ход работы, а не в ленту.
@@ -425,7 +465,14 @@ function stepResult(id, content, isError, ui, ms) {
   step.detail.append(h("div", {}, h("div", { class: "label" }, isError ? "Ошибка" : "Результат", copyBtn(() => content || "")),
     h("pre", { class: isError ? "err" : "" }, content || "—")));
   setStepState(step, isError ? "err" : "ok");
-  for (const w of ui || []) widgetAfter(w);
+  for (const w of ui || []) {
+    // Визуализация — часть ответа, ей место в ленте. Остальное (таблицы, ссылки на
+    // превью, файлы) — рядом с результатом шага, в ходе работы.
+    if (step.silent || w.type === "visual") { widgetAfter(w); continue; }
+    const el = widget(w);
+    if (el) step.detail.append(el);
+    if (w.type === "files") for (const f of w.files || []) S.turnFiles.set(f.path, f);
+  }
 }
 function widgetAfter(w) {
   const el = widget(w);
@@ -476,6 +523,7 @@ function approvalCard(a) {
     a.reason ? h("div", { class: "reason" }, a.reason) : null,
     rows.length ? h("table", {}, h("tbody", {}, rows)) : null,
     h("div", { class: "actions" }, comment, no, yes));
+  card._call = a.tool_call_id;
   S.cards.set(a.approval_id, card);
   add(card);
   scroll(true); // карточка требует действия — она не должна оказаться под полем ввода
@@ -485,9 +533,12 @@ function approvalCard(a) {
 function closeCard(id, approved, expired) {
   const c = S.cards.get(id);
   if (!c) return;
-  c.classList.add("done");
-  c.querySelector(".actions")?.replaceWith(h("div", { class: "verdict " + (expired ? "" : approved ? "ok" : "no") },
-    icon(expired ? "x" : approved ? "check" : "x"), expired ? "Не выполнено — разговор пошёл дальше" : approved ? "Подтверждено" : "Отклонено"));
+  // Решение принято — карточке больше нечего делать в ленте: решение остаётся пометкой у шага.
+  S.cards.delete(id);
+  c.remove();
+  const step = S.steps.get(c._call);
+  step?.detail.prepend(h("div", { class: "verdict " + (expired ? "" : approved ? "ok" : "no") },
+    icon(expired ? "x" : approved ? "check" : "x"), expired ? "Не выполнено — разговор пошёл дальше" : approved ? "Подтверждено вами" : "Отклонено вами"));
 }
 
 function note(text) { add(h("div", { class: "note" }, text)); }
@@ -547,12 +598,6 @@ function onEvent(ev) {
     case "tool_call": stepRow(d.id, d.name, d.args, d.title, ev.agent); if (!ev.agent) traceState("tools"); break;
     case "tool_result": {
       stepResult(d.id, d.content, d.is_error, ev.agent ? [] : d.ui, d.elapsed_ms);
-      // Готовый файл — сразу в панель сбоку (только вживую, не при открытии старого разговора).
-      const files = (ev.agent ? [] : d.ui || []).filter(w => w.type === "files").flatMap(w => w.files || []);
-      // Из нескольких — главный: документ важнее таблицы, таблица важнее картинки.
-      const rank = n => ["pdf", "html", "htm", "docx", "xlsx", "md", "csv", "svg", "png", "jpg", "jpeg", "webp"].indexOf(extOf(n));
-      const pick = files.filter(f => AUTO_OPEN.has(extOf(f.name))).sort((a, b) => rank(a.name) - rank(b.name))[0];
-      if (pick && !d.is_error) openPreview(pick);
       break;
     }
     case "subagent_started": {
@@ -575,6 +620,7 @@ function onEvent(ev) {
       for (const step of S.steps.values()) if (step.state === "run") setStepState(step, "err");
       setRunning(false);
       const st = d.status;
+      if (st !== "waiting_approval") flushFiles({ open: st === "done" });
       if (st === "max_steps") note("Достигнут лимит шагов — напишите «продолжай»");
       else if (st === "cancelled") note("Остановлено");
       else if (st === "error" && d.error) alertMsg(d.error);
@@ -618,7 +664,7 @@ function setRunning(on) {
   // Отправка доступна и во время работы: сообщение встанет в очередь, агент прочтёт его между шагами.
   S.running = on;
   if (on) traceLive();
-  else { clearInterval(S.workTimer); traceClose(); }
+  else { clearInterval(S.workTimer); tracePause(); }
   $("#stop").hidden = !on;
   $("#input").placeholder = on ? "Дописать агенту, пока он работает…" : "Сообщение…";
   updateSend();
@@ -801,7 +847,7 @@ function emptyState() {
 
 function resetView() {
   S.stream?.abort();
-  S.steps.clear(); S.subs.clear(); S.cards.clear(); S.bubble = null; S.trace = null; S.lastSeq = 0; S.day = null; setCost(0);
+  S.steps.clear(); S.subs.clear(); S.cards.clear(); S.bubble = null; S.trace = null; S.turnFiles = new Map(); S.lastSeq = 0; S.day = null; setCost(0);
   box().replaceChildren(emptyState());
   S.tasksShown = false; renderTodos([]); toggleTasks(false); setRunning(false);
   S.queued = []; S.attachments = []; renderAttachments();
