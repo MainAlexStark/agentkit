@@ -31,6 +31,7 @@ from agentkit.runs import Busy
 from agentkit.scheduler import next_run, validate_cron
 from agentkit.server.auth import require_admin
 from agentkit.server.platform_api import register as register_platform
+from agentkit.server.preview import register as register_preview
 from agentkit.server.service import MCP_NAME, AgentService
 from agentkit.store.base import ScheduleRec
 from agentkit.tools.base import User
@@ -726,6 +727,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         return _oauth_page(True, f"{server} подключён")
 
     register_platform(api, app, svc, auth)
+    register_preview(app, svc)
     app.include_router(api)
     for r in extra_routers or []:
         app.include_router(r)

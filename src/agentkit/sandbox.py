@@ -23,7 +23,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -57,7 +59,9 @@ def _limits(mem_mb: int, cpu_s: int):
             import resource
 
             resource.setrlimit(resource.RLIMIT_AS, (mem_mb * 2**20, mem_mb * 2**20))
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu_s, cpu_s))
+            # Мягкий лимит, жёсткий не трогаем: ядро Python (agentkit.kernel) живёт дольше вызова
+            # и поднимает себе мягкий обратно — при жёстком = мягкому оно умирало бы через timeout секунд CPU.
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_s, resource.getrlimit(resource.RLIMIT_CPU)[1]))
             resource.setrlimit(resource.RLIMIT_FSIZE, (512 * 2**20, 512 * 2**20))
         except Exception:  # noqa: BLE001 — на macOS часть лимитов недоступна
             pass
@@ -96,8 +100,14 @@ class LocalBackend:
         work.mkdir(parents=True, exist_ok=True)
 
     def env(self, work: Path) -> dict[str, str]:
+        from agentkit.kernel import default_sock  # noqa: PLC0415
+
+        # Сокет ядра считает сервер, а не дочерний процесс: у того другое окружение (TMPDIR),
+        # и сервер потом не нашёл бы ядро, чтобы остановить его.
         return {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": str(work), "LANG": "C.UTF-8",
-                "MPLBACKEND": "Agg", "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1"}
+                "MPLBACKEND": "Agg", "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1",
+                "AK_KERNEL_SOCK": str(default_sock(work)),
+                **({"AK_KERNEL_IDLE": os.environ["AK_KERNEL_IDLE"]} if "AK_KERNEL_IDLE" in os.environ else {})}
 
     def exec(self, session: str, work: Path, argv: list[str], timeout: int, background: bool = False
              ) -> tuple[int | None, bytes, bytes]:
@@ -141,7 +151,8 @@ class DockerBackend:
 
     def __init__(self, image: str, *, volume: str = "", subpath: str = "workspaces", host_root: str = "",
                  network: str = "none", proxy: str = "", mem_mb: int = 2048, cpus: float = 1.0, pids: int = 256,
-                 idle_s: int = 900, uid: int = 1000, docker: str = "docker", runner: Runner = subprocess.run):
+                 idle_s: int = 900, uid: int = 1000, docker: str = "docker", runner: Runner = subprocess.run,
+                 egress_container: str = "", subnet_pool: str = "10.213.0.0/16"):
         if not image:
             raise ValueError("docker: нужен образ (--image / SANDBOX_IMAGE)")
         if not volume and not host_root:
@@ -150,6 +161,11 @@ class DockerBackend:
         self.network, self.proxy = network or "none", proxy
         self.mem_mb, self.cpus, self.pids, self.idle_s, self.uid = mem_mb, cpus, pids, idle_s, uid
         self.docker, self.runner = docker, runner
+        # Своя сеть у каждого разговора: в общей сети контейнеры разговоров видели бы друг друга
+        # (сервер, поднятый агентом одного пользователя, был бы открыт коду другого). В сети разговора —
+        # только его контейнер и egress (подключается к каждой с именем egress).
+        self.egress_container = egress_container
+        self.pool = ipaddress.ip_network(subnet_pool)
         self.last: dict[str, float] = {}
         self._locks: dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
@@ -157,6 +173,40 @@ class DockerBackend:
     @staticmethod
     def container(session: str) -> str:
         return f"ak-sb-{session}"
+
+    @staticmethod
+    def net_name(session: str) -> str:
+        return f"ak-sbn-{session}"
+
+    @property
+    def per_session_net(self) -> bool:
+        return bool(self.egress_container)
+
+    def _ensure_net(self, session: str) -> None:
+        net = self.net_name(session)
+        if self._run("network", "inspect", net, timeout=20).returncode != 0:
+            # Подсеть — своя /28 из пула: пулы docker по умолчанию кончаются примерно на 30 сетях,
+            # а разговоров одновременно бывает больше. Занятые подсети docker отвергает — берём следующую.
+            start = int(hashlib.sha1(session.encode()).hexdigest(), 16)
+            subnets = list(self.pool.subnets(new_prefix=28))
+            err = ""
+            for i in range(64):
+                sub = subnets[(start + i) % len(subnets)]
+                r = self._run("network", "create", "--internal", "--label", f"{LABEL}=1",
+                              "--label", f"{LABEL}.session={session}", "--subnet", str(sub), net, timeout=30)
+                if r.returncode == 0:
+                    break
+                err = (r.stderr or b"").decode("utf-8", "replace")
+                if "already exists" in err:
+                    break
+                if "overlap" not in err.lower():
+                    raise SandboxError(f"не создать сеть разговора: {err.strip()[-500:]}")
+            else:
+                raise SandboxError(f"не создать сеть разговора: нет свободной подсети в {self.pool} ({err.strip()})")
+        # Каждый раз, а не только при создании: пересозданный egress теряет подключения к сетям.
+        r = self._run("network", "connect", "--alias", "egress", net, self.egress_container, timeout=30)
+        if r.returncode != 0 and b"already exists" not in (r.stderr or b""):
+            self._check(r, "не подключить egress к сети разговора")
 
     def _run(self, *args: str, timeout: float = 60) -> subprocess.CompletedProcess:
         try:
@@ -202,7 +252,9 @@ class DockerBackend:
                 "--label", f"{LABEL}.session={session}", "--init", "--read-only",
                 "--tmpfs", "/tmp:rw,nosuid,size=512m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                 "--pids-limit", str(self.pids), "--memory", f"{self.mem_mb}m", "--memory-swap", f"{self.mem_mb}m",
-                "--cpus", str(self.cpus), "--network", self.network, "--user", f"{self.uid}:{self.uid}",
+                "--cpus", str(self.cpus),
+                "--network", self.net_name(session) if self.per_session_net else self.network,
+                "--user", f"{self.uid}:{self.uid}",
                 "--workdir", "/work", "--mount", self.mount(session)]
         for k, v in self.env().items():
             args += ["--env", f"{k}={v}"]
@@ -215,6 +267,8 @@ class DockerBackend:
     def ensure(self, session: str) -> str:
         name = self.container(session)
         with self._lock(session):
+            if self.per_session_net:
+                self._ensure_net(session)
             r = self._run("inspect", "--format", "{{.State.Running}}", name, timeout=20)
             if r.returncode == 0 and r.stdout.strip() == b"true":
                 pass
@@ -235,7 +289,9 @@ class DockerBackend:
         self.last[session] = time.monotonic()
         code, out, err = r.returncode, r.stdout or b"", r.stderr or b""
         if code == 124 or (code == 137 and time.monotonic() - t0 >= timeout):
-            return None, out, err + f"\nпрервано: дольше {timeout} с".encode()
+            if "прервано".encode() not in err:  # ядро Python уже написало, что прервано и что сброшено
+                err += f"\nпрервано: дольше {timeout} с".encode()
+            return None, out, err
         if code == 137:
             err += f"\nпроцесс убит (137) — скорее всего, не хватило памяти: лимит {self.mem_mb} МБ".encode()
         return code, out, err
@@ -243,13 +299,22 @@ class DockerBackend:
     def reset(self, session: str) -> None:
         with self._lock(session):
             self._run("rm", "-f", self.container(session), timeout=60)
+            if self.per_session_net:
+                net = self.net_name(session)
+                self._run("network", "disconnect", "-f", net, self.egress_container, timeout=30)
+                self._run("network", "rm", net, timeout=30)
             self.last.pop(session, None)
 
     def adopt(self) -> None:
         """После перезапуска сервера: живые контейнеры считаем только что использованными, а не сиротами."""
-        r = self._run("ps", "-a", "--filter", f"label={LABEL}=1", "--format", f'{{{{.Label "{LABEL}.session"}}}}')
+        fmt = f'{{{{.Label "{LABEL}.session"}}}}'
+        r = self._run("ps", "-a", "--filter", f"label={LABEL}=1", "--format", fmt)
+        found = (r.stdout or b"").decode().split()
+        if self.per_session_net:  # сеть без контейнера (сервер упал между шагами) — тоже подберёт уборка
+            found += (self._run("network", "ls", "--filter", f"label={LABEL}=1", "--format", fmt).stdout
+                      or b"").decode().split()
         now = time.monotonic()
-        for s in (r.stdout or b"").decode().split():
+        for s in found:
             if SESSION_RE.match(s):
                 self.last.setdefault(s, now)
 
@@ -266,7 +331,8 @@ class DockerBackend:
             self.reset(s)
 
     def info(self) -> dict[str, Any]:
-        return {"backend": self.name, "image": self.image, "network": self.network, "proxy": bool(self.proxy),
+        return {"backend": self.name, "image": self.image,
+                "network": "своя у разговора" if self.per_session_net else self.network, "proxy": bool(self.proxy),
                 "isolated": True, "containers": len(self.last)}
 
 
@@ -276,7 +342,10 @@ Backend = LocalBackend | DockerBackend
 # ── выполнение ───────────────────────────────────────────────────────
 
 def execute(root: Path, session: str, kind: str, code: str, timeout: int, mem_mb: int = 2048, *,
-            background: bool = False, backend: Backend | None = None) -> dict[str, Any]:
+            background: bool = False, backend: Backend | None = None, kernel: bool = True,
+            reset: bool = False) -> dict[str, Any]:
+    """kernel=True (по умолчанию) — Python выполняется в ядре разговора и помнит переменные;
+    False — отдельным процессом с нуля (как раньше)."""
     if not SESSION_RE.match(session):
         raise ValueError("неверный id сессии")
     backend = backend or LocalBackend(mem_mb)
@@ -294,6 +363,9 @@ def execute(root: Path, session: str, kind: str, code: str, timeout: int, mem_mb
             script = work / f".run_{job}.py"
         script.write_text(code, encoding="utf-8")
         prog = [backend.python, script.relative_to(work).as_posix()]
+        if kernel and not background:
+            prog = [backend.python, "-m", "agentkit.kernel", "run", script.relative_to(work).as_posix(), str(timeout),
+                    *(["--reset"] if reset else [])]
     elif kind == "bash":
         # -c, а не -lc: login-shell перечитывает /etc/profile и затирает PATH с ~/.local/bin (pip --user)
         prog = ["bash", "-c", code]
@@ -308,12 +380,17 @@ def execute(root: Path, session: str, kind: str, code: str, timeout: int, mem_mb
         argv, timeout = ["bash", "-c", launcher], min(timeout, 30)
     else:
         argv = prog
+    in_kernel = kind == "python" and kernel and not background
     t0 = time.monotonic()
     try:
-        code_, out, err = backend.exec(session, work, argv, timeout, background)
+        # У ядра свой таймаут (клиент убивает зависшую ячейку и говорит, что состояние сброшено);
+        # внешний — с запасом на старт ядра, только на случай, если завис сам клиент.
+        code_, out, err = backend.exec(session, work, argv, timeout + 25 if in_kernel else timeout, background)
     finally:
         if script and not background:
             script.unlink(missing_ok=True)
+    if in_kernel and code_ == 124:
+        code_ = None
     after = _snapshot(work)
     changed = [{"path": p, "size": after[p][1], "new": p not in before} for p in sorted(after)
                if before.get(p) != after[p]]
@@ -376,7 +453,7 @@ def serve(root: Path, host: str, port: int, token: str, backend: Backend | None 
                     return self._send(200, {"ok": True})
                 res = execute(root, session, str(body.get("kind", "")), str(body.get("code", "")),
                               int(body.get("timeout") or 60), background=bool(body.get("background")),
-                              backend=backend)
+                              backend=backend, reset=bool(body.get("reset")))
             except ValueError as e:
                 return self._send(400, {"error": str(e)})
             except SandboxError as e:
@@ -407,6 +484,9 @@ def main(argv: list[str] | None = None) -> None:
     d.add_argument("--subpath", default=e("SANDBOX_SUBPATH", "workspaces"), help="подпапка тома")
     d.add_argument("--host-root", default=e("SANDBOX_HOST_ROOT", ""), help="или папка на машине с docker")
     d.add_argument("--network", default=e("SANDBOX_NETWORK", "none"), help="сеть контейнеров (none — без сети)")
+    d.add_argument("--egress-container", default=e("SANDBOX_EGRESS_CONTAINER", ""),
+                   help="контейнер egress: если задан — у каждого разговора своя сеть, egress подключается к ней")
+    d.add_argument("--subnet-pool", default=e("SANDBOX_SUBNET_POOL", "10.213.0.0/16"), help="подсети для сетей разговоров")
     d.add_argument("--proxy", default=e("SANDBOX_PROXY", ""), help="http://egress:3128 — выход в интернет")
     d.add_argument("--cpus", type=float, default=float(e("SANDBOX_CPUS", "1")))
     d.add_argument("--pids", type=int, default=int(e("SANDBOX_PIDS", "256")))
@@ -416,7 +496,7 @@ def main(argv: list[str] | None = None) -> None:
     if a.backend == "docker":
         backend = DockerBackend(a.image, volume=a.volume, subpath=a.subpath, host_root=a.host_root,
                                 network=a.network, proxy=a.proxy, mem_mb=a.memory, cpus=a.cpus, pids=a.pids,
-                                idle_s=a.idle * 60)
+                                idle_s=a.idle * 60, egress_container=a.egress_container, subnet_pool=a.subnet_pool)
     else:
         backend = LocalBackend(a.memory)
     serve(Path(a.root), a.host, a.port, a.token, backend)

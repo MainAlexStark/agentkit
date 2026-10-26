@@ -376,6 +376,7 @@ function widget(w) {
   }
   if (w.type === "visual") return h("div", { class: "msg assistant viz-msg" }, VIZ.render(w));
   if (w.type === "files") return h("div", { class: "msg assistant file-cards" }, (w.files || []).map(fileCard));
+  if (w.type === "link") return h("div", { class: "msg assistant file-cards" }, linkCard(w));
   if (w.type === "choices") return null; // вопрос рисуется по событию ask_user
   return null;
 }
@@ -1928,6 +1929,14 @@ function fileCard(f) {
     h("span", { class: "fc-text" }, h("b", {}, f.name), h("small", {}, [label, humanSize(f.size)].filter(Boolean).join(" · "))),
     kind ? h("span", { class: "fc-open" }, "Открыть") : null,
     h("button", { class: "icon-btn fc-dl", type: "button", title: "Скачать", "aria-label": "Скачать", onclick: () => downloadFile(f) }, icon("download")));
+}
+
+// Сервер, поднятый агентом в песочнице (sandbox_preview): ссылка подписана, открывается в новой вкладке.
+function linkCard(w) {
+  return h("a", { class: "file-card can link-card", href: w.url, target: "_blank", rel: "noopener noreferrer" },
+    h("span", { class: "ftile ft-html" }, "WEB"),
+    h("span", { class: "fc-text" }, h("b", {}, w.title || "Открыть"), h("small", {}, w.hint || w.url)),
+    h("span", { class: "fc-open" }, "Открыть ↗"));
 }
 
 S.preview = null;

@@ -56,11 +56,39 @@ class FakeDocker:
         self.calls: list[list[str]] = []
         self.running: set[str] = set()
         self.exec_code = 0
+        self.networks: dict[str, str] = {}
+        self.connected: set[str] = set()
+        self.busy_subnets: set[str] = set()
+
+    def network(self, cmd):
+        ok = subprocess.CompletedProcess(cmd, 0, b"", b"")
+        sub, name = cmd[2], cmd[-1]
+        if sub == "inspect":
+            return ok if name in self.networks else subprocess.CompletedProcess(cmd, 1, b"", b"not found")
+        if sub == "create":
+            subnet = cmd[cmd.index("--subnet") + 1]
+            if subnet in self.busy_subnets:
+                return subprocess.CompletedProcess(cmd, 1, b"", b"Pool overlaps with other one on this address space")
+            self.networks[name] = subnet
+        elif sub == "connect":
+            net = cmd[-2]
+            if net in self.connected:
+                return subprocess.CompletedProcess(cmd, 1, b"", b"endpoint with name egress already exists")
+            self.connected.add(net)
+        elif sub == "disconnect":
+            self.connected.discard(cmd[-2])
+        elif sub == "rm":
+            self.networks.pop(name, None)
+        elif sub == "ls":
+            return subprocess.CompletedProcess(cmd, 0, b"", b"")
+        return ok
 
     def __call__(self, cmd, **kw):
         self.calls.append(cmd)
         op = cmd[1]
         ok = subprocess.CompletedProcess(cmd, 0, b"", b"")
+        if op == "network":
+            return self.network(cmd)
         if op == "inspect":
             return (subprocess.CompletedProcess(cmd, 0, b"true\n", b"") if cmd[-1] in self.running
                     else subprocess.CompletedProcess(cmd, 1, b"", b"No such object"))
@@ -90,7 +118,10 @@ def test_docker_backend_container_per_session(tmp_path):
     assert run[run.index("--network") + 1] == "agent-sandbox-net"
     assert "HTTPS_PROXY=http://egress:3128" in run and "PIP_USER=1" in run
     ex = next(c for c in fake.calls if c[1] == "exec")
-    assert ex[ex.index("ak-sb-s_1") + 1:ex.index("ak-sb-s_1") + 5] == ["timeout", "-k", "5", "30"]
+    # Python — через ядро разговора: у клиента свой таймаут (30), у docker exec — с запасом на старт ядра
+    i = ex.index("ak-sb-s_1")
+    assert ex[i + 1:i + 5] == ["timeout", "-k", "5", "55"] and ex[i + 5:i + 10] == [
+        "python", "-m", "agentkit.kernel", "run", ex[i + 9]] and ex[i + 10] == "30"
     # второй вызов — тот же контейнер, без нового run
     execute(tmp_path, "s_1", "bash", "ls", 30, backend=b)
     assert sum(c[1] == "run" for c in fake.calls) == 1
@@ -105,6 +136,83 @@ def test_docker_backend_container_per_session(tmp_path):
     assert "s_old" in b.last
     gone = b.reap(now=time.monotonic() + 120)
     assert set(gone) == {"s_1", "s_2", "s_old"} and not fake.running
+
+
+def test_docker_backend_network_per_session(tmp_path):
+    import hashlib
+    import ipaddress
+
+    fake = FakeDocker()
+    b = DockerBackend("img", volume="v", proxy="http://egress:3128", egress_container="agent-service-egress",
+                      subnet_pool="10.213.0.0/16", runner=fake)
+    # первая по счёту подсеть занята (чужая сеть на машине) — берётся следующая
+    subnets = list(ipaddress.ip_network("10.213.0.0/16").subnets(new_prefix=28))
+    first = subnets[int(hashlib.sha1(b"s_1").hexdigest(), 16) % len(subnets)]
+    fake.busy_subnets.add(str(first))
+    execute(tmp_path, "s_1", "bash", "ls", 30, backend=b)
+    execute(tmp_path, "s_2", "bash", "ls", 30, backend=b)
+    assert set(fake.networks) == {"ak-sbn-s_1", "ak-sbn-s_2"} and fake.networks["ak-sbn-s_1"] != str(first)
+    assert ipaddress.ip_network(fake.networks["ak-sbn-s_1"]).subnet_of(ipaddress.ip_network("10.213.0.0/16"))
+    create = next(c for c in fake.calls if c[1:3] == ["network", "create"])
+    assert "--internal" in create
+    run = next(c for c in fake.calls if c[1] == "run" and "ak-sb-s_1" in c)
+    assert run[run.index("--network") + 1] == "ak-sbn-s_1"  # не общая сеть
+    connect = next(c for c in fake.calls if c[1:3] == ["network", "connect"])
+    assert connect[3:5] == ["--alias", "egress"] and connect[-1] == "agent-service-egress"
+    # повторный вызов: egress уже подключён — это не ошибка
+    execute(tmp_path, "s_1", "bash", "ls", 30, backend=b)
+    b.reset("s_1")
+    assert "ak-sbn-s_1" not in fake.networks and "ak-sbn-s_1" not in fake.connected
+
+
+@pytest.fixture
+def kernels(tmp_path):
+    from agentkit.kernel import _kill, default_sock
+
+    yield
+    for d in tmp_path.iterdir():
+        if d.is_dir():
+            _kill(default_sock(d))
+
+
+@posix_only
+def test_kernel_keeps_state_between_calls(tmp_path, kernels):
+    run = lambda code, **kw: execute(tmp_path, "s_k", "python", code, kw.pop("timeout", 30), **kw)  # noqa: E731
+    first = run("import math\nrows = [1, 2, 3]\nprint('загружено', len(rows))")
+    assert first["exit_code"] == 0 and "загружено 3" in first["stdout"]
+    again = run("rows.append(4)\nsum(rows) * math.pi > 30")  # переменные живы, последнее выражение печатается
+    assert again["exit_code"] == 0 and again["stdout"].strip() == "True"
+    err = run("1 / 0")
+    assert err["exit_code"] == 1 and "ZeroDivisionError" in err["stderr"] and "agentkit" not in err["stderr"]
+    assert "1 / 0" in err["stderr"]  # строка ячейки в traceback
+    assert run("print(len(rows))")["stdout"].strip() == "4"  # ошибка ячейки ядро не роняет
+    assert run("raise SystemExit(3)")["exit_code"] == 3
+    # зависшая ячейка: таймаут, ядро остановлено, переменных больше нет — и вывод это говорит
+    hung = run("import time\ntime.sleep(30)", timeout=1)
+    assert hung["exit_code"] is None and "переменные сброшены" in hung["stderr"]
+    lost = run("print(rows)")
+    assert lost["exit_code"] == 1 and "NameError" in lost["stderr"]
+    run("x = 1")
+    fresh = run("print('x' in dir())", reset=True)
+    assert fresh["stdout"].strip() == "False" and "перезапущено" in fresh["stderr"]
+    # старый режим — отдельный процесс с нуля
+    run("y = 5")
+    assert execute(tmp_path, "s_k", "python", "print(y)", 30, kernel=False)["exit_code"] == 1
+
+
+@posix_only
+def test_kernel_reports_when_it_died(tmp_path, kernels):
+    import os
+    import signal
+
+    from agentkit.kernel import default_sock
+
+    execute(tmp_path, "s_d", "python", "z = 1", 30)
+    pid = int(Path(f"{default_sock(tmp_path / 's_d')}.pid").read_text())
+    os.kill(pid, signal.SIGKILL)
+    time.sleep(0.2)
+    r = execute(tmp_path, "s_d", "python", "print('жив')", 30)
+    assert r["exit_code"] == 0 and "жив" in r["stdout"] and "потеряны" in r["stderr"]
 
 
 def test_docker_backend_bind_mount_for_laptop(tmp_path):
@@ -212,3 +320,113 @@ def test_workspace_edits_skip_approval_but_not_plan_mode():
     assert p.check(write_file, {"path": "a.html", "content": ""}).decision == Decision.ALLOW
     assert p.with_mode(Mode.PLAN).check(write_file, {"path": "a", "content": ""}).decision == Decision.DENY
     assert Permissions().check(write_file, {"path": "a", "content": ""}).decision == Decision.ASK
+
+
+# ── превью серверов песочницы ────────────────────────────────────────
+
+def _http_server():
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    seen: dict = {}
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen["headers"] = dict(self.headers)
+            seen["path"] = self.path
+            if self.path.startswith("/go"):
+                self.send_response(302)
+                self.send_header("Location", "/login")
+                self.end_headers()
+                return
+            body = "<h1>отчёт</h1>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Set-Cookie", "sid=1; Path=/")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, seen
+
+
+async def test_preview_link_proxies_with_sandbox_csp():
+    import httpx
+    from fastapi import FastAPI
+
+    from agentkit.server.preview import SandboxPreview, register
+
+    srv, seen = _http_server()
+    port = srv.server_address[1]
+    pv = SandboxPreview(b"k" * 32, public_url="http://agent.test", sandbox_url="local")
+    svc = type("Svc", (), {"preview": pv})()
+    app = FastAPI()
+    register(app, svc)
+    link = pv.link("s_1", port, "/report?x=1")
+    assert link.startswith("http://agent.test/sandbox/p/") and pv.verify(link.split("/")[5]) == ("s_1", port)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://agent.test") as c:
+        r = await c.get(link.removeprefix("http://agent.test"), headers={"Cookie": "chat=secret",
+                                                                          "Authorization": "Bearer tok"})
+        assert r.status_code == 200 and "отчёт" in r.text
+        # страница с пустым origin: не достанет токен чата; куки и токен человека наверх не ушли
+        assert r.headers["content-security-policy"].startswith("sandbox") and "allow-same-origin" not in \
+            r.headers["content-security-policy"]
+        assert "set-cookie" not in r.headers
+        assert "Cookie" not in seen["headers"] and "Authorization" not in seen["headers"]
+        assert seen["path"] == "/report?x=1"
+        sig = link.split("/")[5]
+        red = await c.get(f"/sandbox/p/{sig}/go")
+        assert red.status_code == 302 and red.headers["location"] == f"/sandbox/p/{sig}/login"
+        # подделка, чужой порт, просрочка
+        assert (await c.get(f"/sandbox/p/{sig[:-2]}xx/")).status_code == 403
+        old = pv.sign("s_1", port, ttl=-1)
+        assert (await c.get(f"/sandbox/p/{old}/")).status_code == 403
+        srv.shutdown()
+        srv.server_close()
+        dead = await c.get(f"/sandbox/p/{sig}/")
+        assert dead.status_code == 502 and "ничего не отвечает" in dead.text
+    assert await pv.check("s_1", port) is not None
+    await pv.client.aclose()
+
+
+async def test_sandbox_preview_tool_card(store, tmp_path):
+    class FakePreview:
+        async def check(self, session, port):
+            return None if port == 8000 else f"на порту {port} ничего не слушает"
+
+        def link(self, session, port, path="/"):
+            return f"http://agent.test/sandbox/p/sig-{session}-{port}{path}"
+
+    tools = {t.name: t for t in sandbox_tools("http://sandbox:8090", preview=FakePreview())}
+    ctx = ctx_for(store, tmp_path / "s_7")
+    ok = await tools["sandbox_preview"].call({"port": 8000, "title": "Дашборд"}, ctx)
+    assert not ok.is_error and ok.ui[0] == {"type": "link", "url": "http://agent.test/sandbox/p/sig-s_7-8000/",
+                                            "title": "Дашборд", "hint": "Компьютер агента · открыть в новой вкладке"}
+    bad = await tools["sandbox_preview"].call({"port": 9000}, ctx)
+    assert bad.is_error and "0.0.0.0" in bad.content and "background" in bad.content
+    assert "sandbox_preview" not in {t.name for t in sandbox_tools("http://sandbox:8090")}
+
+
+async def test_egress_reverse_needs_token_and_sandbox_target():
+    eg = Egress([], token="t0k", log=lambda m: None)
+    srv = await asyncio.start_server(eg.handle_reverse, "127.0.0.1", 0)
+    port = srv.sockets[0].getsockname()[1]
+
+    async def ask(headers: str) -> bytes:
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(f"GET / HTTP/1.1\r\nHost: x\r\n{headers}\r\n".encode())
+        await w.drain()
+        data = await asyncio.wait_for(r.read(), 5)
+        w.close()
+        return data
+
+    assert (await ask("X-Sandbox-Target: ak-sb-s_1:8000\r\n")).startswith(b"HTTP/1.1 401")
+    # к базе, Redis и прочему — нельзя: цель только контейнер разговора
+    assert (await ask("X-Sandbox-Token: t0k\r\nX-Sandbox-Target: postgres:5432\r\n")).startswith(b"HTTP/1.1 400")
+    assert (await ask("X-Sandbox-Token: t0k\r\nX-Sandbox-Target: ak-sb-s_1:8000\r\n")).startswith(b"HTTP/1.1 502")
+    srv.close()

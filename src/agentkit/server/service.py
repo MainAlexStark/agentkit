@@ -123,6 +123,7 @@ class AgentService:
         self.projects: ProjectLibrary | None = None
         self.mcp_all: list[MCPServerConfig] = []  # вместе с выключенными — для списка в настройках
         self.mcp_file_names: set[str] = set()
+        self.preview: Any = None  # SandboxPreview — ссылки на серверы, поднятые агентом в песочнице
 
     async def start(self) -> None:
         s = self.settings
@@ -145,6 +146,10 @@ class AgentService:
         self.runs = RunManager(self.store, self.bus)
         self.runs.on_idle = self._drain_inbox
         await self._fail_orphans()
+        if s.sandbox_url:
+            from agentkit.server.preview import SandboxPreview  # noqa: PLC0415
+
+            self.preview = await SandboxPreview.create(s, self.store)
         await self._build_agent()
         # Планировщик создаётся всегда — «Запустить сейчас» работает и при выключенном
         # AGENT_SCHEDULER; тикать по расписанию он начинает только если включён.
@@ -205,7 +210,8 @@ class AgentService:
         if self.devices:
             out += device_tools(self.devices)
         if s.sandbox_url:
-            out += sandbox_tools(s.sandbox_url, s.sandbox_token, egress=s.sandbox_egress)
+            pv = self.preview if self.preview is not None and self.preview.available else None
+            out += sandbox_tools(s.sandbox_url, s.sandbox_token, egress=s.sandbox_egress, preview=pv)
         return out
 
     # ── MCP-серверы: из mcp.json и добавленные в настройках ──────────

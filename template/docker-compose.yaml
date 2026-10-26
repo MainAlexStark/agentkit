@@ -37,7 +37,7 @@ services:
   # Компьютер агента (run_python / run_bash): сервер, который держит по контейнеру на разговор.
   # Ему — и только ему — дан docker.sock: сервис агента сокета не видит, а код разговоров
   # работает в отдельных контейнерах (uid 1000, без capabilities, только своя папка /work,
-  # сеть agent-sandbox-net без выхода наружу, кроме egress).
+  # своя сеть ak-sbn-<сессия> без выхода наружу: в ней только этот контейнер и egress).
   sandbox:
     build:
       context: .
@@ -54,7 +54,7 @@ services:
       SANDBOX_IMAGE: agent-service-sandbox:latest
       SANDBOX_VOLUME: agent-service_data
       SANDBOX_SUBPATH: workspaces
-      SANDBOX_NETWORK: agent-sandbox-net
+      SANDBOX_EGRESS_CONTAINER: agent-service-egress
       SANDBOX_PROXY: http://egress:3128
     depends_on:
       agent-service:
@@ -82,7 +82,8 @@ services:
       - sandbox
 
   # Единственный выход контейнеров разговоров в интернет: домены из AGENT_SANDBOX_EGRESS
-  # (deploy.sh кладёт список в deploy/sandbox.env), внутренние адреса — никогда.
+  # (deploy.sh кладёт список в deploy/sandbox.env), внутренние адреса — никогда. Сервер песочницы
+  # подключает egress к сети каждого разговора; порт 3129 (с токеном) — обратная дорога для превью.
   egress:
     build:
       context: .
@@ -100,7 +101,7 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
     networks:
-      - sandbox-net
+      - sandbox
       - egress
 
   postgres:
@@ -149,12 +150,8 @@ networks:
   mcp-network:
     external: true
   internal:
-  # Агент ↔ сервер песочницы. internal: true — без выхода в интернет.
+  # Агент ↔ сервер песочницы и превью egress. internal: true — без выхода в интернет.
+  # Контейнеры разговоров сюда не входят: у каждого своя сеть (ak-sbn-<сессия>), её создаёт сервер песочницы.
   sandbox:
-    internal: true
-  # Контейнеры разговоров ↔ egress. Имя фиксировано: его называет сервер песочницы при docker run.
-  # Сервиса агента и базы в этой сети нет — код разговора до них не дотянется.
-  sandbox-net:
-    name: agent-sandbox-net
     internal: true
   egress:

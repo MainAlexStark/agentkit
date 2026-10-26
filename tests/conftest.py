@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from agentkit import Agent, AgentConfig, AgentSpec, FakeLLM, ModelRouter, SQLStore, User, standard_tools
@@ -8,6 +10,10 @@ from agentkit.llm.router import RetryPolicy
 
 async def _nosleep(_: float) -> None:
     return None
+
+
+# Ядра Python из тестов песочницы (agentkit.kernel) не должны жить после прогона.
+os.environ.setdefault("AK_KERNEL_IDLE", "15")
 
 
 @pytest.fixture

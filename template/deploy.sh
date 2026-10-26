@@ -61,6 +61,7 @@ prepare_extra() {
   # придумывается один раз. Интернет песочницы — по списку доменов; по умолчанию только PyPI,
   # чтобы работал pip install. Пустое значение — без интернета совсем.
   env_set "${PREFIX}_SANDBOX_URL" "http://sandbox:8090"
+  env_set "${PREFIX}_SANDBOX_PREVIEW_URL" "http://egress:3129"
   local sb_token
   sb_token="$(env_get "${PREFIX}_SANDBOX_TOKEN")"
   if [ -z "$sb_token" ]; then

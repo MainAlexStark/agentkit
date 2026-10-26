@@ -1069,6 +1069,8 @@ button.link:hover { text-decoration: underline; }
 .file-cards { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px auto 14px; }
 .file-card { display: flex; align-items: center; gap: 12px; min-width: 260px; max-width: 420px; flex: 0 1 auto; padding: 10px 10px 10px 10px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); text-align: left; color: var(--text); transition: border-color .12s, box-shadow .12s; }
 .file-card.can { cursor: pointer; }
+a.link-card { text-decoration: none; }
+a.link-card .fc-open { opacity: 1; }
 .file-card.can:hover { border-color: var(--line-2); box-shadow: var(--shadow-1), 0 4px 14px rgba(0,0,0,.06); }
 .fc-text { flex: 1; min-width: 0; display: grid; }
 .fc-text b { font-size: 13.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

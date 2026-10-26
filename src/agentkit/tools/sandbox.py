@@ -36,12 +36,15 @@ def network_note(url: str, egress: str) -> str:
             "пакеты и файлы сохраняются в разговоре.")
 
 
-def sandbox_tools(url: str, token: str = "", *, client: httpx.AsyncClient | None = None, egress: str = ""
-                  ) -> list[Tool]:
+def sandbox_tools(url: str, token: str = "", *, client: httpx.AsyncClient | None = None, egress: str = "",
+                  preview: Any = None) -> list[Tool]:
+    """preview — объект с link(session, port, path) и async check(session, port) (server/preview.py);
+    без него sandbox_preview не выдаётся."""
     base = url.rstrip("/")
     local = url == "local"
 
-    async def call(ctx: ToolContext, kind: str, code: str, timeout: int, background: bool = False) -> ToolResult:
+    async def call(ctx: ToolContext, kind: str, code: str, timeout: int, background: bool = False,
+                   reset: bool = False) -> ToolResult:
         # Папка разговора — та же, что у файловых инструментов: у субагента она своя, и имя
         # папки, а не session_id, гарантирует, что run_python видит файлы, записанные write_file.
         session = ctx.workspace.name if ctx.workspace is not None else ctx.session_id
@@ -52,11 +55,13 @@ def sandbox_tools(url: str, token: str = "", *, client: httpx.AsyncClient | None
 
             root = ctx.workspace.parent if ctx.workspace is not None else Path("data/workspaces")
             try:
-                d = await asyncio.to_thread(execute, root, session, kind, code, timeout, background=background)
+                d = await asyncio.to_thread(execute, root, session, kind, code, timeout, background=background,
+                                            reset=reset)
             except (ValueError, OSError) as e:
                 return ToolResult.error(f"песочница: {e}")
             return _result(d)
-        payload = {"session": session, "kind": kind, "code": code, "timeout": timeout, "background": background}
+        payload = {"session": session, "kind": kind, "code": code, "timeout": timeout, "background": background,
+                   "reset": reset}
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         try:
             if client is not None:
@@ -79,7 +84,9 @@ def sandbox_tools(url: str, token: str = "", *, client: httpx.AsyncClient | None
         "Выполняет код Python на твоём компьютере в песочнице. Текущая папка — рабочая папка разговора: "
         "вложения пользователя (uploads/) и всё, что ты создал (в том числе write_file). Есть pandas, numpy, "
         "matplotlib, openpyxl, python-docx, reportlab, pillow, pypdf. " + net + " Созданные файлы человек "
-        "сразу видит и может скачать. Переменные между вызовами не сохраняются — только файлы. "
+        "сразу видит и может скачать. Это ядро, как в Jupyter: переменные, импорты и загруженные данные "
+        "сохраняются между вызовами (последнее выражение печатается само) — не перечитывай файлы заново. "
+        "reset=true — начать с чистого листа. Если ядро перезапустилось, вывод об этом скажет. "
         "Используй, чтобы посчитать, проверить код или файл, построить график, собрать документ.")
     bash_doc = (
         "Выполняет команду bash в песочнице в рабочей папке разговора. " + net + " "
@@ -91,8 +98,9 @@ def sandbox_tools(url: str, token: str = "", *, client: httpx.AsyncClient | None
         ctx: ToolContext,
         code: Annotated[str, "Программа на Python 3. Печатай результат через print; файлы сохраняй в текущую папку"],
         timeout: Annotated[int, "Сколько ждать, секунд (до 600)"] = 120,
+        reset: Annotated[bool, "Перезапустить ядро перед выполнением: все переменные сбросятся"] = False,
     ) -> ToolResult:
-        return await call(ctx, "python", code, max(1, min(timeout, 600)))
+        return await call(ctx, "python", code, max(1, min(timeout, 600)), reset=reset)
 
     @tool(title="Команда в песочнице", description=bash_doc, read_only=not local, concurrency_safe=False, group="sandbox", source="builtin",
           timeout=660)
@@ -104,7 +112,37 @@ def sandbox_tools(url: str, token: str = "", *, client: httpx.AsyncClient | None
     ) -> ToolResult:
         return await call(ctx, "bash", command, max(1, min(timeout, 600)), background)
 
-    return [run_python, run_bash]
+    tools = [run_python, run_bash]
+    if preview is not None:
+        host = "127.0.0.1 или 0.0.0.0" if local else "0.0.0.0 (не 127.0.0.1 — иначе снаружи контейнера не видно)"
+
+        @tool(title="Открыть сервер человеку", read_only=True, group="sandbox", source="builtin", timeout=30,
+              description="Даёт человеку ссылку на сервер, который ты запустил в песочнице: сайт, дашборд "
+                          "(Streamlit, Dash), API. Сначала запусти сервер run_bash(background=true) на хосте "
+                          f"{host}, потом вызови это с его портом. Ссылка живёт 8 часов, видна только этот "
+                          "разговор и этот порт; относительные пути работают, абсолютные (/static/…) — нет, "
+                          "WebSocket не проксируется — Streamlit и Gradio не заработают, бери Flask, Dash, FastAPI "
+                          "или статику (python -m http.server).")
+        async def sandbox_preview(
+            ctx: ToolContext,
+            port: Annotated[int, "Порт сервера в песочнице"],
+            path: Annotated[str, "Страница, например / или /report"] = "/",
+            title: Annotated[str, "Подпись на карточке"] = "",
+        ) -> ToolResult:
+            if not 0 < port < 65536:
+                return ToolResult.error("порт — от 1 до 65535")
+            session = ctx.workspace.name if ctx.workspace is not None else ctx.session_id
+            if problem := await preview.check(session, port):
+                return ToolResult.error(f"{problem}. Запусти сервер run_bash(background=true) на хосте {host} "
+                                        "и проверь лог в .jobs/.")
+            url = preview.link(session, port, path)
+            return ToolResult(content=f"Ссылка для человека: {url}\nОна уже показана карточкой — "
+                                      "в ответе можно не повторять.",
+                              ui=[{"type": "link", "url": url, "title": title or f"Сервер на порту {port}",
+                                   "hint": "Компьютер агента · открыть в новой вкладке"}])
+
+        tools.append(sandbox_preview)
+    return tools
 
 
 def _result(d: dict[str, Any]) -> ToolResult:
