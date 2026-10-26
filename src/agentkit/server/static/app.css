@@ -883,11 +883,27 @@ button.link:hover { text-decoration: underline; }
 .share-add .mini-select { height: 32px; }
 
 /* ── компьютер ─────────────────────────────────────────────────────── */
-.device-chip { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 9px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--text-2); font-size: 12px; cursor: pointer; max-width: 180px; }
-.device-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.device-chip svg { width: 14px; height: 14px; color: var(--muted); }
-.device-chip i { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent); flex: none; }
-.device-chip:hover { border-color: var(--line-2); background: var(--surface-2); }
+/* значок компьютера у названия чата: точка — есть ли у агента доступ к компьютеру здесь */
+.pc-ind { position: relative; flex: none; display: grid; place-items: center; width: 28px; height: 28px; border: 0; border-radius: var(--r); background: none; color: var(--muted); cursor: pointer; }
+.pc-ind svg { width: 16px; height: 16px; }
+.pc-ind i, .pc-dot { position: absolute; right: 3px; bottom: 5px; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); box-shadow: 0 0 0 2px var(--bg); }
+.pc-ind:hover, .pc-ind[aria-expanded="true"] { background: var(--surface-2); color: var(--text); }
+.pc-ind[data-state="ok"] i, .pc-dot[data-state="ok"] { background: var(--ok); }
+.pc-ind[data-state="partial"] i, .pc-dot[data-state="partial"] { background: var(--warn); }
+.pc-pop-head { display: flex; gap: 10px; align-items: flex-start; padding: 8px 10px 6px; max-width: 280px; }
+.pc-pop-head .pc-dot { position: static; flex: none; margin-top: 5px; box-shadow: none; }
+.pc-pop-head b { font-size: 13px; }
+.pc-pop-head .help { font-size: 12px; margin-top: 2px; }
+.pc-pop-folder { display: flex; align-items: center; gap: 8px; padding: 4px 10px; font-size: 13px; max-width: 280px; }
+.pc-pop-folder svg { width: 14px; height: 14px; color: var(--muted); flex: none; }
+.pc-pop-folder span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pc-pop-folder small { font-size: 11.5px; color: var(--faint); }
+.pc-pop-folder.off span { color: var(--muted); text-decoration: line-through; }
+.pf-name.static { cursor: default; }
+.pf-name.static:hover span { text-decoration: none; }
+.pf-icon.on { color: var(--ok); }
+.link-btn { border: 0; background: none; padding: 0; color: var(--accent); cursor: pointer; font: inherit; }
+.link-btn:hover { text-decoration: underline; }
 .code-block { position: relative; margin-top: 8px; }
 .code-block pre { margin: 0; padding: 12px 44px 12px 14px; background: var(--code-bg); border: 1px solid var(--line); border-radius: var(--r); font: 12px/1.6 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 .code-block .copy { position: absolute; top: 6px; right: 6px; }
@@ -909,7 +925,6 @@ button.link:hover { text-decoration: underline; }
   .page-inner { padding: 20px 16px 40px; }
   .page-head { flex-direction: column; }
   .crumb { max-width: 45%; }
-  .device-chip span { display: none; }
   .share-add { flex-wrap: wrap; }
 }
 .compose-card textarea:focus-visible { box-shadow: none; }

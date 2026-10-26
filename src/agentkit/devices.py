@@ -5,6 +5,11 @@ NAT и без открытых портов. Сервер кладёт кома�
 выполняет и возвращает ответ. Какие папки открыты и можно ли выполнять команды,
 решает человек при запуске моста, а не сервер: даже взломанный сервис не
 расширит доступ к компьютеру.
+
+Папки проекта (как в Cowork): человек привязывает к проекту свои открытые папки.
+В разговоре такого проекта pc_* видят только их — это проверяет код инструментов,
+а не промпт. Привязка личная (проект общий, а компьютер у каждого свой) и хранится
+по пути: имя папки мост выдаёт заново при каждом открытии («Docs», «Docs-2»).
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ import time
 from typing import Annotated, Any
 
 from agentkit.messages import new_id
+from agentkit.projects import session_project_id
 from agentkit.tools.base import Tool, ToolContext, ToolResult, User, tool
 
 ONLINE_WINDOW = 45.0  # мост опрашивает раз в ≤25 с — если 45 с тишины, считаем отключённым
@@ -23,6 +29,7 @@ POLL_WAIT = 25.0
 DEVICE_TOOLS = {"pc_list", "pc_read", "pc_search", "pc_write", "pc_edit", "pc_run", "pc_request_access"}
 FOLDER_TOOLS = {"pc_list", "pc_read", "pc_search", "pc_write", "pc_edit"}
 NS = "devices"
+NS_PROJECT = "project_folders"  # ключ «<проект>:<пользователь>» → привязанные папки
 
 
 class DeviceError(Exception):
@@ -120,30 +127,118 @@ class DeviceHub:
     async def deliver(self, device_id: str, call_id: str, result: dict[str, Any]) -> None:
         await self.bus.push(f"devres:{device_id}:{call_id}", result, ttl=120)
 
+    # ── папки проекта ────────────────────────────────────────────────
+    async def project_folders(self, project_id: str, user_id: str) -> list[dict[str, Any]]:
+        return (await self.store.kv_get(NS_PROJECT, f"{project_id}:{user_id}") or {}).get("items", [])
+
+    async def bind_folder(self, project_id: str, user_id: str, device_id: str, path: str) -> dict[str, Any]:
+        items = await self.project_folders(project_id, user_id)
+        hit = next((b for b in items if b["device_id"] == device_id and b["path"] == path), None)
+        if hit:
+            return hit
+        rec = {"id": new_id("pf_"), "device_id": device_id, "path": path[:300], "added_at": time.time()}
+        await self.store.kv_set(NS_PROJECT, f"{project_id}:{user_id}", {"items": [*items, rec][-20:]})
+        return rec
+
+    async def unbind_folder(self, project_id: str, user_id: str, binding_id: str) -> bool:
+        items = await self.project_folders(project_id, user_id)
+        rest = [b for b in items if b["id"] != binding_id]
+        if len(rest) == len(items):
+            return False
+        await self.store.kv_set(NS_PROJECT, f"{project_id}:{user_id}", {"items": rest})
+        return True
+
+    async def drop_project(self, project_id: str) -> None:
+        for key in await self.store.kv_list(NS_PROJECT):
+            if key.startswith(project_id + ":"):
+                await self.store.kv_delete(NS_PROJECT, key)
+
+    async def project_folders_view(self, project_id: str, user_id: str) -> list[dict[str, Any]]:
+        """Привязки с текущим состоянием: на связи ли компьютер, открыта ли папка в мосте и под каким именем."""
+        devs = {d["id"]: d for d in await self.list(user_id)}
+        out = []
+        for b in await self.project_folders(project_id, user_id):
+            d = devs.get(b["device_id"])
+            f = next((f for f in ((d or {}).get("info") or {}).get("folders", []) if f["path"] == b["path"]), None)
+            out.append({**b, "device": d["name"] if d else "", "online": bool(d and self.online(d)),
+                        "name": f["name"] if f else _basename(b["path"]), "open": f is not None,
+                        "read_only": bool(f and f.get("read_only")), "missing_device": d is None})
+        return out
+
+    async def session_folders(self, user: User, session_id: str) -> list[dict[str, Any]]:
+        """Папки проекта этого разговора (пусто — разговор не в проекте или к проекту ничего не привязано)."""
+        pid = await session_project_id(self.store, session_id)
+        return await self.project_folders_view(pid, user.id) if pid else []
+
+    @staticmethod
+    def scope_of(items: list[dict[str, Any]]) -> dict[str, set[str]] | None:
+        """Какие папки можно трогать: None — все открытые, иначе {устройство: {имена открытых папок проекта}}.
+
+        Разговор проекта с привязанными папками видит только их: иначе агент из проекта «Бухгалтерия»
+        полез бы в папку проекта «Личное» на том же компьютере, просто потому что она открыта.
+        """
+        if not items:
+            return None
+        out: dict[str, set[str]] = {b["device_id"]: set() for b in items if not b["missing_device"]}
+        for b in items:
+            if b["open"] and b["device_id"] in out:
+                out[b["device_id"]].add(b["name"])
+        return out
+
+    async def choose(self, user: User, scope: dict[str, set[str]] | None, device: str = "") -> dict[str, Any]:
+        if scope is None:
+            return await self.pick(user.id, device)
+        on = [d for d in await self.list(user.id) if self.online(d) and d["id"] in scope]
+        if not on:
+            raise DeviceError("компьютер с папками проекта не на связи — включите его, мост подключится сам")
+        if device:
+            low = device.lower()
+            on = [d for d in on if low in d["name"].lower() or d["id"] == device]
+            if not on:
+                raise DeviceError(f"в этом проекте нет папок на компьютере «{device}»")
+        return next((d for d in on if scope[d["id"]]), on[0])  # сначала тот, где папки проекта открыты
+
     # ── контекст для агента ──────────────────────────────────────────
     async def context(self, user: User, session_id: str):
         from agentkit.agent import TurnContext
 
-        on = [d for d in await self.list(user.id) if self.online(d)]
+        items = await self.session_folders(user, session_id)
+        scope = self.scope_of(items)
+        on = [d for d in await self.list(user.id) if self.online(d) and (scope is None or d["id"] in scope)]
         if not on:
+            if scope is not None:
+                return TurnContext(text="# Компьютер пользователя\nК проекту привязаны папки на компьютере, "
+                                        "но он сейчас не на связи. Если нужны эти файлы — скажи человеку "
+                                        "включить компьютер (мост подключится сам).", hide_tools=set(DEVICE_TOOLS))
             return TurnContext(hide_tools=set(DEVICE_TOOLS))
         lines = ["# Компьютер пользователя",
                  "Через мост подключён компьютер человека — инструменты pc_*. Пути пиши как «папка/путь внутри», "
                  "где папка — одна из открытых ниже; выйти за них нельзя."]
+        if scope is not None:
+            lines.append("К проекту привязаны свои папки — в этом разговоре доступны только они. "
+                         "Это рабочая папка проекта: ищи и сохраняй результаты в ней.")
         hide: set[str] = set()
+        any_folders = False
         for d in on:
             info = d.get("info") or {}
-            folders = info.get("folders") or []
+            folders = [f for f in info.get("folders") or [] if scope is None or f["name"] in scope[d["id"]]]
+            any_folders = any_folders or bool(folders)
             fl = ", ".join(f"{f['name']}{' (только чтение)' if f.get('read_only') else ''}" for f in folders) or "нет"
             lines.append(f"- «{d['name']}» ({info.get('platform', '?')}): папки — {fl}; "
                          f"команды — {'можно' if info.get('shell') else 'запрещены'}")
+        closed = [b for b in items if b["online"] and not b["open"]]
+        if closed:
+            lines.append("Папки проекта, закрытые на компьютере (человек убрал доступ): "
+                         + ", ".join(f"{b['name']} ({b['path']})" for b in closed)
+                         + ". Нужны — попроси доступ через pc_request_access.")
         if not any((d.get("info") or {}).get("shell") for d in on):
             hide.add("pc_run")
-        if not any((d.get("info") or {}).get("folders") for d in on):
+        if not any_folders:
             hide |= FOLDER_TOOLS
             lines.append("Папок пока не открыто: если нужны файлы с компьютера, попроси доступ через pc_request_access.")
         else:
-            lines.append("Нужна другая папка — попроси доступ через pc_request_access (человек выберет её у себя).")
+            lines.append("Нужна другая папка — попроси доступ через pc_request_access (человек выберет её у себя"
+                         + (", и она привяжется к проекту)." if scope is not None else ")."))
         if len(on) > 1:
             lines.append("Компьютеров несколько — укажи device, иначе берётся последний активный.")
         return TurnContext(text="\n".join(lines), hide_tools=hide)
@@ -156,9 +251,47 @@ def _clean_info(info: dict[str, Any]) -> dict[str, Any]:
             "version": str(info.get("version", ""))[:20], "shell": bool(info.get("shell")), "folders": folders}
 
 
+def _root(path: str) -> str:
+    # Так же, как bridge.resolve: «папка/путь» → «папка»; пусто — корень (список открытых папок).
+    p = (path or "").replace("\\", "/").strip().strip("/")
+    return "" if not p.strip(" ./") else p.partition("/")[0]
+
+
+def _basename(path: str) -> str:
+    return path.replace("\\", "/").rstrip("/").rpartition("/")[2] or path
+
+
 def device_tools(hub: DeviceHub) -> list[Tool]:
+    async def target(ctx: ToolContext, device: str) -> tuple[dict[str, Any], set[str] | None]:
+        """Компьютер для команды и папки, которые в этом разговоре можно трогать (None — любые открытые)."""
+        scope = hub.scope_of(await hub.session_folders(ctx.user, ctx.session_id))
+        dev = await hub.choose(ctx.user, scope, device)
+        allowed = None if scope is None else scope[dev["id"]]
+        if allowed is not None and not allowed:
+            raise DeviceError("папки проекта на этом компьютере закрыты — откройте их снова: проект → «Папки на компьютере»")
+        return dev, allowed
+
+    def check(path: str, allowed: set[str] | None) -> None:
+        root = _root(path)
+        if allowed is not None and root and root not in allowed:
+            raise DeviceError(f"папка «{root}» не привязана к этому проекту; доступны: {', '.join(sorted(allowed))}")
+
     async def run(ctx: ToolContext, device: str, op: str, args: dict[str, Any], timeout: float = 60) -> dict[str, Any]:
-        dev = await hub.pick(ctx.user.id, device)
+        dev, allowed = await target(ctx, device)
+        if allowed is not None:
+            if op == "list" and not _root(args.get("path", "")):
+                return {"path": "", "items": [{"name": n, "dir": True} for n in sorted(allowed)]}
+            if op == "search" and not _root(args.get("path", "")):
+                # Пустой путь у моста — «во всех открытых»; в проекте ищем только по его папкам.
+                hits, more = [], False
+                for name in sorted(allowed):
+                    r = await hub.call(dev, op, {**args, "path": name}, timeout)
+                    hits += r.get("hits", [])
+                    more = more or bool(r.get("more"))
+                return {"hits": hits[:200], "more": more or len(hits) > 200}
+            if op == "run" and not _root(args.get("cwd", "")):
+                args = {**args, "cwd": sorted(allowed)[0]}
+            check(args.get("cwd", "") if op == "run" else args.get("path", ""), allowed)
         return await hub.call(dev, op, args, timeout)
 
     def err(e: Exception) -> ToolResult:
@@ -232,7 +365,7 @@ def device_tools(hub: DeviceHub) -> list[Tool]:
     @tool(title="Команда на компьютере", group="device", destructive=True, source="builtin", timeout=330,
           describe=lambda a: [["Команда", a.get("command", "")], ["Где", a.get("cwd") or "первая открытая папка"]])
     async def pc_run(ctx: ToolContext, command: Annotated[str, "Команда оболочки"],
-                     cwd: Annotated[str, "Рабочая папка «папка/путь»; пусто — первая открытая"] = "",
+                     cwd: Annotated[str, "Рабочая папка «папка/путь»; пусто — первая открытая (в проекте — папка проекта)"] = "",
                      timeout: Annotated[int, "Сколько ждать, секунд (до 300)"] = 60, device: Annotated[str, "Какой компьютер (если их несколько); пусто — последний активный"] = "") -> ToolResult:
         """Выполняет команду в оболочке на компьютере пользователя (если он разрешил это при запуске моста)."""
         t = max(5, min(int(timeout), 300))
@@ -253,11 +386,20 @@ def device_tools(hub: DeviceHub) -> list[Tool]:
         """Просит человека открыть папку: на его компьютере появляется обычное окно выбора папки.
         Используй, когда нужных файлов нет в уже открытых папках. Ждёт, пока человек выберет (до 5 минут)."""
         try:
-            r = await run(ctx, device, "pick_folder", {"reason": reason}, timeout=300)
+            pid = await session_project_id(ctx.store, ctx.session_id)
+            scope = hub.scope_of(await hub.session_folders(ctx.user, ctx.session_id))
+            dev = await hub.choose(ctx.user, scope, device)
+            r = await hub.call(dev, "pick_folder", {"reason": reason}, timeout=300)
         except Exception as e:  # noqa: BLE001
             return err(e)
         mode = "только чтение" if r.get("read_only") else "чтение и запись"
-        return ToolResult(content=f"Открыта папка «{r['name']}» ({mode}). Пути: {r['name']}/…", data=r)
+        note = ""
+        if pid and (await ctx.store.project_role(pid, ctx.user.id))[1]:
+            # Папку, открытую из разговора проекта, сразу привязываем к нему — иначе в разговоре
+            # с ограничением по папкам проекта она открылась бы, но осталась недоступной.
+            await hub.bind_folder(pid, ctx.user.id, dev["id"], r["path"])
+            note = " Привязана к проекту."
+        return ToolResult(content=f"Открыта папка «{r['name']}» ({mode}). Пути: {r['name']}/….{note}", data=r)
 
     return [pc_list, pc_read, pc_search, pc_write, pc_edit, pc_run, pc_request_access]
 

@@ -47,6 +47,11 @@ class DeviceAction(BaseModel):
     args: dict[str, Any] = {}
 
 
+class FolderBind(BaseModel):
+    device_id: str
+    path: str = ""  # пусто — спросить папку окном выбора на компьютере
+
+
 class BridgePoll(BaseModel):
     info: dict[str, Any] = {}
     hello: bool = False  # первый опрос: ответить сразу, чтобы мост показал «подключено»
@@ -137,6 +142,8 @@ def register(api: APIRouter, app: Any, svc: Any, auth: Any) -> None:
     async def delete_project(project_id: str, user: User = Depends(auth)):
         await access(project_id, user, "owner")
         await lib().delete_project(project_id)
+        if svc.devices is not None:
+            await svc.devices.drop_project(project_id)
         return {"ok": True}
 
     @api.post("/projects/{project_id}/files")
@@ -235,6 +242,62 @@ def register(api: APIRouter, app: Any, svc: Any, auth: Any) -> None:
         except DeviceError as e:
             raise HTTPException(409, str(e)) from None
         return {"ok": True, "result": res}
+
+    # ── папки компьютера, привязанные к проекту ──────────────────────
+    # Привязка личная: проект общий, а компьютер у каждого свой. Поэтому хватает роли читателя.
+    @api.get("/projects/{project_id}/folders")
+    async def project_folders(project_id: str, user: User = Depends(auth)):
+        await access(project_id, user)
+        items = await hub().project_folders_view(project_id, user.id)
+        bound = {(b["device_id"], b["path"]) for b in items}
+        free = [{"device_id": d["id"], "device": d["name"], **f} for d in await hub().list(user.id) if DeviceHub.online(d)
+                for f in (d.get("info") or {}).get("folders", []) if (d["id"], f["path"]) not in bound]
+        return {"items": items, "available": free}
+
+    @api.post("/projects/{project_id}/folders")
+    async def bind_project_folder(project_id: str, body: FolderBind, user: User = Depends(auth)):
+        await access(project_id, user)
+        d = await own_device(body.device_id, user)
+        path = body.path
+        if not path:
+            if not DeviceHub.online(d):
+                raise HTTPException(409, "компьютер не на связи — запустите мост")
+            try:
+                r = await hub().call(d, "pick_folder", {"reason": "Папка для проекта — агент будет работать в ней"},
+                                     timeout=DEVICE_ACTIONS["pick_folder"])
+            except DeviceError as e:
+                raise HTTPException(409, str(e)) from None
+            path = r["path"]
+        elif path not in {f["path"] for f in (d.get("info") or {}).get("folders", [])}:
+            # Привязать можно только открытую в мосте папку: сервер доступ не расширяет, а «мёртвая»
+            # привязка только закрыла бы в проекте остальные папки.
+            raise HTTPException(400, "эта папка не открыта на компьютере — выберите из открытых или «Другая папка…»")
+        await hub().bind_folder(project_id, user.id, d["id"], path)
+        return {"ok": True, "items": await hub().project_folders_view(project_id, user.id)}
+
+    @api.delete("/projects/{project_id}/folders/{binding_id}")
+    async def unbind_project_folder(project_id: str, binding_id: str, user: User = Depends(auth)):
+        await access(project_id, user)
+        if not await hub().unbind_folder(project_id, user.id, binding_id):
+            raise HTTPException(404, "нет такой папки в проекте")
+        return {"ok": True}
+
+    @api.get("/devices/status")
+    async def device_status(project_id: str = "", user: User = Depends(auth)):
+        """Значок компьютера у названия чата: есть ли у агента доступ к компьютеру в этом разговоре."""
+        devs = await hub().list(user.id)
+        folders = []
+        if project_id and svc.projects is not None and (await svc.store.project_role(project_id, user.id))[1]:
+            folders = await hub().project_folders_view(project_id, user.id)
+        scope = DeviceHub.scope_of(folders)
+        on = [d for d in devs if DeviceHub.online(d) and (scope is None or d["id"] in scope)]
+        visible = [{"device": d["name"], "name": f["name"], "read_only": f.get("read_only", False)} for d in on
+                   for f in (d.get("info") or {}).get("folders", []) if scope is None or f["name"] in scope[d["id"]]]
+        # ok — агент может работать с файлами; partial — компьютер на связи, но папок (проекта) нет;
+        # off — не на связи; none — компьютер ещё не подключали.
+        state = "none" if not devs else "off" if not on else "ok" if visible else "partial"
+        return {"state": state, "project_scoped": scope is not None, "folders": visible,
+                "devices": [view(d) for d in devs], "project_folders": folders}
 
     async def bridge_device(request: Request) -> dict[str, Any]:
         key = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
