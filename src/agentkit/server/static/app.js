@@ -39,7 +39,7 @@ const S = {
   bubble: null,      // текущий ответ, который печатается
   bubbleText: "",
   day: null,         // день последнего сообщения в ленте — для разделителей дат
-  group: null,       // текущая группа действий агента
+  trace: null,       // ход работы текущего ответа: действия, реплики, рассуждения
   steps: new Map(),  // tool_call_id → шаг
   subs: new Map(),   // id дочерней сессии → контейнер субагента
   cards: new Map(),  // approval_id → карточка
@@ -131,42 +131,142 @@ const box = () => $("#messages");
 function nearBottom() { const el = box(); return el.scrollHeight - el.scrollTop - el.clientHeight < 160; }
 function scroll(force) { if (force || nearBottom()) box().scrollTop = box().scrollHeight; }
 function setEmpty(on) { $(".main").classList.toggle("is-empty", on); $("#below").hidden = !on; }
-function add(el, { keepGroup = false } = {}) {
+function add(el) {
   if ($("#empty")) { $("#empty").remove(); setEmpty(false); }
-  // Любой элемент, кроме шагов, закрывает текущую группу действий.
-  if (!keepGroup) closeGroup();
-  // Индикатор работы всегда последний в ленте — новое встаёт перед ним.
-  const w = $("#working");
-  w ? box().insertBefore(el, w) : box().append(el);
+  box().append(el);
   scroll(); return el;
 }
 
-// ── индикатор «агент работает» ─────────────────────────────────────
-// Живёт внизу ленты весь прогон: между шагами модель может молчать десятки секунд,
-// и без него непонятно, работает агент или завис. Пока печатается текст — прячем:
-// там есть мигающий курсор. Пока ждёт подтверждения — замирает и просит ответить.
-function showWorking(on) {
-  clearInterval(S.workTimer);
-  if (!on) { $("#working")?.remove(); return; }
-  let w = $("#working");
-  if (!w) {
-    w = h("div", { id: "working", class: "working", role: "status", "aria-live": "polite" },
-      h("span", { class: "spinner", "aria-hidden": "true" }), h("span", { class: "working-label" }, "Думает…"), h("span", { class: "working-time" }));
-    box().append(w);
+// ── ход работы агента ───────────────────────────────────────────────
+// Как у Claude: на каждый ответ — одна строка «что агент делает сейчас» с кольцом и
+// секундомером. Действия, промежуточные реплики («Проверю по реестру.») и рассуждения
+// прячутся под неё и раскрываются по клику. В ленте остаются только итоговый ответ и то,
+// что требует внимания: подтверждения, вопросы, файлы, визуализации.
+// Строка появляется в начале прогона: между шагами модель может молчать десятки секунд,
+// и без неё непонятно, работает агент или завис.
+const isMcp = name => String(name || "").startsWith("mcp__");
+const mcpServer = name => String(name).split("__")[1] || "";
+const fmtDur = s => s < 60 ? `${s} с` : `${Math.floor(s / 60)} мин ${s % 60} с`;
+function mcpChip(servers) {
+  return h("span", { class: "mcp-chip", title: "Инструмент подключённого MCP-сервера" }, icon("plug"), `MCP · ${servers}`);
+}
+
+function traceNew() {
+  const t = { steps: [], notes: 0, thoughts: 0, thought: null, mcp: new Set(), live: false, state: "thinking", t0: Date.now(), wall: 0 };
+  t.ic = h("span", { class: "trace-ic", "aria-hidden": "true" });
+  t.label = h("span", { class: "trace-label", "aria-live": "polite" });
+  t.chip = h("span", { class: "trace-chip" });
+  t.time = h("span", { class: "trace-time" });
+  t.head = h("button", { class: "trace-head", type: "button", "aria-expanded": "false" }, t.ic, t.label, t.chip, t.time, icon("chev", "chev"));
+  t.body = h("div", { class: "trace-body" });
+  t.el = h("div", { class: "trace" }, t.head, t.body);
+  t.head.addEventListener("click", () => t.head.setAttribute("aria-expanded", t.el.classList.toggle("open")));
+  add(t.el);
+  return t;
+}
+// Ход текущего ответа: создаётся началом прогона или первым действием (при открытии старого разговора).
+const trace = () => S.trace || (S.trace = traceNew());
+
+// Самый свежий выполняющийся шаг — в том числе шаг субагента: он и есть «что сейчас делает агент».
+function lastRunning() {
+  const all = [...S.steps.values()];
+  for (let i = all.length - 1; i >= 0; i--) if (all[i].state === "run") return all[i];
+  return null;
+}
+
+function traceRender(t) {
+  const n = t.steps.length;
+  const errs = t.steps.filter(s => s.state === "err").length;
+  const waiting = t.steps.some(s => s.state === "wait");
+  const running = t.live ? lastRunning() : null;
+  // Ответ без действий не занимает строку: пока печатается текст, её не видно, по окончании её убирает traceClose.
+  t.el.hidden = !n && !t.notes && !t.thoughts && (!t.live || t.state === "typing");
+  t.el.classList.toggle("live", t.live);
+  t.el.classList.toggle("waiting", t.live && (waiting || t.state === "waiting"));
+  t.el.classList.toggle("has-err", !t.live && !!errs);
+  t.ic.replaceChildren(t.live ? h("span", { class: "spinner" }) : icon(errs ? "x" : waiting ? "pause" : n ? "tools" : "spark"));
+  t.label.classList.toggle("shimmer", t.live && !waiting && t.state !== "waiting");
+  t.label.replaceChildren();
+  t.chip.replaceChildren();
+  if (t.live) {
+    if (waiting || t.state === "waiting") t.label.append("Ждёт вашего решения");
+    else if (running) {
+      t.label.append(running.title);
+      if (running.args) t.label.append(h("span", { class: "args" }, running.args));
+      if (running.server) t.chip.append(mcpChip(running.server));
+    } else t.label.append(t.state === "pondering" ? "Размышляет…" : t.state === "typing" ? "Пишет ответ…" : t.state === "tools" ? "Выполняет действия…" : "Думает…");
+    return; // секундомер ведёт таймер из traceLive
   }
-  const t0 = Date.now(), t = w.querySelector(".working-time");
-  t.textContent = "";
+  t.label.append(n ? `${n} ${plural(n, "действие", "действия", "действий")}` : t.thoughts ? "Размышления" : "Ход работы");
+  if (errs) t.label.append(h("span", { class: "errs" }, ` · ${errs} ${plural(errs, "ошибка", "ошибки", "ошибок")}`));
+  if (waiting) t.label.append(" · ждёт подтверждения");
+  if (t.mcp.size) t.chip.append(mcpChip([...t.mcp].join(", ")));
+  const ms = t.wall ? t.wall * 1000 : t.steps.reduce((a, s) => a + (s.ms || 0), 0);
+  t.time.textContent = ms ? secs(ms) : "";
+}
+
+function traceLive() {
+  const t = trace();
+  if (t.live) return;
+  Object.assign(t, { live: true, state: "thinking", t0: Date.now() });
+  t.time.textContent = "";
+  clearInterval(S.workTimer);
   S.workTimer = setInterval(() => {
-    const s = Math.floor((Date.now() - t0) / 1000);
-    t.textContent = s < 3 ? "" : s < 60 ? `${s} с` : `${Math.floor(s / 60)} мин ${s % 60} с`;
+    const s = Math.floor((Date.now() - t.t0) / 1000);
+    t.time.textContent = s < 3 ? "" : fmtDur(s);
   }, 1000);
+  traceRender(t);
   scroll();
 }
-function workingState(state) {
-  const w = $("#working"); if (!w) return;
-  w.hidden = state === "typing";
-  w.classList.toggle("waiting", state === "waiting");
-  w.querySelector(".working-label").textContent = state === "waiting" ? "Ждёт вашего решения" : state === "tools" ? "Выполняет действия…" : "Думает…";
+function traceState(state) {
+  const t = S.trace; if (!t) return;
+  t.state = state;
+  traceRender(t);
+}
+// Ход закрывается следующим сообщением человека или концом прогона. Шаги закрытого хода
+// ещё могут обновиться (действие подтвердили позже) — тогда перерисовывается его сводка.
+function traceClose() {
+  const t = S.trace; if (!t) return;
+  S.trace = null;
+  if (t.live) { t.wall = Math.round((Date.now() - t.t0) / 1000); t.live = false; clearInterval(S.workTimer); }
+  thoughtEnd(t);
+  if (!t.steps.length && !t.notes && !t.thoughts) { t.el.remove(); return; }
+  traceRender(t);
+}
+
+// Промежуточная реплика перед действиями — в ход работы, а не в ленту.
+function narrate(text) {
+  const t = trace();
+  thoughtEnd(t);
+  const el = h("div", { class: "md trace-note" });
+  renderMd(el, text);
+  t.body.append(el);
+  t.notes++;
+  traceRender(t);
+}
+// Рассуждения модели (если она их отдаёт) — живьём, в ход работы; в истории не хранятся.
+function thought(text) {
+  const t = trace();
+  if (!t.thought) {
+    const out = h("div", { class: "thought-text" });
+    const time = h("span", { class: "step-time" });
+    const row = h("button", { class: "step-row", type: "button" }, h("span", { class: "st think" }, icon("spark")),
+      h("span", { class: "step-title" }, "Размышления"), h("span", { class: "step-args" }), time);
+    const el = h("div", { class: "step thought" }, row, h("div", { class: "step-detail" }, out));
+    row.addEventListener("click", () => el.classList.toggle("open"));
+    t.body.append(el);
+    t.thought = { out, time, text: "", t0: Date.now() };
+    t.thoughts++;
+  }
+  t.thought.text += text;
+  t.thought.out.textContent = t.thought.text;
+  t.state = "pondering";
+  traceRender(t);
+}
+function thoughtEnd(t) {
+  if (!t?.thought) return;
+  t.thought.time.textContent = secs(Date.now() - t.thought.t0);
+  t.thought = null;
 }
 
 // ── время сообщений и разделители дней ─────────────────────────────
@@ -198,6 +298,9 @@ function splitContent(content) {
 
 function userMsg(content, seq, { queued = false, ts = nowTs() } = {}) {
   const { text, files } = splitContent(content);
+  // Новое сообщение человека закрывает ход прошлого ответа; дописанное во время работы — нет:
+  // агент ещё не прочёл его, действия идут в тот же ход.
+  if (!queued) traceClose();
   daySep(ts);
   const badge = queued ? h("span", { class: "queued-badge" }, "агент прочтёт после текущего шага") : null;
   const rewind = seq ? h("button", { class: "btn ghost sm", title: "Откатить разговор и файлы агента к моменту до этого сообщения",
@@ -266,98 +369,67 @@ function argSummary(args) {
   return v.length > 90 ? v.slice(0, 90) + "…" : v;
 }
 
-function newGroup() {
-  const head = h("button", { class: "steps-head", type: "button" }, icon("chev", "chev"), h("span", { class: "summary" }), h("span", { class: "time" }));
-  const list = h("div", { class: "steps-list" });
-  const el = h("div", { class: "steps open" }, head, list);
-  const g = { el, head, list, steps: [], userToggled: false };
-  head.addEventListener("click", () => { g.userToggled = true; el.classList.toggle("open"); });
-  add(el, { keepGroup: true });
-  return g;
-}
-function closeGroup() {
-  const g = S.group;
-  if (!g) return;
-  S.group = null;
-  // Готовая группа сворачивается — ход мысли виден одной строкой; ошибки и ожидание оставляют её открытой.
-  if (!g.userToggled && g.steps.every(s => s.state === "ok")) g.el.classList.remove("open");
-  updateGroup(g);
-}
-function updateGroup(g) {
-  const n = g.steps.length;
-  const running = g.steps.filter(s => s.state === "run");
-  const errs = g.steps.filter(s => s.state === "err").length;
-  const waiting = g.steps.some(s => s.state === "wait");
-  const ms = g.steps.reduce((a, s) => a + (s.ms || 0), 0);
-  const sum = g.head.querySelector(".summary");
-  sum.replaceChildren();
-  if (running.length) sum.append(h("b", {}, running.at(-1).title), "…");
-  else if (waiting) sum.append(h("b", {}, "Ждёт подтверждения"));
-  else sum.append(`${n} ${plural(n, "действие", "действия", "действий")}`);
-  if (errs) sum.append(h("span", { style: "color:var(--err)" }, ` · ${errs} ${plural(errs, "ошибка", "ошибки", "ошибок")}`));
-  if (n > 1 && running.length) sum.append(h("span", {}, ` · шаг ${n - running.length + 1} из ${n}`));
-  g.head.querySelector(".time").textContent = ms ? secs(ms) : "";
-}
-
 // Инструменты, которые сами по себе — часть ответа (график, дашборд): без строки «1 действие»,
 // чтобы текст, визуализация и снова текст читались одним целым.
 const SILENT_TOOLS = new Set(["show_visual"]);
 function stepRow(id, name, args, title, agent) {
   if (S.steps.has(id)) return S.steps.get(id);
   if (SILENT_TOOLS.has(name) && !agent) {
-    const ghost = { el: h("div"), st: h("span"), time: h("span"), detail: h("div"), title: "", state: "run", ms: 0, group: null, silent: true };
+    // Шага в ходе работы нет, но строка «что сейчас делает агент» его называет.
+    const ghost = { el: h("div"), st: h("span"), time: h("span"), detail: h("div"), title: "Готовит визуализацию", args: "", state: "run", ms: 0, trace: null, silent: true };
     S.steps.set(id, ghost);
+    if (S.trace) traceRender(S.trace);
     return ghost;
   }
+  // У инструмента MCP-сервера — пометка с именем сервера: человек видит, что агент ходит во внешнюю систему.
+  const server = isMcp(name) ? mcpServer(name) : null;
+  const ttl = server && !title && !S.config?.titles?.[name] ? (s => s.charAt(0).toUpperCase() + s.slice(1))((name.split("__")[2] || name).replace(/_/g, " ")) : toolTitle(name, title);
   const st = h("span", { class: "st run" });
-  const ttl = toolTitle(name, title);
   const time = h("span", { class: "step-time" });
-  const row = h("button", { class: "step-row", type: "button", title: name }, st, h("span", { class: "step-title" }, ttl),
-    h("span", { class: "step-args" }, argSummary(args)), time);
+  const summary = argSummary(args);
+  const row = h("button", { class: "step-row", type: "button", title: name }, st,
+    h("span", { class: "step-title" }, ttl, server ? mcpChip(server) : null), h("span", { class: "step-args" }, summary), time);
   const detail = h("div", { class: "step-detail" });
   const argText = JSON.stringify(args ?? {}, null, 2);
   if (argText !== "{}") detail.append(h("div", {}, h("div", { class: "label" }, "Аргументы", copyBtn(() => argText)), h("pre", {}, argText)));
   const el = h("div", { class: "step" }, row, detail);
   row.addEventListener("click", () => el.classList.toggle("open"));
-  const step = { el, st, time, detail, title: ttl, state: "run", ms: 0, group: null };
+  const step = { el, st, time, detail, title: ttl, args: summary, server, state: "run", ms: 0, trace: null };
   S.steps.set(id, step);
   if (agent && S.subs.has(agent)) {
     S.subs.get(agent).append(el);
+    if (server && S.trace) S.trace.mcp.add(server);
   } else {
-    if (!S.group) S.group = newGroup();
-    step.group = S.group;
-    S.group.steps.push(step);
-    S.group.list.append(el);
-    updateGroup(S.group);
+    const t = trace();
+    thoughtEnd(t);
+    step.trace = t;
+    t.steps.push(step);
+    if (server) t.mcp.add(server);
+    t.body.append(el);
   }
-  scroll();
+  if (S.trace) traceRender(S.trace);
   return step;
 }
 function setStepState(step, state) {
   step.state = state;
   step.st.className = "st " + state;
   step.st.replaceChildren(state === "ok" ? icon("check") : state === "err" ? icon("x") : state === "wait" ? icon("pause") : "");
-  if (step.group) {
-    updateGroup(step.group);
-    if (state === "err" || state === "wait") step.group.el.classList.add("open");
-  }
+  if (step.trace && step.trace !== S.trace) traceRender(step.trace);
+  if (S.trace) traceRender(S.trace);
 }
 function stepResult(id, content, isError, ui, ms) {
   const step = S.steps.get(id);
   if (!step) return;
   step.ms = ms || 0;
   if (ms) step.time.textContent = secs(ms);
-  setStepState(step, isError ? "err" : "ok");
-  // Группа уже закрыта (действие подтверждали позже) — сворачиваем, когда всё прошло успешно.
-  const g = step.group;
-  if (g && g !== S.group && !g.userToggled && g.steps.every(s => s.state === "ok")) g.el.classList.remove("open");
   step.detail.append(h("div", {}, h("div", { class: "label" }, isError ? "Ошибка" : "Результат", copyBtn(() => content || "")),
     h("pre", { class: isError ? "err" : "" }, content || "—")));
+  setStepState(step, isError ? "err" : "ok");
   for (const w of ui || []) widgetAfter(w);
 }
 function widgetAfter(w) {
   const el = widget(w);
-  if (el) add(el, { keepGroup: true });
+  if (el) add(el);
 }
 
 function widget(w) {
@@ -446,27 +518,33 @@ function onEvent(ev) {
     case "run_started": setRunning(true); break;
     case "user_message": {
       const el = S.queued.shift();
-      if (el) { el.classList.remove("queued"); el._badge?.remove(); closeGroup(); }
+      if (el) { el.classList.remove("queued"); el._badge?.remove(); traceClose(); }
       else userMsg(d.content, d.seq, { ts: ev.ts });
+      // Дальше агент работает уже над ответом на это сообщение — новый ход под ним.
+      if (S.running) traceLive();
       break;
     }
     case "text_delta":
       if (ev.agent) break;
-      if (!S.bubble) { S.bubble = assistantBubble(ev.ts); S.bubbleText = ""; workingState("typing"); }
+      if (!S.bubble) { S.bubble = assistantBubble(ev.ts); S.bubbleText = ""; thoughtEnd(S.trace); traceState("typing"); }
       S.bubbleText = d.snapshot ? d.text : S.bubbleText + d.text;
       S.bubble.innerHTML = md(S.bubbleText); scroll(); break;
-    case "message":
+    case "thinking_delta": if (!ev.agent && d.text) thought(d.text); break;
+    case "message": {
       if (ev.agent) break;
-      if (d.content) {
+      const calls = d.tool_calls || [];
+      if (d.content && isNarration(calls)) { S.bubble?.parentElement.remove(); narrate(d.content); }
+      else if (d.content) {
         if (!S.bubble) S.bubble = assistantBubble(ev.ts);
-        renderMd(S.bubble, d.content); finishBubble(S.bubble, d.content, !!d.tool_calls?.length);
+        renderMd(S.bubble, d.content); finishBubble(S.bubble, d.content, !!calls.length);
       } else S.bubble?.parentElement.remove();
-      S.bubble?.classList.remove("streaming");
       S.bubble = null; S.bubbleText = "";
-      for (const tc of d.tool_calls || []) stepRow(tc.id, tc.function.name, safeJSON(tc.function.arguments));
-      workingState(d.tool_calls?.length ? "tools" : "thinking");
+      thoughtEnd(S.trace);
+      for (const tc of calls) stepRow(tc.id, tc.function.name, safeJSON(tc.function.arguments));
+      traceState(calls.length ? "tools" : "thinking");
       break;
-    case "tool_call": stepRow(d.id, d.name, d.args, d.title, ev.agent); if (!ev.agent) workingState("tools"); break;
+    }
+    case "tool_call": stepRow(d.id, d.name, d.args, d.title, ev.agent); if (!ev.agent) traceState("tools"); break;
     case "tool_result": {
       stepResult(d.id, d.content, d.is_error, ev.agent ? [] : d.ui, d.elapsed_ms);
       // Готовый файл — сразу в панель сбоку (только вживую, не при открытии старого разговора).
@@ -484,8 +562,8 @@ function onEvent(ev) {
       step?.el.insertBefore(sub, step.detail);
       break;
     }
-    case "approval_required": approvalCard(d); workingState("waiting"); break;
-    case "approval_resolved": closeCard(d.approval_id, d.approved, d.expired); workingState("tools"); break;
+    case "approval_required": approvalCard(d); traceState("waiting"); break;
+    case "approval_resolved": closeCard(d.approval_id, d.approved, d.expired); traceState("tools"); break;
     case "ask_user": add(choices(d.question, d.options)); break;
     case "todo": if (!ev.agent) renderTodos(d.todos); break;
     case "compacted": note("История сжата, чтобы поместиться в контекст"); break;
@@ -493,10 +571,9 @@ function onEvent(ev) {
     case "error": alertMsg(d.message); break;
     case "usage": setCost(S.cost + (d.cost || 0)); break;
     case "run_finished": {
-      setRunning(false);
       S.bubble?.classList.remove("streaming"); S.bubble = null;
       for (const step of S.steps.values()) if (step.state === "run") setStepState(step, "err");
-      closeGroup();
+      setRunning(false);
       const st = d.status;
       if (st === "max_steps") note("Достигнут лимит шагов — напишите «продолжай»");
       else if (st === "cancelled") note("Остановлено");
@@ -506,6 +583,9 @@ function onEvent(ev) {
     }
   }
 }
+// Текст перед действиями — ход мысли, ему место в ходе работы. Перед show_visual — часть
+// ответа («Вот выручка по месяцам:» + график), он остаётся в ленте.
+const isNarration = calls => calls.length > 0 && !calls.every(tc => SILENT_TOOLS.has(tc.function.name));
 function safeJSON(s) { try { return JSON.parse(s); } catch { return s; } }
 
 async function follow() {
@@ -537,7 +617,8 @@ async function follow() {
 function setRunning(on) {
   // Отправка доступна и во время работы: сообщение встанет в очередь, агент прочтёт его между шагами.
   S.running = on;
-  showWorking(on);
+  if (on) traceLive();
+  else { clearInterval(S.workTimer); traceClose(); }
   $("#stop").hidden = !on;
   $("#input").placeholder = on ? "Дописать агенту, пока он работает…" : "Сообщение…";
   updateSend();
@@ -720,7 +801,7 @@ function emptyState() {
 
 function resetView() {
   S.stream?.abort();
-  S.steps.clear(); S.subs.clear(); S.cards.clear(); S.bubble = null; S.group = null; S.lastSeq = 0; S.day = null; setCost(0);
+  S.steps.clear(); S.subs.clear(); S.cards.clear(); S.bubble = null; S.trace = null; S.lastSeq = 0; S.day = null; setCost(0);
   box().replaceChildren(emptyState());
   S.tasksShown = false; renderTodos([]); toggleTasks(false); setRunning(false);
   S.queued = []; S.attachments = []; renderAttachments();
@@ -745,7 +826,8 @@ async function openSession(id) {
     const ts = m.ts || nowTs();
     if (m.role === "user") userMsg(m.content, m.seq, { ts });
     else if (m.role === "assistant") {
-      if (m.content) { const b = assistantBubble(ts); renderMd(b, m.content); finishBubble(b, m.content, !!m.tool_calls?.length); }
+      if (m.content && isNarration(m.tool_calls || [])) narrate(m.content);
+      else if (m.content) { const b = assistantBubble(ts); renderMd(b, m.content); finishBubble(b, m.content, !!m.tool_calls?.length); }
       for (const tc of m.tool_calls || []) stepRow(tc.id, tc.function.name, safeJSON(tc.function.arguments));
     } else if (m.role === "tool") stepResult(m.tool_call_id, m.content, m.meta?.is_error, m.meta?.ui, m.meta?.elapsed_ms);
   }
@@ -756,7 +838,7 @@ async function openSession(id) {
     if (w) add(choices(w.question, w.options || []));
   }
   for (const a of s.approvals) approvalCard({ ...a, approval_id: a.id, tool: a.tool_name });
-  if (!s.running_run) closeGroup();
+  if (!s.running_run) traceClose();
   renderTodos(s.state?.todos);
   setCost((s.runs || []).reduce((acc, r) => acc + (r.usage?.cost || 0), 0));
   S.lastSeq = s.last_seq;

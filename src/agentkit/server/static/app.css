@@ -136,15 +136,10 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 .msg.user .meta { display: flex; gap: 6px; align-items: center; margin-top: 4px; min-height: 22px; opacity: 0; transition: opacity .12s; }
 .msg.user:hover .meta, .msg.user.queued .meta { opacity: 1; }
 .msg.user.queued .bubble { opacity: .55; }
-/* индикатор работы агента: кольцо с градиентным хвостом + переливающаяся подпись */
-.working { display: flex; align-items: center; gap: 10px; margin: 16px auto; min-height: 22px; font-size: 13px; color: var(--muted); animation: fade .25s ease-out; }
-.working[hidden] { display: none; }
-.spinner { flex: none; width: 18px; height: 18px; border-radius: 50%; background: conic-gradient(from 90deg, transparent 0 20%, color-mix(in srgb, var(--accent) 35%, transparent) 45%, var(--accent)); -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px)); mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px)); animation: spin .85s linear infinite; }
-.working-label { background: linear-gradient(90deg, var(--muted) 0%, var(--muted) 35%, var(--text) 50%, var(--muted) 65%, var(--muted) 100%); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: shimmer 2s linear infinite; }
-.working-time { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
-.working.waiting .spinner { animation-play-state: paused; background: var(--warn); }
-.working.waiting .working-label { animation: none; color: var(--text-2); background: none; }
-@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } .working-label { animation: none; color: var(--muted); background: none; } }
+/* кольцо «агент работает» (градиентный хвост) и переливающаяся подпись */
+.spinner { flex: none; width: 16px; height: 16px; border-radius: 50%; background: conic-gradient(from 90deg, transparent 0 20%, color-mix(in srgb, var(--accent) 35%, transparent) 45%, var(--accent)); -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px)); mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px)); animation: spin .85s linear infinite; }
+.shimmer { background: linear-gradient(90deg, var(--muted) 0%, var(--muted) 35%, var(--text) 50%, var(--muted) 65%, var(--muted) 100%); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: shimmer 2s linear infinite; }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } .shimmer { animation: none; color: var(--muted); background: none; } }
 .msg.user .meta .icon-btn { width: 26px; height: 26px; }
 .msg.user .meta svg { width: 14px; height: 14px; }
 .msg-time { font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; padding: 0 4px; cursor: default; }
@@ -184,21 +179,35 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 .file-chip small { color: var(--muted); }
 .file-chip:hover { border-color: var(--line-2); }
 
-/* ── действия агента ────────────────────────────────────────────── */
-.steps { margin: 10px auto; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); overflow: hidden; }
-.steps-head { display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 12px; border: 0; background: none; cursor: pointer; font-size: 13px; color: var(--muted); text-align: left; }
-.steps-head:hover { color: var(--text); }
-.steps-head .chev { width: 14px; height: 14px; transition: transform .15s; }
-.steps.open .steps-head .chev { transform: rotate(90deg); }
-.steps-head .summary { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.steps-head .summary b { color: var(--text-2); font-weight: 500; }
-.steps-head .time { font-variant-numeric: tabular-nums; font-size: 12px; color: var(--faint); }
-.steps-list { display: none; border-top: 1px solid var(--line); }
-.steps.open .steps-list { display: block; }
+/* ── ход работы агента: одна строка, под ней — действия, реплики, рассуждения ── */
+.trace { margin: 10px auto 4px; font-size: 13.5px; animation: fade .2s ease-out; }
+.trace[hidden] { display: none; }
+.trace-head { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; min-height: 30px; padding: 4px 10px 4px 4px; margin-left: -4px; border: 0; border-radius: var(--r); background: none; color: var(--muted); cursor: pointer; text-align: left; font: inherit; transition: background .12s, color .12s; }
+.trace-head:hover { color: var(--text); background: var(--surface-2); }
+.trace-ic { flex: none; width: 18px; height: 18px; display: grid; place-items: center; }
+.trace-ic svg { width: 15px; height: 15px; }
+.trace.has-err .trace-ic { color: var(--err); }
+.trace.waiting .spinner { animation-play-state: paused; background: var(--warn); }
+.trace.waiting .trace-label { color: var(--text-2); }
+.trace-label { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.trace-label .args { margin-left: 7px; opacity: .7; }
+.trace-label .errs { color: var(--err); }
+.trace-chip:empty { display: none; }
+.trace-time { flex: none; color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+.trace-time:empty { display: none; }
+.trace-head .chev { flex: none; width: 13px; height: 13px; opacity: .6; transition: transform .15s; }
+.trace.open .trace-head .chev { transform: rotate(90deg); }
+.trace-body { display: none; margin: 2px 0 8px 12px; padding-left: 14px; border-left: 1.5px solid var(--line); }
+.trace.open .trace-body { display: grid; gap: 1px; animation: fade .15s ease-out; }
+.trace-note { font-size: 13.5px; line-height: 1.55; color: var(--text-2); padding: 5px 0; }
+.thought-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.55; color: var(--muted); max-height: 320px; overflow: auto; }
+/* пометка «это MCP»: агент ходит во внешнюю систему */
+.mcp-chip { display: inline-flex; align-items: center; gap: 4px; flex: none; padding: 1px 7px 1px 5px; border-radius: 999px; font-size: 11.5px; font-weight: 500; line-height: 1.5; white-space: nowrap; color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); }
+.mcp-chip svg { width: 12px; height: 12px; }
+.step-title .mcp-chip { margin-left: 7px; vertical-align: 1px; font-size: 11px; padding: 0 6px 0 4px; }
 
-.step { border-bottom: 1px solid var(--line); }
-.step:last-child { border-bottom: 0; }
-.step-row { display: grid; grid-template-columns: 18px minmax(0, auto) minmax(0, 1fr) auto; align-items: center; gap: 8px; width: 100%; padding: 7px 12px; border: 0; background: none; cursor: pointer; text-align: left; font-size: 13px; }
+.step { border-radius: var(--r); }
+.step-row { display: grid; grid-template-columns: 18px minmax(0, auto) minmax(0, 1fr) auto; align-items: center; gap: 8px; width: calc(100% + 8px); margin-left: -8px; padding: 5px 8px; border: 0; border-radius: var(--r); background: none; cursor: pointer; text-align: left; font-size: 13px; }
 .step-row:hover { background: var(--surface-2); }
 .step-title { color: var(--text); font-weight: 500; white-space: nowrap; }
 .step-args { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12.5px; }
@@ -206,8 +215,9 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 .st { width: 16px; height: 16px; display: grid; place-items: center; }
 .st svg { width: 14px; height: 14px; stroke-width: 2.2; }
 .st.run::before { content: ""; width: 11px; height: 11px; border: 1.8px solid var(--line-2); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
+.st.think { color: var(--muted); }
 .st.ok { color: var(--ok); } .st.err { color: var(--err); } .st.wait { color: var(--warn); }
-.step-detail { display: none; padding: 2px 12px 12px 38px; }
+.step-detail { display: none; padding: 2px 0 10px 26px; }
 .step.open .step-detail { display: grid; gap: 8px; }
 .step-detail .label { font-size: 11px; font-weight: 600; color: var(--faint); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 3px; display: flex; justify-content: space-between; align-items: center; }
 .step-detail pre { margin: 0; background: var(--code-bg); border: 1px solid var(--line); padding: 8px 10px; border-radius: var(--r-sm); overflow: auto; max-height: 280px; font: 12px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-2); }
