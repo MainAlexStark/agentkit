@@ -37,7 +37,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.1"
+VERSION = "1.2"
 HOME_DIR = Path.home() / ".agentkit"
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".idea", ".cache", "Library", "AppData", "$RECYCLE.BIN"}
 MAX_READ = 5_000_000
@@ -106,6 +106,30 @@ class Bridge:
         return {"hostname": socket.gethostname(), "platform": f"{platform.system()} {platform.release()}",
                 "version": VERSION, "shell": self.allow_shell,
                 "folders": [{"name": f.name, "path": str(f.path), "read_only": f.read_only} for f in self.folders.values()]}
+
+    def hello(self) -> str | None:
+        """Одна проверка связи при настройке: None — сервер принял ключ, иначе — что не так, по-человечески.
+
+        Без неё ошибка (не тот адрес, сертификат, старый ключ) всплывала только в фоновом мосте после
+        «готово», в логе, который никто не открывает, — а в чате вечно висело «Ждём подключения…».
+        """
+        for _ in range(2):
+            try:
+                self.post("/api/bridge/poll", {"info": self.info(), "hello": True}, timeout=20)
+                return None
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    return "ключ не подошёл — скопируйте команду из чата заново (Настройки → Компьютер → Подключить)"
+                return f"сервер {self.server} ответил {e.code}"
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                reason = getattr(e, "reason", e)
+                if "CERTIFICATE_VERIFY_FAILED" in str(reason) and not self._ssl_fixed:
+                    self._ssl_fixed = True
+                    if fix_ssl(self.ctx):
+                        continue
+                    return "не проверяется сертификат сервера. На macOS: запустите «Install Certificates.command» из папки Python"
+                return f"нет связи с {self.server}: {reason}"
+        return f"нет связи с {self.server}"
 
     def loop(self) -> None:
         delay = 1.0
@@ -492,15 +516,49 @@ def install_autostart(config: Path, script: Path) -> Path:
 <key>ProgramArguments</key><array>{args}</array>
 <key>RunAtLoad</key><true/>
 <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+<key>StandardOutPath</key><string>{HOME_DIR / "bridge.log"}</string>
+<key>StandardErrorPath</key><string>{HOME_DIR / "bridge.log"}</string>
 </dict></plist>
 ''', encoding="utf-8")
+        # Падение фонового моста до первой строки лога (не тот Python, нет прав) раньше уходило в никуда —
+        # теперь трассировка попадает в bridge.log, а ошибку launchctl показываем здесь же.
         subprocess.run(["launchctl", "unload", str(target)], capture_output=True)
-        subprocess.run(["launchctl", "load", "-w", str(target)], capture_output=True)
+        r = subprocess.run(["launchctl", "load", "-w", str(target)], capture_output=True)
+        err = (r.stderr or b"").decode("utf-8", "replace").strip()
+        if r.returncode != 0 or err:
+            r2 = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(target)], capture_output=True)
+            if r2.returncode != 0:
+                log(f"launchctl не запустил мост: {err or (r2.stderr or b'').decode('utf-8', 'replace').strip()}")
     else:
         target.write_text(f"[Desktop Entry]\nType=Application\nName=Агент: мост\n"
                           f"Exec={py} {script} --config {config} --background\nX-GNOME-Autostart-enabled=true\n", encoding="utf-8")
         subprocess.Popen([str(py), str(script), "--config", str(config), "--background"], start_new_session=True)
     return target
+
+
+def wait_background(log_file: Path, start: int, timeout: float = 20) -> bool:
+    """Ждёт, пока фоновый мост напишет «подключено». Иначе «готово» в Терминале — неправда:
+    человек закрывает окно, а компьютер в чате так и не появляется."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        time.sleep(1)
+        try:
+            with open(log_file, "rb") as fh:
+                fh.seek(start)
+                if "подключено".encode() in fh.read():
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def log_tail(log_file: Path, start: int, lines: int = 15) -> str:
+    try:
+        with open(log_file, "rb") as fh:
+            fh.seek(start)
+            return "\n".join(fh.read().decode("utf-8", "replace").strip().splitlines()[-lines:])
+    except OSError:
+        return ""
 
 
 def remove_autostart(config: Path) -> None:
@@ -609,6 +667,12 @@ def main(argv: list[str] | None = None) -> None:
 
     if a.setup:
         log(f"мост agentkit {VERSION} → {server}")
+        problem = bridge.hello()
+        if problem:
+            cfg_path.with_suffix(".pid").unlink(missing_ok=True)
+            log(f"✕ {problem}")
+            sys.exit(1)
+        log("связь с сервером есть — в чате компьютер уже виден")
         if not bridge.folders:
             log("откройте агенту папку — появится обычное окно выбора")
             while True:
@@ -628,8 +692,23 @@ def main(argv: list[str] | None = None) -> None:
                 HOME_DIR.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(__file__, script)
             cfg_path.with_suffix(".pid").unlink(missing_ok=True)  # фоновый экземпляр возьмёт замок сам
+            log_file = HOME_DIR / "bridge.log"
+            start = log_file.stat().st_size if log_file.exists() else 0
             install_autostart(cfg_path, script)
-            log("готово: мост работает в фоне и запустится сам при входе. Окно можно закрыть.")
+            if wait_background(log_file, start):
+                log("готово: мост работает в фоне и запустится сам при входе. Окно можно закрыть.")
+                return
+            tail = log_tail(log_file, start)
+            log("✕ фоновый мост не вышел на связь за 20 с" + (f". Его лог ({log_file}):\n{tail}" if tail else
+                                                            f" и ничего не написал в {log_file}"))
+            if not take_lock(cfg_path):
+                log("фоновый мост запущен, но не подключается — пришлите этот вывод разработчику")
+                sys.exit(1)
+            log("пока держу связь из этого окна — не закрывайте его")
+            try:
+                bridge.loop()
+            except KeyboardInterrupt:
+                log("остановлено")
             return
         log("готово. Пока это окно открыто, агент видит компьютер. Закрыть — Ctrl+C или крестик.")
     else:

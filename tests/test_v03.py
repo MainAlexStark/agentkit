@@ -207,3 +207,21 @@ async def test_show_visual_validates_and_returns_widget(store):
     # схема без $ref — её понимают все провайдеры
     import json as _json
     assert "$ref" not in _json.dumps(t.schema())
+
+
+def test_bridge_setup_checks_connection_and_background(tmp_path, monkeypatch):
+    # Не тот адрес — настройка говорит об этом сразу, а не «готово» с молчащим фоновым мостом.
+    b = Bridge("http://127.0.0.1:1", "k", [], False)
+    assert "нет связи с http://127.0.0.1:1" in b.hello()
+
+    from agentkit import bridge as br
+
+    monkeypatch.setattr(br.time, "sleep", lambda s: None)
+    log = tmp_path / "bridge.log"
+    log.write_text("старое: подключено\n", encoding="utf-8")
+    start = log.stat().st_size
+    assert not br.wait_background(log, start, timeout=0.05)  # старые строки не считаются
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write("Traceback: что-то сломалось\n[12:00:00] подключено — агент видит этот компьютер\n")
+    assert br.wait_background(log, start, timeout=1)
+    assert br.log_tail(log, start).startswith("Traceback")
