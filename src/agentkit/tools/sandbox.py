@@ -1,13 +1,21 @@
-"""run_python / run_bash — код в песочнице (agentkit.sandbox), а не в процессе сервиса.
+"""run_python / run_bash — код на «компьютере агента» (agentkit.sandbox), а не в процессе сервиса.
 
-read_only=True намеренно: песочница без сети и без секретов, меняет только
-рабочую папку разговора — подтверждать каждый расчёт было бы шумом. Всё, что
-выходит наружу (файлы на компьютер, письма, записи в системы), идёт другими
-инструментами со своими подтверждениями.
+read_only=True намеренно: песочница без секретов, интернет — только по белому
+списку, меняет только рабочую папку разговора — подтверждать каждый расчёт было
+бы шумом. Всё, что выходит наружу (файлы на компьютер человека, письма, записи
+в системы), идёт другими инструментами со своими подтверждениями.
+
+url="local" — без отдельного сервера, процессы на этой же машине (разработка):
+без этого локальный запуск оставался без run_python, и агент, не найдя его,
+«проверял» код чтением файла. Изоляции там нет, поэтому в local инструменты
+НЕ read_only: каждый запуск — по подтверждению (в режиме default), иначе код из
+чужого файла выполнился бы на ноутбуке разработчика без спроса.
 """
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
 from typing import Annotated, Any
 
 import httpx
@@ -15,46 +23,86 @@ import httpx
 from agentkit.tools.base import Tool, ToolContext, ToolResult, tool
 
 
-def sandbox_tools(url: str, token: str = "", *, client: httpx.AsyncClient | None = None) -> list[Tool]:
-    base = url.rstrip("/")
+def network_note(url: str, egress: str) -> str:
+    """Что модели знать о сети: без этого она тратит шаги на pip install там, где сети нет."""
+    if url == "local":
+        return "Песочница локальная (режим разработки): интернет — как у машины."
+    hosts = [h.strip() for h in egress.split(",") if h.strip()]
+    if not hosts:
+        return "Интернета нет: pip install не сработает — обходись установленным."
+    if "*" in hosts:
+        return "Интернет есть (кроме внутренних адресов); pip install ставит пакеты в разговор."
+    return ("Интернет — только к: " + ", ".join(hosts) + ". pip install работает, если пакет оттуда; "
+            "пакеты и файлы сохраняются в разговоре.")
 
-    async def call(ctx: ToolContext, kind: str, code: str, timeout: int) -> ToolResult:
+
+def sandbox_tools(url: str, token: str = "", *, client: httpx.AsyncClient | None = None, egress: str = ""
+                  ) -> list[Tool]:
+    base = url.rstrip("/")
+    local = url == "local"
+
+    async def call(ctx: ToolContext, kind: str, code: str, timeout: int, background: bool = False) -> ToolResult:
+        # Папка разговора — та же, что у файловых инструментов: у субагента она своя, и имя
+        # папки, а не session_id, гарантирует, что run_python видит файлы, записанные write_file.
+        session = ctx.workspace.name if ctx.workspace is not None else ctx.session_id
         if ctx.workspace is not None:
             ctx.workspace.mkdir(parents=True, exist_ok=True)
-        payload = {"session": ctx.session_id, "kind": kind, "code": code, "timeout": timeout}
+        if local:
+            from agentkit.sandbox import execute  # noqa: PLC0415
+
+            root = ctx.workspace.parent if ctx.workspace is not None else Path("data/workspaces")
+            try:
+                d = await asyncio.to_thread(execute, root, session, kind, code, timeout, background=background)
+            except (ValueError, OSError) as e:
+                return ToolResult.error(f"песочница: {e}")
+            return _result(d)
+        payload = {"session": session, "kind": kind, "code": code, "timeout": timeout, "background": background}
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         try:
             if client is not None:
-                r = await client.post(base + "/run", json=payload, headers=headers, timeout=timeout + 15)
+                r = await client.post(base + "/run", json=payload, headers=headers, timeout=timeout + 45)
             else:
                 async with httpx.AsyncClient() as c:
-                    r = await c.post(base + "/run", json=payload, headers=headers, timeout=timeout + 15)
+                    r = await c.post(base + "/run", json=payload, headers=headers, timeout=timeout + 45)
         except httpx.HTTPError as e:
             return ToolResult.error(f"песочница недоступна ({e}); проверьте сервис sandbox и AGENT_SANDBOX_URL")
         if r.status_code != 200:
-            return ToolResult.error(f"песочница: {r.json().get('error', r.text) if r.content else r.status_code}")
+            try:
+                msg = r.json().get("error", r.text)
+            except ValueError:
+                msg = r.text or str(r.status_code)
+            return ToolResult.error(f"песочница: {msg}")
         return _result(r.json())
 
-    @tool(title="Python", read_only=True, concurrency_safe=False, group="sandbox", source="builtin", timeout=660)
+    net = network_note(url, egress)
+    py_doc = (
+        "Выполняет код Python на твоём компьютере в песочнице. Текущая папка — рабочая папка разговора: "
+        "вложения пользователя (uploads/) и всё, что ты создал (в том числе write_file). Есть pandas, numpy, "
+        "matplotlib, openpyxl, python-docx, reportlab, pillow, pypdf. " + net + " Созданные файлы человек "
+        "сразу видит и может скачать. Переменные между вызовами не сохраняются — только файлы. "
+        "Используй, чтобы посчитать, проверить код или файл, построить график, собрать документ.")
+    bash_doc = (
+        "Выполняет команду bash в песочнице в рабочей папке разговора. " + net + " "
+        "background=true — для долгого: команда работает дальше после ответа, вывод пишется в .jobs/<id>.log "
+        "(смотри tail, останавливай kill <pid>). Процессы живут, пока разговор активен.")
+
+    @tool(title="Python", description=py_doc, read_only=not local, concurrency_safe=False, group="sandbox", source="builtin", timeout=660)
     async def run_python(
         ctx: ToolContext,
         code: Annotated[str, "Программа на Python 3. Печатай результат через print; файлы сохраняй в текущую папку"],
         timeout: Annotated[int, "Сколько ждать, секунд (до 600)"] = 120,
     ) -> ToolResult:
-        """Выполняет код Python в изолированной песочнице (без интернета). Текущая папка — рабочая папка
-        разговора: там вложения пользователя (uploads/) и всё, что ты создал. Есть pandas, numpy,
-        matplotlib, openpyxl, python-docx, reportlab. Созданные файлы человек сможет скачать.
-        Между вызовами переменные не сохраняются — только файлы."""
         return await call(ctx, "python", code, max(1, min(timeout, 600)))
 
-    @tool(title="Команда в песочнице", read_only=True, concurrency_safe=False, group="sandbox", source="builtin", timeout=660)
+    @tool(title="Команда в песочнице", description=bash_doc, read_only=not local, concurrency_safe=False, group="sandbox", source="builtin",
+          timeout=660)
     async def run_bash(
         ctx: ToolContext,
         command: Annotated[str, "Команда bash"],
         timeout: Annotated[int, "Сколько ждать, секунд (до 600)"] = 60,
+        background: Annotated[bool, "Запустить в фоне и сразу вернуть номер задачи (сервер, долгий расчёт)"] = False,
     ) -> ToolResult:
-        """Выполняет команду bash в изолированной песочнице (без интернета) в рабочей папке разговора."""
-        return await call(ctx, "bash", command, max(1, min(timeout, 600)))
+        return await call(ctx, "bash", command, max(1, min(timeout, 600)), background)
 
     return [run_python, run_bash]
 
@@ -62,7 +110,10 @@ def sandbox_tools(url: str, token: str = "", *, client: httpx.AsyncClient | None
 def _result(d: dict[str, Any]) -> ToolResult:
     code = d.get("exit_code")
     parts = [f"Код выхода: {code if code is not None else 'прервано по времени'} · {d.get('seconds', 0)} с"]
-    if d.get("stdout"):
+    if job := d.get("job"):
+        parts = [f"Запущено в фоне: задача {job['id']}, pid {job['pid']}. Вывод — {job['log']} "
+                 f"(tail -n 50 {job['log']}), остановить — kill {job['pid']}."]
+    if d.get("stdout") and not job:
         parts.append("stdout:\n" + d["stdout"])
     if d.get("stderr"):
         parts.append("stderr:\n" + d["stderr"])

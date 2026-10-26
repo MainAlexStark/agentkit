@@ -34,39 +34,74 @@ services:
       - internal
       - sandbox
 
-  # Песочница для run_python / run_bash: сеть без выхода наружу, без секретов и базы.
-  # С агентом делит только рабочие папки разговоров (подпапка workspaces тома data).
+  # Компьютер агента (run_python / run_bash): сервер, который держит по контейнеру на разговор.
+  # Ему — и только ему — дан docker.sock: сервис агента сокета не видит, а код разговоров
+  # работает в отдельных контейнерах (uid 1000, без capabilities, только своя папка /work,
+  # сеть agent-sandbox-net без выхода наружу, кроме egress).
   sandbox:
     build:
       context: .
       dockerfile: deploy/sandbox.Dockerfile
+    image: agent-service-sandbox:latest
     container_name: agent-service-sandbox
     restart: unless-stopped
+    # root — ради docker.sock (он и так равен root на машине); права на папки — только нужные.
+    user: "0"
     env_file:
       - ./deploy/sandbox.env
+    environment:
+      SANDBOX_BACKEND: docker
+      SANDBOX_IMAGE: agent-service-sandbox:latest
+      SANDBOX_VOLUME: agent-service_data
+      SANDBOX_SUBPATH: workspaces
+      SANDBOX_NETWORK: agent-sandbox-net
+      SANDBOX_PROXY: http://egress:3128
     depends_on:
       agent-service:
         condition: service_healthy
+      egress:
+        condition: service_started
     volumes:
       - type: volume
         source: data
         target: /work
         volume:
           subpath: workspaces
+      - /var/run/docker.sock:/var/run/docker.sock
     read_only: true
     tmpfs:
       - /tmp
-      - /home/sandbox
     cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
     security_opt: ["no-new-privileges:true"]
-    pids_limit: 256
-    mem_limit: 3g
-    cpus: 2
+    stop_grace_period: 60s  # успеть убрать контейнеры разговоров
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
     networks:
       - sandbox
+
+  # Единственный выход контейнеров разговоров в интернет: домены из AGENT_SANDBOX_EGRESS
+  # (deploy.sh кладёт список в deploy/sandbox.env), внутренние адреса — никогда.
+  egress:
+    build:
+      context: .
+      dockerfile: deploy/sandbox.Dockerfile
+    image: agent-service-sandbox:latest
+    container_name: agent-service-egress
+    restart: unless-stopped
+    command: ["python", "-m", "agentkit.egress"]
+    env_file:
+      - ./deploy/sandbox.env
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks:
+      - sandbox-net
+      - egress
 
   postgres:
     image: postgres:16-alpine
@@ -114,6 +149,12 @@ networks:
   mcp-network:
     external: true
   internal:
-  # internal: true — у песочницы нет выхода в интернет.
+  # Агент ↔ сервер песочницы. internal: true — без выхода в интернет.
   sandbox:
     internal: true
+  # Контейнеры разговоров ↔ egress. Имя фиксировано: его называет сервер песочницы при docker run.
+  # Сервиса агента и базы в этой сети нет — код разговора до них не дотянется.
+  sandbox-net:
+    name: agent-sandbox-net
+    internal: true
+  egress:

@@ -87,6 +87,12 @@ cd ~/projects/<имя> && agentkit vendor && pytest && git commit -am "agentkit 
 
 - **Проекты** (`AGENT_ENABLE_PROJECTS`) — пользователи сами заводят их в чате: инструкции, файлы, память, доступ коллегам.
 - **Компьютер** (`AGENT_ENABLE_DEVICES`) — «Настройки → Компьютер» выдаёт ключ и команду запуска `bridge.py`; агент получает инструменты `pc_*` только пока мост подключён.
-- **Песочница** — на VPS `deploy.sh` поднимает сервис `sandbox` и прописывает `AGENT_SANDBOX_URL`; локально: `agentkit sandbox --root data/workspaces --port 8090`. Нужны другие библиотеки — допишите их в `deploy/sandbox.Dockerfile`.
+- **Компьютер агента** (run_python / run_bash) — на VPS `deploy.sh` поднимает сервисы `sandbox` (контейнер на разговор) и `egress` (интернет по списку `AGENT_SANDBOX_EGRESS`, по умолчанию только PyPI) и прописывает `AGENT_SANDBOX_URL`. Нужны другие библиотеки «из коробки» — допишите их в `deploy/sandbox.Dockerfile`; остальное агент поставит сам через `pip install`.
+  Локально, без докера: `AGENT_SANDBOX_URL=local` — код выполняется на вашей машине без изоляции, поэтому каждый запуск спрашивает подтверждение. С Docker Desktop — как на VPS:
+  ```bash
+  docker build -f deploy/sandbox.Dockerfile -t agentkit-sandbox .
+  agentkit sandbox --backend docker --image agentkit-sandbox --host-root "$PWD/data/workspaces" --port 8090
+  # .env: AGENT_SANDBOX_URL=http://localhost:8090  (сеть контейнеров — none; интернет: --network + agentkit egress)
+  ```
 
 Если агенту что-то из этого не нужно (например, сервис для внешних клиентов) — выключите переменной.

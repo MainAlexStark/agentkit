@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from agentkit.tools.base import Tool, ToolContext, ToolResult
+from agentkit.tools.base import Tool, ToolContext, ToolDenied, ToolResult
 
 CHART_KINDS = ["line", "area", "bar", "stacked_bar", "hbar", "pie", "donut", "scatter"]
 MAX_BLOCKS = 24
@@ -81,7 +81,10 @@ SCHEMA: dict[str, Any] = {
                                 "интерактивный расчёт). Рисуется в изолированном окне без доступа к сети; "
                                 "библиотеки можно подключать с cdnjs.cloudflare.com или cdn.jsdelivr.net. "
                                 "Цвета бери из CSS-переменных --text, --muted, --line, --surface, --viz-1…--viz-8."},
-        "height": {"type": "integer", "description": "html: высота в пикселях (по умолчанию — по содержимому)"},
+        "path": {"type": "string",
+                 "description": "Вместо html — путь к HTML-файлу в рабочей папке (создай его write_file). Для "
+                                "большого интерактива это надёжнее: длинный html в аргументе модели теряют."},
+        "height": {"type": "integer", "description": "html/path: высота в пикселях (по умолчанию — по содержимому)"},
     },
 }
 
@@ -91,7 +94,8 @@ DESCRIPTION = """Показывает человеку в чате график�
 или от человека), не придумывай. Не повторяй потом те же цифры текстом — коротко напиши вывод.
 Один график — одна мысль; не больше 6 рядов на графике; разные единицы — разные графики (никогда две оси Y).
 Визуализация встаёт прямо в ответ: напиши вводную фразу, вызови show_visual, потом вывод — читается одним текстом.
-Обычно хватает blocks; html — только для того, что blocks не умеют.
+Обычно хватает blocks; html — только для того, что blocks не умеют. Больше пары экранов кода —
+сначала write_file в .html, потом show_visual(path=…).
 Если нужен файл (отчёт PDF, Excel, HTML-страница) — его создают run_python или write_file: готовый файл сам
 откроется у человека в панели сбоку."""
 
@@ -180,9 +184,32 @@ def _summary(title: str, blocks: list[dict[str, Any]], html: str) -> str:
     return f"Показано человеку{f' «{title}»' if title else ''}: " + ", ".join(kinds) + ". Цифры он уже видит — напиши вывод."
 
 
-async def _show_visual(ctx: ToolContext, title: str = "", blocks: list[dict[str, Any]] | None = None, html: str = "",
-                       height: int = 0) -> ToolResult:
+def _read_html(ctx: ToolContext, path: str) -> str:
+    from agentkit.tools.files import resolve  # noqa: PLC0415 — та же граница рабочей папки, что у файлов
+
     try:
+        p = resolve(ctx, path)
+    except ToolDenied as e:
+        raise ValueError(str(e)) from e
+    if not p.is_file():
+        raise ValueError(f"нет файла {path} в рабочей папке — сначала создай его write_file")
+    if p.stat().st_size > MAX_HTML * 4:
+        raise ValueError(f"{path} больше {MAX_HTML} символов — упрости страницу")
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
+async def _show_visual(ctx: ToolContext, title: str = "", blocks: list[dict[str, Any]] | None = None, html: str = "",
+                       height: int = 0, path: str = "") -> ToolResult:
+    if not blocks and not html and not path:
+        # Так выглядит потерянный аргумент: модель «вставила» html, а дошли только title/height.
+        # Голое «нужно blocks или html» модель читала как сбой и повторяла тот же вызов (17 раз подряд).
+        return ToolResult.error(
+            "пришли только title/height — html до инструмента не дошёл (вероятно, слишком длинный аргумент). "
+            "Не повторяй тот же вызов: запиши страницу write_file в файл .html и вызови show_visual(path=…), "
+            "или покажи данные блоками (blocks).")
+    try:
+        if path and not html:
+            html = _read_html(ctx, path)
         clean = validate(title, blocks or [], html)
     except ValueError as e:
         return ToolResult.error(str(e))

@@ -10,7 +10,7 @@
   7. needs_approval у инструмента          → ask (даже в auto: это доменная страховка)
   8. read_only                             → allow
   9. режим auto                            → allow
- 10. accept_edits и группа files           → allow (кроме destructive)
+ 10. accept_edits (или workspace_edits) и группа files → allow (кроме destructive)
  11. иначе (режим default)                 → ask
 
 Правило — строка «имя_инструмента» или «имя(шаблон)»: шаблон сравнивается
@@ -91,6 +91,9 @@ class Permissions:
     deny: list[str] = field(default_factory=list)
     # Группы инструментов, которые режим ACCEPT_EDITS пропускает без вопроса.
     edit_groups: tuple[str, ...] = ("files",)
+    # Правки рабочей папки без вопроса в любом пишущем режиме — когда папка своя у каждого разговора
+    # (сервис): иначе каждая правка HTML-черновика ждала человека (8 подтверждений на один дашборд).
+    workspace_edits: bool = False
 
     def __post_init__(self) -> None:
         self._allow = [Rule.parse(r) for r in self.allow]
@@ -98,7 +101,8 @@ class Permissions:
         self._deny = [Rule.parse(r) for r in self.deny]
 
     def with_mode(self, mode: Mode | str) -> Permissions:
-        return Permissions(mode=Mode(mode), allow=self.allow, ask=self.ask, deny=self.deny, edit_groups=self.edit_groups)
+        return Permissions(mode=Mode(mode), allow=self.allow, ask=self.ask, deny=self.deny, edit_groups=self.edit_groups,
+                           workspace_edits=self.workspace_edits)
 
     def check(self, tool: Tool, args: dict[str, Any], ctx: ToolContext | None = None) -> Verdict:
         name = tool.name
@@ -125,6 +129,7 @@ class Permissions:
             return Verdict(Decision.ALLOW)
         if self.mode in (Mode.AUTO, Mode.BYPASS):
             return Verdict(Decision.ALLOW)
-        if self.mode == Mode.ACCEPT_EDITS and tool.group in self.edit_groups and not tool.destructive:
+        if (self.mode == Mode.ACCEPT_EDITS or self.workspace_edits) and tool.group in self.edit_groups \
+                and not tool.destructive:
             return Verdict(Decision.ALLOW)
         return Verdict(Decision.ASK, "")

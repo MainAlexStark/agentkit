@@ -57,7 +57,9 @@ prepare_extra() {
   env_set "${PREFIX}_REDIS_URL" "redis://redis:6379/0"
   [ -n "$(env_get "${PREFIX}_WORKERS")" ] || env_set "${PREFIX}_WORKERS" "2"
 
-  # Песочница (run_python): свой контейнер; токен общий у агента и песочницы, придумывается один раз.
+  # Компьютер агента (run_python): сервер песочницы + egress; токен общий у агента и песочницы,
+  # придумывается один раз. Интернет песочницы — по списку доменов; по умолчанию только PyPI,
+  # чтобы работал pip install. Пустое значение — без интернета совсем.
   env_set "${PREFIX}_SANDBOX_URL" "http://sandbox:8090"
   local sb_token
   sb_token="$(env_get "${PREFIX}_SANDBOX_TOKEN")"
@@ -65,7 +67,9 @@ prepare_extra() {
     sb_token="$(gen_secret 24)"
     env_set "${PREFIX}_SANDBOX_TOKEN" "$sb_token"
   fi
-  printf 'SANDBOX_TOKEN=%s\n' "$sb_token" > deploy/sandbox.env
+  grep -q "^${PREFIX}_SANDBOX_EGRESS=" "$ENV_FILE" 2>/dev/null \
+    || env_set "${PREFIX}_SANDBOX_EGRESS" "pypi.org,files.pythonhosted.org"
+  printf 'SANDBOX_TOKEN=%s\nEGRESS_ALLOW=%s\n' "$sb_token" "$(env_get "${PREFIX}_SANDBOX_EGRESS")" > deploy/sandbox.env
   chmod 600 deploy/sandbox.env
 
   # Токены придумываются один раз: перевыпуск выкинул бы всех из чата

@@ -205,7 +205,7 @@ class AgentService:
         if self.devices:
             out += device_tools(self.devices)
         if s.sandbox_url:
-            out += sandbox_tools(s.sandbox_url, s.sandbox_token)
+            out += sandbox_tools(s.sandbox_url, s.sandbox_token, egress=s.sandbox_egress)
         return out
 
     # ── MCP-серверы: из mcp.json и добавленные в настройках ──────────
@@ -389,7 +389,8 @@ def assemble_agent(
         tools=reg,
         spec=spec,
         subagents=domain.subagents,
-        permissions=Permissions(mode=Mode(s.default_mode), allow=split_rules(s.allow_rules),
+        permissions=Permissions(mode=Mode(s.default_mode), workspace_edits=s.workspace_edits,
+                                allow=split_rules(s.allow_rules),
                                 ask=split_rules(s.ask_rules), deny=split_rules(s.deny_rules)),
         hooks=domain.hooks,
         skills=SkillLibrary.from_dirs(s.skills_dir),

@@ -86,9 +86,17 @@ class Settings(BaseSettings):
     enable_projects: bool = True
     project_inline_chars: int = 40_000  # столько текста файлов проекта кладётся прямо в промпт
     max_project_file_mb: int = 50
-    # Песочница для run_python / run_bash (сервис sandbox в docker-compose). Пусто — выключена.
+    # Компьютер агента — run_python / run_bash. Пусто — выключен; http://sandbox:8090 — сервис sandbox
+    # (контейнер на разговор); "local" — процессы на этой машине, только для разработки: код видит
+    # всё, что видит сервис (файлы, .env), поэтому по умолчанию не включается.
     sandbox_url: str = ""
     sandbox_token: str = ""
+    # Куда песочнице можно в интернет (через прокси egress): домены через запятую, «*» — всюду, пусто — никуда.
+    # Сервис только сообщает это модели; пропускает трафик сам прокси (deploy.sh передаёт ему тот же список).
+    sandbox_egress: str = ""
+    # Правки файлов в папке разговора (write_file / edit_file) — без подтверждения: это рабочая папка
+    # агента, run_python и так пишет туда без вопросов, а откат к сообщению возвращает файлы.
+    workspace_edits: bool = True
     max_output_chars: int = 30_000
 
     def model_list(self) -> list[str]:

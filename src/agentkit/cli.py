@@ -155,11 +155,12 @@ def main(argv: list[str] | None = None) -> None:
     # Мост и песочница разбирают свои аргументы сами — здесь только передаём остаток.
     sub.add_parser("bridge", help="мост: папки и команды этого компьютера для агента", add_help=False)
     sub.add_parser("sandbox", help="песочница для run_python / run_bash", add_help=False)
+    sub.add_parser("egress", help="прокси с белым списком доменов для песочницы", add_help=False)
     argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] in ("bridge", "sandbox"):
-        from agentkit import bridge, sandbox  # noqa: PLC0415
+    if argv and argv[0] in ("bridge", "sandbox", "egress"):
+        from agentkit import bridge, egress, sandbox  # noqa: PLC0415
 
-        return (bridge if argv[0] == "bridge" else sandbox).main(argv[1:])
+        return {"bridge": bridge, "sandbox": sandbox, "egress": egress}[argv[0]].main(argv[1:])
     a = ap.parse_args(argv)
     if a.cmd == "new":
         new(a.name, a.dest, a.git)
