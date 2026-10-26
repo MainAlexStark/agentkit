@@ -38,6 +38,7 @@ const S = {
   running: false,
   bubble: null,      // текущий ответ, который печатается
   bubbleText: "",
+  day: null,         // день последнего сообщения в ленте — для разделителей дат
   group: null,       // текущая группа действий агента
   steps: new Map(),  // tool_call_id → шаг
   subs: new Map(),   // id дочерней сессии → контейнер субагента
@@ -134,8 +135,60 @@ function add(el, { keepGroup = false } = {}) {
   if ($("#empty")) { $("#empty").remove(); setEmpty(false); }
   // Любой элемент, кроме шагов, закрывает текущую группу действий.
   if (!keepGroup) closeGroup();
-  box().append(el); scroll(); return el;
+  // Индикатор работы всегда последний в ленте — новое встаёт перед ним.
+  const w = $("#working");
+  w ? box().insertBefore(el, w) : box().append(el);
+  scroll(); return el;
 }
+
+// ── индикатор «агент работает» ─────────────────────────────────────
+// Живёт внизу ленты весь прогон: между шагами модель может молчать десятки секунд,
+// и без него непонятно, работает агент или завис. Пока печатается текст — прячем:
+// там есть мигающий курсор. Пока ждёт подтверждения — замирает и просит ответить.
+function showWorking(on) {
+  clearInterval(S.workTimer);
+  if (!on) { $("#working")?.remove(); return; }
+  let w = $("#working");
+  if (!w) {
+    w = h("div", { id: "working", class: "working", role: "status", "aria-live": "polite" },
+      h("span", { class: "spinner", "aria-hidden": "true" }), h("span", { class: "working-label" }, "Думает…"), h("span", { class: "working-time" }));
+    box().append(w);
+  }
+  const t0 = Date.now(), t = w.querySelector(".working-time");
+  t.textContent = "";
+  S.workTimer = setInterval(() => {
+    const s = Math.floor((Date.now() - t0) / 1000);
+    t.textContent = s < 3 ? "" : s < 60 ? `${s} с` : `${Math.floor(s / 60)} мин ${s % 60} с`;
+  }, 1000);
+  scroll();
+}
+function workingState(state) {
+  const w = $("#working"); if (!w) return;
+  w.hidden = state === "typing";
+  w.classList.toggle("waiting", state === "waiting");
+  w.querySelector(".working-label").textContent = state === "waiting" ? "Ждёт вашего решения" : state === "tools" ? "Выполняет действия…" : "Думает…";
+}
+
+// ── время сообщений и разделители дней ─────────────────────────────
+const nowTs = () => Date.now() / 1000;
+const fmtTime = ts => new Date(ts * 1000).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+function dayLabel(ts) {
+  const d = new Date(ts * 1000), today = new Date(), yest = new Date();
+  yest.setDate(today.getDate() - 1);
+  if (d.toDateString() === today.toDateString()) return "Сегодня";
+  if (d.toDateString() === yest.toDateString()) return "Вчера";
+  return d.toLocaleDateString("ru-RU", { day: "numeric", month: "long", year: d.getFullYear() === today.getFullYear() ? undefined : "numeric" });
+}
+// Разделитель — перед первым сообщением нового дня. S.day помнит день последнего
+// сообщения в ленте; сбрасывается в resetView, иначе при переключении разговоров
+// первый день нового разговора терялся бы, если совпал с днём прошлого.
+function daySep(ts) {
+  const key = new Date(ts * 1000).toDateString();
+  if (S.day === key) return;
+  S.day = key;
+  add(h("div", { class: "day-sep", role: "separator" }, dayLabel(ts)));
+}
+const timeEl = ts => h("time", { class: "msg-time", datetime: new Date(ts * 1000).toISOString(), title: fmtWhen(ts) }, fmtTime(ts));
 
 function splitContent(content) {
   if (typeof content === "string") return { text: content, files: [] };
@@ -143,15 +196,16 @@ function splitContent(content) {
   return { text: parts.filter(p => p.type === "text").map(p => p.text).join("\n"), files: parts.filter(p => p.type === "file") };
 }
 
-function userMsg(content, seq, { queued = false } = {}) {
+function userMsg(content, seq, { queued = false, ts = nowTs() } = {}) {
   const { text, files } = splitContent(content);
+  daySep(ts);
   const badge = queued ? h("span", { class: "queued-badge" }, "агент прочтёт после текущего шага") : null;
   const rewind = seq ? h("button", { class: "btn ghost sm", title: "Откатить разговор и файлы агента к моменту до этого сообщения",
     onclick: () => doRewind(seq, text) }, icon("undo"), "Изменить") : null;
   const el = add(h("div", { class: "msg user" + (queued ? " queued" : "") },
     files.length ? h("div", { class: "files" }, files.map(fileView)) : null,
     text ? h("div", { class: "bubble" }, text) : null,
-    h("div", { class: "meta" }, badge, rewind)));
+    h("div", { class: "meta" }, badge, timeEl(ts), text ? copyBtn(() => text) : null, rewind)));
   el._badge = badge;
   return el;
 }
@@ -184,10 +238,12 @@ function finishBubble(b, text, intermediate = false) {
   if (intermediate) return; // «Проверю по реестру.» перед действиями — копировать нечего
   const msg = b.parentElement;
   msg.querySelector(".msg-actions")?.remove();
-  msg.append(h("div", { class: "msg-actions" }, copyBtn(() => text)));
+  msg.append(h("div", { class: "msg-actions" }, copyBtn(() => text), timeEl(b._ts)));
 }
-function assistantBubble() {
+function assistantBubble(ts = nowTs()) {
   const b = h("div", { class: "md streaming" });
+  b._ts = ts;
+  daySep(ts);
   add(h("div", { class: "msg assistant" }, b));
   return b;
 }
@@ -390,25 +446,26 @@ function onEvent(ev) {
     case "user_message": {
       const el = S.queued.shift();
       if (el) { el.classList.remove("queued"); el._badge?.remove(); closeGroup(); }
-      else userMsg(d.content, d.seq);
+      else userMsg(d.content, d.seq, { ts: ev.ts });
       break;
     }
     case "text_delta":
       if (ev.agent) break;
-      if (!S.bubble) { S.bubble = assistantBubble(); S.bubbleText = ""; }
+      if (!S.bubble) { S.bubble = assistantBubble(ev.ts); S.bubbleText = ""; workingState("typing"); }
       S.bubbleText = d.snapshot ? d.text : S.bubbleText + d.text;
       S.bubble.innerHTML = md(S.bubbleText); scroll(); break;
     case "message":
       if (ev.agent) break;
       if (d.content) {
-        if (!S.bubble) S.bubble = assistantBubble();
+        if (!S.bubble) S.bubble = assistantBubble(ev.ts);
         renderMd(S.bubble, d.content); finishBubble(S.bubble, d.content, !!d.tool_calls?.length);
       } else S.bubble?.parentElement.remove();
       S.bubble?.classList.remove("streaming");
       S.bubble = null; S.bubbleText = "";
       for (const tc of d.tool_calls || []) stepRow(tc.id, tc.function.name, safeJSON(tc.function.arguments));
+      workingState(d.tool_calls?.length ? "tools" : "thinking");
       break;
-    case "tool_call": stepRow(d.id, d.name, d.args, d.title, ev.agent); break;
+    case "tool_call": stepRow(d.id, d.name, d.args, d.title, ev.agent); if (!ev.agent) workingState("tools"); break;
     case "tool_result": {
       stepResult(d.id, d.content, d.is_error, ev.agent ? [] : d.ui, d.elapsed_ms);
       // Готовый файл — сразу в панель сбоку (только вживую, не при открытии старого разговора).
@@ -426,8 +483,8 @@ function onEvent(ev) {
       step?.el.insertBefore(sub, step.detail);
       break;
     }
-    case "approval_required": approvalCard(d); break;
-    case "approval_resolved": closeCard(d.approval_id, d.approved, d.expired); break;
+    case "approval_required": approvalCard(d); workingState("waiting"); break;
+    case "approval_resolved": closeCard(d.approval_id, d.approved, d.expired); workingState("tools"); break;
     case "ask_user": add(choices(d.question, d.options)); break;
     case "todo": if (!ev.agent) renderTodos(d.todos); break;
     case "compacted": note("История сжата, чтобы поместиться в контекст"); break;
@@ -479,6 +536,7 @@ async function follow() {
 function setRunning(on) {
   // Отправка доступна и во время работы: сообщение встанет в очередь, агент прочтёт его между шагами.
   S.running = on;
+  showWorking(on);
   $("#stop").hidden = !on;
   $("#input").placeholder = on ? "Дописать агенту, пока он работает…" : "Сообщение…";
   updateSend();
@@ -661,7 +719,7 @@ function emptyState() {
 
 function resetView() {
   S.stream?.abort();
-  S.steps.clear(); S.subs.clear(); S.cards.clear(); S.bubble = null; S.group = null; S.lastSeq = 0; setCost(0);
+  S.steps.clear(); S.subs.clear(); S.cards.clear(); S.bubble = null; S.group = null; S.lastSeq = 0; S.day = null; setCost(0);
   box().replaceChildren(emptyState());
   S.tasksShown = false; renderTodos([]); toggleTasks(false); setRunning(false);
   S.queued = []; S.attachments = []; renderAttachments();
@@ -682,9 +740,11 @@ async function openSession(id) {
   if (!s.messages.length) box().replaceChildren(emptyState());
   for (const m of s.messages) {
     if (m.meta?.hidden) continue;
-    if (m.role === "user") userMsg(m.content, m.seq);
+    // ts нет у старых ответов API — тогда «сейчас», лента всё равно рисуется.
+    const ts = m.ts || nowTs();
+    if (m.role === "user") userMsg(m.content, m.seq, { ts });
     else if (m.role === "assistant") {
-      if (m.content) { const b = assistantBubble(); renderMd(b, m.content); finishBubble(b, m.content, !!m.tool_calls?.length); }
+      if (m.content) { const b = assistantBubble(ts); renderMd(b, m.content); finishBubble(b, m.content, !!m.tool_calls?.length); }
       for (const tc of m.tool_calls || []) stepRow(tc.id, tc.function.name, safeJSON(tc.function.arguments));
     } else if (m.role === "tool") stepResult(m.tool_call_id, m.content, m.meta?.is_error, m.meta?.ui, m.meta?.elapsed_ms);
   }

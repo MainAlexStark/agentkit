@@ -311,6 +311,11 @@ class SQLStore(Store):
         async with self.engine.connect() as c:
             return [(r.seq, Message.from_dict(r.data)) for r in await c.execute(q)]
 
+    async def message_times(self, session_id):
+        q = select(messages.c.seq, messages.c.created_at).where(messages.c.session_id == session_id)
+        async with self.engine.connect() as c:
+            return {r.seq: r.created_at for r in await c.execute(q)}
+
     async def delete_messages_after(self, session_id, seq):
         async with self.engine.begin() as c:
             r = await c.execute(delete(messages).where(messages.c.session_id == session_id, messages.c.seq > seq))

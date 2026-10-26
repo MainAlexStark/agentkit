@@ -63,6 +63,8 @@ def test_chat_with_approval(client):
     s = client.get(f"/api/sessions/{sid}", headers=H).json()
     assert s["approvals"] == []
     assert s["messages"][-1]["content"] == "Записал #1."
+    # время записи — для разделителей дней и времени у сообщения в ленте
+    assert all(isinstance(m["ts"], float) and m["ts"] > 0 for m in s["messages"])
 
     # события доступны и опросом, и через SSE
     polled = client.get(f"/api/sessions/{sid}/poll?after=0", headers=H).json()["events"]

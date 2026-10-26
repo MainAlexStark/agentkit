@@ -238,6 +238,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
     async def get_session(session_id: str, user: User = Depends(auth)):
         s = await own_session(session_id, user)
         msgs = await svc.store.list_messages(session_id)
+        times = await svc.store.message_times(session_id)
         pending = await svc.store.list_approvals(session_id, status="pending")
         project = None
         if s.project_id and svc.projects is not None:
@@ -245,7 +246,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
             project = {"id": p.id, "name": p.name, "role": role} if p and role else None
         return {
             "id": s.id, "title": s.title, "state": s.state, "project": project,
-            "messages": [{"seq": seq, **m.to_dict()} for seq, m in msgs],
+            "messages": [{"seq": seq, "ts": times.get(seq), **m.to_dict()} for seq, m in msgs],
             "approvals": [{**a.__dict__, "destructive": bool((t := svc.registry.get(a.tool_name)) and t.destructive),
                            "title": t.title if t else ""} for a in pending],
             "running_run": await svc.runs.active_run(session_id),

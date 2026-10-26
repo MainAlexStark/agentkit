@@ -136,6 +136,21 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 .msg.user .meta { display: flex; gap: 6px; align-items: center; margin-top: 4px; min-height: 22px; opacity: 0; transition: opacity .12s; }
 .msg.user:hover .meta, .msg.user.queued .meta { opacity: 1; }
 .msg.user.queued .bubble { opacity: .55; }
+/* индикатор работы агента: кольцо с градиентным хвостом + переливающаяся подпись */
+.working { display: flex; align-items: center; gap: 10px; margin: 16px auto; min-height: 22px; font-size: 13px; color: var(--muted); animation: fade .25s ease-out; }
+.working[hidden] { display: none; }
+.spinner { flex: none; width: 18px; height: 18px; border-radius: 50%; background: conic-gradient(from 90deg, transparent 0 20%, color-mix(in srgb, var(--accent) 35%, transparent) 45%, var(--accent)); -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px)); mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px)); animation: spin .85s linear infinite; }
+.working-label { background: linear-gradient(90deg, var(--muted) 0%, var(--muted) 35%, var(--text) 50%, var(--muted) 65%, var(--muted) 100%); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: shimmer 2s linear infinite; }
+.working-time { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+.working.waiting .spinner { animation-play-state: paused; background: var(--warn); }
+.working.waiting .working-label { animation: none; color: var(--text-2); background: none; }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } .working-label { animation: none; color: var(--muted); background: none; } }
+.msg.user .meta .icon-btn { width: 26px; height: 26px; }
+.msg.user .meta svg { width: 14px; height: 14px; }
+.msg-time { font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; padding: 0 4px; cursor: default; }
+/* время у последнего ответа видно и без наведения (там всегда видны действия) — оставляем приглушённым */
+.day-sep { display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--muted); font-size: 12px; font-weight: 500; margin: 22px auto 6px; }
+.day-sep::before, .day-sep::after { content: ""; height: 1px; background: var(--line); flex: 1; max-width: 160px; }
 .queued-badge { font-size: 11.5px; color: var(--muted); display: inline-flex; align-items: center; gap: 5px; }
 .queued-badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--warn); animation: pulse 1.2s infinite; }
 .msg.assistant { font-size: 14.5px; line-height: 1.65; overflow-wrap: anywhere; }
@@ -392,6 +407,7 @@ body.dragging .composer { border-color: var(--accent); border-style: dashed; box
 .scrim { position: fixed; inset: 0; background: rgba(0,0,0,.3); z-index: 9; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
+@keyframes shimmer { to { background-position: -200% 0; } }
 @keyframes blink { 50% { opacity: 0; } }
 @keyframes pulse { 50% { opacity: .35; } }
 @keyframes fade { from { opacity: 0; } }
@@ -678,7 +694,7 @@ button.link:hover { text-decoration: underline; }
 .main.is-empty .composer { box-shadow: 0 6px 24px rgba(0,0,0,.06); }
 
 /* ── ответ: действия, кнопка вниз ──────────────────────────────────── */
-.msg-actions { display: flex; gap: 2px; margin-top: 4px; margin-left: -6px; opacity: 0; transition: opacity .12s; }
+.msg-actions { display: flex; align-items: center; gap: 2px; margin-top: 4px; margin-left: -6px; opacity: 0; transition: opacity .12s; }
 .msg.assistant:hover .msg-actions, .msg.assistant:last-child .msg-actions { opacity: 1; }
 .msg-actions .icon-btn { width: 28px; height: 28px; }
 .msg-actions svg { width: 15px; height: 15px; }
