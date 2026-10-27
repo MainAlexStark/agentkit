@@ -227,7 +227,8 @@ def test_docker_backend_bind_mount_for_laptop(tmp_path):
 async def test_sandbox_tools_local_mode_sees_written_files(store, tmp_path):
     ws = tmp_path / "workspaces" / "s_1"
     ctx = ctx_for(store, ws)
-    await write_file.call({"path": "data.csv", "content": "a\n1\n2\n"}, ctx)
+    assert (await write_file.call({"path": "data.csv", "content": "a\n1\n2\n"}, ctx)).ui
+    assert not (await write_file.call({"path": ".probe.txt", "content": "x"}, ctx)).ui  # служебное — без карточки
     tools = {t.name: t for t in sandbox_tools("local")}
     # без изоляции — по подтверждению; в настоящей песочнице — без вопросов
     assert not tools["run_python"].read_only and sandbox_tools("http://sandbox:8090")[0].read_only
@@ -430,3 +431,14 @@ async def test_egress_reverse_needs_token_and_sandbox_target():
     assert (await ask("X-Sandbox-Token: t0k\r\nX-Sandbox-Target: postgres:5432\r\n")).startswith(b"HTTP/1.1 400")
     assert (await ask("X-Sandbox-Token: t0k\r\nX-Sandbox-Target: ak-sb-s_1:8000\r\n")).startswith(b"HTTP/1.1 502")
     srv.close()
+
+
+@posix_only
+def test_installer_caches_not_listed_as_results(tmp_path):
+    # Так pip на macOS кладёт кэш при HOME = папке разговора — в чат это попадало сотнями файлов.
+    code = ("mkdir -p Library/Caches/pip/http-v2/a node_modules/x myenv && touch myenv/pyvenv.cfg myenv/lib.py"
+            " && echo 1 > Library/Caches/pip/http-v2/a/abc.body && echo 1 > node_modules/x/i.js"
+            " && echo \"$PIP_CACHE_DIR\" > cache.txt && echo ok > result.txt")
+    r = execute(tmp_path, "s_1", "bash", code, 30)
+    assert sorted(f["path"] for f in r["files"]) == ["cache.txt", "result.txt"]
+    assert (tmp_path / "s_1" / "cache.txt").read_text().strip().endswith(".cache/pip")
