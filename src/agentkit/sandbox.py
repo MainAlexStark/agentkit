@@ -46,6 +46,10 @@ MAX_OUT = 40_000
 MAX_FILES_LISTED = 50
 JOBS_DIR = ".jobs"
 LABEL = "agentkit.sandbox"
+# Папки, которые наполняют установщики и инструменты, а не агент. Без этого фильтра
+# pip на macOS (HOME = папка разговора → кэш в ~/Library/Caches/pip) выкладывал в чат
+# сотню файлов-хэшей и их .body; то же — venv без точки, node_modules, __pycache__.
+SKIP_DIRS = {"Library", "AppData", "node_modules", "__pycache__", "site-packages", "venv"}
 
 
 class SandboxError(RuntimeError):
@@ -72,7 +76,9 @@ def _snapshot(root: Path) -> dict[str, tuple[float, int]]:
     out = {}
     for dirpath, dirnames, filenames in os.walk(root):
         # .home (пакеты pip), .jobs (логи фоновых задач) и прочие скрытые — служебное, в чат не показываем
-        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        # Library, node_modules, venv — тоже служебное: см. SKIP_DIRS.
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in SKIP_DIRS
+                       and not (Path(dirpath) / d / "pyvenv.cfg").exists()]
         for n in filenames:
             if n.startswith("."):
                 continue
@@ -105,6 +111,9 @@ class LocalBackend:
         # Сокет ядра считает сервер, а не дочерний процесс: у того другое окружение (TMPDIR),
         # и сервер потом не нашёл бы ядро, чтобы остановить его.
         return {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": str(work), "LANG": "C.UTF-8",
+                # Кэши — в скрытую .cache: по умолчанию pip на macOS пишет в ~/Library/Caches,
+                # то есть прямо в папку разговора, и его файлы попадали в чат как результаты.
+                "XDG_CACHE_HOME": str(work / ".cache"), "PIP_CACHE_DIR": str(work / ".cache" / "pip"),
                 "MPLBACKEND": "Agg", "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1",
                 "AK_KERNEL_SOCK": str(default_sock(work)),
                 **({"AK_KERNEL_IDLE": os.environ["AK_KERNEL_IDLE"]} if "AK_KERNEL_IDLE" in os.environ else {})}

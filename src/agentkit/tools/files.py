@@ -74,9 +74,11 @@ async def write_file(
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     # Карточка файла в чате (и предпросмотр сбоку): написанный файл — обычно результат работы.
+    # Кроме скрытых (.probe.txt, .env): это служебное, как и в списке файлов песочницы.
     r = rel(ctx, p)
-    return ToolResult(content=f"Записан {path} ({len(content)} символов).",
-                      ui=[{"type": "files", "files": [{"path": r, "name": p.name, "size": p.stat().st_size}]}])
+    hidden = any(part.startswith(".") for part in Path(r).parts)
+    ui = [] if hidden else [{"type": "files", "files": [{"path": r, "name": p.name, "size": p.stat().st_size}]}]
+    return ToolResult(content=f"Записан {path} ({len(content)} символов).", ui=ui)
 
 
 @tool(title="Правка файла", group="files", source="builtin",

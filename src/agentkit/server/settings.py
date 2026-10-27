@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     # Запасные: "openrouter:a=openrouter:b|yandex:c;…"
     fallbacks: str = ""
     context_window: int = 200_000
-    max_steps: int = 30
+    max_steps: int = 150  # 30 не хватало на сборку приложения: прогон обрывался на середине
     reasoning_effort: str = ""
 
     # ── инструменты ──
