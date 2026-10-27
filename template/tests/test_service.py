@@ -336,6 +336,35 @@ def test_connect_scripts_and_device_actions(client):
                        headers={"Authorization": "Bearer t-bob"}).status_code == 404
 
 
+def test_project_folders_and_device_status(client):
+    bob = {"Authorization": "Bearer t-bob"}
+    assert client.get("/api/devices/status", headers=H).json()["state"] == "none"
+    r = client.post("/api/devices", json={"name": "Ноут"}, headers=H).json()
+    did, dev = r["device"]["id"], {"Authorization": f"Bearer {r['key']}"}
+    assert client.get("/api/devices/status", headers=H).json()["state"] == "off"
+    info = {"folders": [{"name": "work", "path": "/home/a/work"}, {"name": "docs", "path": "/home/a/docs"}]}
+    client.post("/api/bridge/poll", json={"info": info, "hello": True}, headers=dev)
+    st = client.get("/api/devices/status", headers=H).json()
+    assert st["state"] == "ok" and {f["name"] for f in st["folders"]} == {"work", "docs"} and not st["project_scoped"]
+
+    pid = client.post("/api/projects", json={"name": "Отчёты"}, headers=H).json()["id"]
+    f = client.get(f"/api/projects/{pid}/folders", headers=H).json()
+    assert f["items"] == [] and len(f["available"]) == 2
+    # привязать можно только открытую в мосте папку
+    assert client.post(f"/api/projects/{pid}/folders", json={"device_id": did, "path": "/etc"}, headers=H).status_code == 400
+    items = client.post(f"/api/projects/{pid}/folders", json={"device_id": did, "path": "/home/a/work"}, headers=H).json()["items"]
+    assert items[0]["name"] == "work" and items[0]["open"] and items[0]["online"]
+    st = client.get(f"/api/devices/status?project_id={pid}", headers=H).json()
+    assert st["project_scoped"] and [f["name"] for f in st["folders"]] == ["work"]
+    # чужой компьютер не привязать, чужой проект не открыть
+    assert client.post(f"/api/projects/{pid}/folders", json={"device_id": did, "path": "/home/a/work"}, headers=bob).status_code == 404
+    # папку закрыли на компьютере — компьютер на связи, но папок проекта нет
+    client.post("/api/bridge/poll", json={"info": {"folders": info["folders"][1:]}, "hello": True}, headers=dev)
+    assert client.get(f"/api/devices/status?project_id={pid}", headers=H).json()["state"] == "partial"
+    assert client.delete(f"/api/projects/{pid}/folders/{items[0]['id']}", headers=H).json()["ok"]
+    assert client.get(f"/api/devices/status?project_id={pid}", headers=H).json()["state"] == "ok"
+
+
 def test_file_preview_for_word(client, tmp_path):
     docx = pytest.importorskip("docx")
     sid = client.post("/api/sessions", json={}, headers=H).json()["id"]

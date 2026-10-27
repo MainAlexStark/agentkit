@@ -1626,6 +1626,7 @@ function setCrumb(project) {
   const c = $("#crumb");
   c.hidden = !project;
   if (project) { c.querySelector("span").textContent = project.name; c.onclick = () => openProject(project.id); }
+  setTimeout(refreshDeviceStatus, 0);  // после того как вызывающий допишет S.view / S.projectId
 }
 const ROLE_NAMES = { owner: "владелец", editor: "редактор", viewer: "читатель" };
 const fileIcon = kind => ({ pdf: "file", docx: "file", xlsx: "chart", image: "eye", text: "file" }[kind] || "file");
@@ -1726,7 +1727,7 @@ async function openProject(id) {
         starter,
         h("div", { class: "section-title" }, "Разговоры"), chats),
       h("aside", { class: "proj-side" },
-        instructionsCard(p, canEdit), filesCard(p, canEdit), memoryCard(p, canEdit)))));
+        instructionsCard(p, canEdit), filesCard(p, canEdit), foldersCard(p), memoryCard(p, canEdit)))));
   setTimeout(() => input.focus(), 0);
 }
 
@@ -1802,6 +1803,49 @@ function filesCard(p, canEdit) {
   return card;
 }
 
+// Папки компьютера, привязанные к проекту (как в Cowork). Привязка своя у каждого участника:
+// проект общий, а компьютер у каждого свой, — поэтому менять её может и читатель.
+function foldersCard(p) {
+  const list = h("div", { class: "pfiles" });
+  const add = h("button", { class: "icon-btn", title: "Привязать папку", "aria-label": "Привязать папку", "aria-haspopup": "true" }, icon("plus"));
+  const card = sideCard("Папки на компьютере", "monitor", add, list);
+  let data = null;
+  const bind = async body => {
+    const wait = body.path ? null : toastWait("Выберите папку в окне на компьютере…");
+    try { data.items = (await api(`/api/projects/${p.id}/folders`, { method: "POST", body })).items; await load(); }
+    catch (e) { toast(e.message); }
+    finally { wait?.(); }
+  };
+  const draw = () => {
+    list.replaceChildren(...data.items.map(f => h("div", { class: "pfile" },
+      h("span", { class: "pf-icon" + (f.open && f.online ? " on" : "") }, icon("folder")),
+      h("div", { class: "pf-name static", title: f.path }, h("span", {}, f.name),
+        h("small", {}, [f.device || "компьютер отключён", !f.online ? "не на связи" : !f.open ? "закрыта на компьютере" : f.read_only ? "только чтение" : ""].filter(Boolean).join(" · "))),
+      h("button", { class: "icon-btn", title: "Отвязать от проекта", "aria-label": "Отвязать папку", onclick: async () => {
+        try { await api(`/api/projects/${p.id}/folders/${f.id}`, { method: "DELETE" }); await load(); } catch (e) { toast(e.message); } } }, icon("x")))));
+    if (!data.items.length) list.append(h("p", { class: "muted small" }, (S.devices || []).length
+      ? "Привяжите папку — в разговорах проекта агент будет работать в ней, и только в ней."
+      : "Подключите компьютер, чтобы агент работал с папками на нём.",
+      (S.devices || []).length ? null : h("button", { class: "link-btn", type: "button", onclick: () => openSettings("computer") }, " Подключить")));
+    else list.append(h("div", { class: "pf-note" }, "В разговорах проекта агент видит только эти папки. Привязка — только ваша."));
+  };
+  const load = async () => {
+    try { data = await api(`/api/projects/${p.id}/folders`); } catch { card.remove(); return; }  // компьютер выключен на сервере
+    draw(); refreshDeviceStatus();
+  };
+  add.addEventListener("click", e => {
+    e.stopPropagation();
+    const on = (S.devices || []).filter(d => d.online);
+    if (!on.length) { toast((S.devices || []).length ? "Компьютер не на связи — включите его" : "Сначала подключите компьютер"); if (!(S.devices || []).length) openSettings("computer"); return; }
+    popMenu(add, [
+      ...(data?.available || []).map(f => ["folder", on.length > 1 ? `${f.name} — ${f.device}` : f.name, () => bind({ device_id: f.device_id, path: f.path })]),
+      ...on.map(d => ["plus", on.length > 1 ? `Другая папка на «${d.name}»…` : "Другая папка…", () => bind({ device_id: d.id })]),
+    ]);
+  });
+  load();
+  return card;
+}
+
 async function downloadProjectFile(pid, f) {
   try {
     const r = await fetch(`/api/projects/${pid}/files/${f.id}`, { headers: { Authorization: `Bearer ${S.token}` } });
@@ -1872,14 +1916,56 @@ async function shareDialog(p) {
 // ── компьютер ───────────────────────────────────────────────────────
 async function refreshDevices() {
   try { S.devices = await api("/api/devices"); } catch { S.devices = []; }
-  const on = (S.devices || []).filter(d => d.online);
-  const chip = $("#device-chip");
-  chip.hidden = !on.length;
-  if (on.length) {
-    chip.querySelector("span").textContent = on.length > 1 ? `${on.length} компьютера` : on[0].name;
-    chip.title = "Агент видит: " + on.map(d => `${d.name} — ${(d.info.folders || []).map(f => f.name).join(", ") || "папок нет"}`).join("; ");
-  }
+  refreshDeviceStatus();
   return S.devices;
+}
+// Значок у названия чата: есть ли у агента доступ к компьютеру именно здесь. В разговоре проекта
+// с привязанными папками ответ другой, чем в обычном, — поэтому статус считает сервер, как и для агента.
+const statusProject = () => S.view?.startsWith("project:") ? S.view.slice(8) : S.projectId || "";
+const PC_STATES = {
+  ok: ["Компьютер на связи", "Агент работает с файлами в открытых папках"],
+  partial: ["На связи, но папок нет", "Агент попросит папку сам, когда понадобится"],
+  off: ["Компьютер не на связи", "Включите компьютер — мост подключится сам, если включён автозапуск"],
+  none: ["Компьютер не подключён", "Подключите, чтобы агент работал с файлами на нём"],
+};
+async function refreshDeviceStatus() {
+  const chip = $("#device-chip"), pid = statusProject();
+  let st;
+  try { st = await api("/api/devices/status" + (pid ? `?project_id=${encodeURIComponent(pid)}` : "")); }
+  catch { chip.hidden = true; return; }  // компьютер выключен в настройках сервиса
+  if (pid !== statusProject()) return;  // пока ждали ответ, открыли другой разговор
+  S.deviceStatus = st;
+  chip.hidden = S.view === "projects";
+  chip.dataset.state = st.state;
+  const [title] = PC_STATES[st.state];
+  chip.title = st.state === "ok" ? `${title}. Агент видит: ${st.folders.map(f => f.name).join(", ")}` : title;
+  chip.setAttribute("aria-label", chip.title);
+}
+function devicePopover() {
+  const chip = $("#device-chip"), pop = $("#popover"), st = S.deviceStatus;
+  if (pop._owner === chip && !pop.hidden) return closeMenus();
+  closeMenus();
+  if (!st) return;
+  const pid = statusProject();
+  let [title, help] = PC_STATES[st.state];
+  if (st.project_scoped && st.state === "ok") help = "В этом проекте агент видит только папки проекта";
+  if (st.project_scoped && st.state === "partial") [title, help] = ["Папки проекта закрыты", "Компьютер на связи, но папки проекта на нём закрыты — откройте их снова в проекте"];
+  const closed = (st.project_folders || []).filter(f => f.online && !f.open);
+  const go = fn => () => { closeMenus(); fn(); };
+  pop.replaceChildren(
+    h("div", { class: "pc-pop-head" }, h("i", { class: "pc-dot", "data-state": st.state }),
+      h("div", {}, h("b", {}, title), h("div", { class: "help" }, help))),
+    ...(st.folders.length ? [h("div", { class: "menu-head" }, st.project_scoped ? "Папки проекта" : "Агент видит"),
+      ...st.folders.map(f => h("div", { class: "pc-pop-folder" }, icon("folder"), h("span", {}, f.name),
+        h("small", {}, [st.devices.length > 1 ? f.device : "", f.read_only ? "чтение" : ""].filter(Boolean).join(" · "))))] : []),
+    ...closed.map(f => h("div", { class: "pc-pop-folder off" }, icon("folder"), h("span", {}, f.name), h("small", {}, "закрыта"))),
+    h("div", { class: "menu-sep" }),
+    pid && S.view !== "project:" + pid ? h("button", { class: "menu-item", role: "menuitem", onclick: go(() => openProject(pid)) }, icon("folder"), "Папки проекта") : null,
+    h("button", { class: "menu-item", role: "menuitem", onclick: go(() => openSettings("computer")) }, icon("monitor"),
+      st.state === "none" ? "Подключить компьютер" : "Настройки компьютера"));
+  const r = chip.getBoundingClientRect();
+  pop.style.left = `${Math.max(8, Math.min(r.left, innerWidth - 296))}px`; pop.style.top = `${r.bottom + 4}px`;
+  pop.hidden = false; pop._owner = chip; chip.setAttribute("aria-expanded", "true");
 }
 const detectOS = () => /Win/i.test(navigator.userAgent) ? "win" : /Mac/i.test(navigator.userAgent) ? "mac" : "linux";
 const OS_NAMES = { win: "Windows", mac: "macOS", linux: "Linux" };
@@ -2458,7 +2544,7 @@ $("#stop").addEventListener("click", () => S.sessionId && api(`/api/sessions/${S
 $("#new-chat").addEventListener("click", newChat);
 // Ссылки вида …/#p/<id> и кнопка «назад» браузера. Свои переходы идут через replaceState и сюда не попадают.
 window.addEventListener("hashchange", () => S.config && route(location.hash.slice(1)));
-$("#device-chip").addEventListener("click", () => openSettings("computer"));
+$("#device-chip").addEventListener("click", e => { e.stopPropagation(); devicePopover(); });
 $("#logout").addEventListener("click", logout);
 $("#user-btn").addEventListener("click", e => { e.stopPropagation(); toggleUserMenu(); });
 document.querySelectorAll("[data-settings]").forEach(b => b.addEventListener("click", () => openSettings(b.dataset.settings)));

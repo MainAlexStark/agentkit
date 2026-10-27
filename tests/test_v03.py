@@ -144,6 +144,70 @@ async def test_device_roundtrip_through_bus(store, tmp_path):
     task.cancel()
 
 
+async def test_project_folders_limit_device_tools(store, tmp_path):
+    hub = DeviceHub(store, LocalBus())
+    dev, key = await hub.create("u1", "Ноутбук")
+    bridge = make_bridge(tmp_path, shell=True)
+    (tmp_path / "docs" / "b.txt").write_text("поверка в docs", encoding="utf-8")
+    picked = tmp_path / "picked"
+    picked.mkdir()
+
+    async def fake_bridge():
+        d = await hub.auth(key)
+        while True:
+            await hub.touch(d, bridge.info())
+            cmd = await hub.next_command(d["id"], 0.2)
+            if cmd:
+                if cmd["op"] == "pick_folder":  # человек выбрал папку в окне
+                    f = bridge.add_folder(picked, False)
+                    res = {"name": f.name, "path": str(f.path), "read_only": False}
+                else:
+                    res = getattr(bridge, "op_" + cmd["op"])(**cmd["args"])
+                await hub.touch(d, bridge.info())
+                await hub.deliver(d["id"], cmd["id"], {"ok": True, "result": res})
+
+    task = asyncio.create_task(fake_bridge())
+    await asyncio.sleep(0.05)
+    u = User(id="u1")
+    p = await store.project_create("u1", "Поверка")
+    s = await store.create_session("u1", project_id=p.id)
+    tools = {t.name: t for t in device_tools(hub)}
+    ctx = ToolContext(session_id=s.id, run_id="r", user=u, agent=None, store=store, emit=None)
+
+    # без привязок проект видит все открытые папки, как обычный разговор
+    assert {i["name"] for i in (await tools["pc_list"].call({}, ctx)).data["items"]} == {"work", "docs"}
+    await hub.bind_folder(p.id, "u1", dev["id"], str((tmp_path / "work").resolve()))
+    assert {i["name"] for i in (await tools["pc_list"].call({}, ctx)).data["items"]} == {"work"}
+    res = await tools["pc_read"].call({"path": "docs/a.md"}, ctx)
+    assert res.is_error and "не привязана" in res.content
+    hits = (await tools["pc_search"].call({"query": "поверка"}, ctx)).data["hits"]
+    assert {h["path"] for h in hits} == {"work/notes.txt"}  # docs/b.txt не ищется
+    assert str(tmp_path / "work") in (await tools["pc_run"].call({"command": "pwd" if sys.platform != "win32" else "cd"}, ctx)).content
+    tctx = await hub.context(u, s.id)
+    assert "work" in tctx.text and "docs" not in tctx.text
+    # обычный разговор этого же человека по-прежнему видит всё
+    plain = ToolContext(session_id="s", run_id="r", user=u, agent=None, store=store, emit=None)
+    assert not (await tools["pc_read"].call({"path": "docs/a.md"}, plain)).is_error
+
+    # папка, открытая из разговора проекта, сразу привязывается к нему
+    res = await tools["pc_request_access"].call({"reason": "для отчёта"}, ctx)
+    assert "Привязана к проекту" in res.content
+    view = await hub.project_folders_view(p.id, "u1")
+    assert {b["name"] for b in view} == {"work", "picked"} and all(b["open"] and b["online"] for b in view)
+
+    # человек закрыл папку на компьютере — доступа нет, хотя привязка осталась
+    bridge.op_remove_folder("work")
+    bridge.op_remove_folder("picked")
+    await asyncio.sleep(0.3)
+    await hub.update(dev["id"], info=bridge.info())
+    res = await tools["pc_list"].call({}, ctx)
+    assert res.is_error and "закрыты" in res.content
+    assert await hub.unbind_folder(p.id, "u1", view[0]["id"])
+    await hub.drop_project(p.id)
+    assert await hub.project_folders(p.id, "u1") == []
+    task.cancel()
+
+
 def test_sandbox_execute_reports_files(tmp_path):
     r = execute(tmp_path, "s_1", "python", "open('out.csv','w').write('a,b\\n1,2')\nprint('готово')", 30)
     assert r["exit_code"] == 0 and "готово" in r["stdout"]
