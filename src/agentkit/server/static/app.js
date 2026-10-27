@@ -1391,8 +1391,11 @@ async function toolsTab(body) {
     const builtin = d.tools.filter(t => t.source === "builtin");
     const out = [];
     if (domain.length) out.push(card({ key: "domain", ic: "cube", title: "Инструменты агента", sub: count(domain.length), tools: domain }));
-    if (d.mcp.length || admin) out.push(h("div", { class: "src-label" }, h("span", {}, "MCP-серверы"),
-      admin ? h("button", { class: "btn ghost sm", type: "button", onclick: () => openEditor(null) }, icon("plus"), "Добавить сервер") : null));
+    // Заголовок и пояснение — всем: без роли admin блок раньше пропадал целиком, и было
+    // непонятно, есть ли MCP вообще и кого просить подключить сервер.
+    out.push(h("div", { class: "src-label" }, h("span", {}, "MCP-серверы"),
+      admin ? h("button", { class: "btn ghost sm", type: "button", onclick: () => openEditor(null) }, icon("plus"), "Добавить сервер")
+        : h("span", { class: "muted", title: "Роль задаётся в AGENT_TOKENS: id:токен:admin" }, "добавляет администратор")));
     for (const s of d.mcp) {
       const tools = d.tools.filter(t => t.group === `mcp:${s.name}`);
       const acts = [];
@@ -1422,6 +1425,8 @@ async function toolsTab(body) {
       c?.classList.toggle("disabled", !s.enabled);
       out.push(c);
     }
+    if (!admin && !d.mcp.length && !q) out.push(h("p", { class: "muted" },
+      "Серверов пока нет. Подключить свой MCP-сервер может пользователь с ролью admin — попросите администратора."));
     if (admin && !d.mcp.length && !q) out.push(h("button", { class: "add-card", type: "button", onclick: () => openEditor(null) },
       h("span", { class: "src-icon" }, icon("plus")), h("span", { class: "src-title" }, h("b", {}, "Подключить MCP-сервер"),
         h("span", { class: "src-sub" }, "CRM, склад, почта, база знаний — всё, что умеет MCP, станет инструментами агента"))));
