@@ -190,9 +190,14 @@ async def _judge(agent: Agent, rubric: str, question: str, answer: str, tools: l
                      f"Итоговый ответ агента:\n{answer}"),
     ]
     text = ""
-    async for ch in agent.router.stream(LLMRequest(model=model, messages=msgs, max_tokens=400)):
-        if ch.kind == "done" and ch.response:
-            text = ch.response.message.text
+    # 2000, а не 400: у рассуждающих моделей (DeepSeek Flash) рассуждение съедало весь лимит,
+    # и ответ приходил пустым — «судья ответил не JSON» на верном ответе агента.
+    for _ in range(2):
+        async for ch in agent.router.stream(LLMRequest(model=model, messages=msgs, max_tokens=2000)):
+            if ch.kind == "done" and ch.response:
+                text = ch.response.message.text
+        if text.strip():
+            break
     try:
         start, end = text.index("{"), text.rindex("}") + 1
         d = json.loads(text[start:end])
@@ -393,7 +398,10 @@ async def run_case(case: dict[str, Any], make_agent: MakeAgent, *, model: str | 
 
     return CaseResult(id=cid, passed=not failures, failures=failures, text=text, tools=tools, status=str(status),
                       steps=counters["steps"], usage=usage.to_dict(), seconds=round(time.monotonic() - t0, 2),
-                      model=model or "", attempt=attempt, tags=list(case.get("tags", [])),
+                      # Без --model — модель main по имени: иначе отчёт с явным --model и без него
+                      # не сравнивались бы с одним и тем же baseline.
+                      model=model or (agent.router.resolve(agent.spec.model) if fake is None else ""),
+                      attempt=attempt, tags=list(case.get("tags", [])),
                       tool_errors=counters["tool_errors"], events=events)
 
 

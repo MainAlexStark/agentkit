@@ -2,9 +2,11 @@
 
     AGENT_OPENROUTER_API_KEY=… agentkit eval evals/harness --app agentkit.bench:make_agent --budget 0.5
 
-По умолчанию — дешёвые модели: main — DeepSeek V4.1 Flash (≈ $0.1–0.2 за весь
-набор), small (сжатие, explore, судья) — бесплатная Gemma 4 31B с запасной
-DeepSeek Flash, если бесплатную упрёт в лимит. Сильные модели — только
+По умолчанию — дешёвая DeepSeek V4.1 Flash и для main, и для small (сжатие,
+explore, судья): весь набор ≈ $0.02. Бесплатные модели (AGENTKIT_EVAL_SMALL=
+openrouter:google/gemma-4-31b-it:free) можно, но на параллельном прогоне их почти
+всё время упирает в 429: шаг ждёт ~17 с повторов, кейсы не укладываются в таймаут
+(запасная Flash подключается сама). Сильные модели — только
 осознанно: `--model openrouter:anthropic/claude-sonnet-4.5` стоит ≈ $0.7 за набор,
 поэтому вместе с --budget.
 
@@ -52,13 +54,13 @@ def _env(*names: str, default: str = "") -> str:
 # Закреплённые версии, а не «~…-latest»: алиас провайдер переставляет на новую модель,
 # и сравнение с baseline тихо стало бы сравнением разных моделей.
 CHEAP_MAIN = "openrouter:deepseek/deepseek-v4.1-flash"
-FREE_SMALL = "openrouter:google/gemma-4-31b-it:free"
+FREE_SMALL = "openrouter:google/gemma-4-31b-it:free"  # по желанию: см. docstring про 429
 
 
 def make_router_from_env() -> ModelRouter:
     # Свои переменные набора сильнее сервисных: в .env сервиса main может быть дорогой моделью.
     main = _env("AGENTKIT_EVAL_MAIN", default=CHEAP_MAIN)
-    small = _env("AGENTKIT_EVAL_SMALL", default=FREE_SMALL)
+    small = _env("AGENTKIT_EVAL_SMALL", default=CHEAP_MAIN)
     return make_router(
         openrouter_key=_env("AGENT_OPENROUTER_API_KEY", "OPENROUTER_API_KEY"),
         openai_key=_env("AGENT_OPENAI_API_KEY", "OPENAI_API_KEY"),

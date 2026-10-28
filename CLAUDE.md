@@ -21,7 +21,7 @@ cd template && pytest -q && agentkit eval evals/ --app app.evals:make_agent --of
 agentkit new smoke-agent --dest /tmp && (cd /tmp/smoke-agent && pip install -r requirements.txt -q && pytest -q)
 ```
 
-Правка поведения ядра (CORE_RULES, описания и тексты ошибок инструментов, `context.py`, цикл) — ещё и живой прогон набора ядра против baseline. По умолчанию модель дешёвая (DeepSeek Flash, ≈ $0.1–0.2 за набор), и всегда с `--budget`. **Сильные модели (Sonnet, Opus, GPT-5 и т. п.) — только после явного согласия Алекса**: бюджет на тесты маленький.
+Правка поведения ядра (CORE_RULES, описания и тексты ошибок инструментов, `context.py`, цикл) — ещё и живой прогон набора ядра против baseline. По умолчанию модель дешёвая (DeepSeek Flash, ≈ $0.02 за набор), и всегда с `--budget`. **Сильные модели (Sonnet, Opus, GPT-5 и т. п.) — только после явного согласия Алекса**: бюджет на тесты маленький.
 
 ```bash
 agentkit eval evals/harness --app agentkit.bench:make_agent --budget 0.5 --parallel 8 \

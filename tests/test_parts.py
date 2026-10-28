@@ -359,3 +359,14 @@ async def test_missing_file_suggests_similar(store, tmp_path):
     assert r.content.splitlines() == [
         "n.py-1- def alert_owner(e):", "n.py-2-     text = e", "n.py:3:     send_sms(text)",
         "n.py:4:     send_sms(2)", "n.py-5-     return 1"]
+
+
+async def test_stringified_list_args_are_parsed():
+    from agentkit.tools.core import ask_user, todo_write
+
+    args = ask_user.validate({"question": "Какие?", "options": '[{"label": "все"}, {"label": "никакие"}]'})
+    assert [o["label"] for o in args["options"]] == ["все", "никакие"]
+    args = todo_write.validate({"todos": '[{"content": "a", "status": "pending"}]'})
+    assert args["todos"][0]["content"] == "a"
+    # строка, которая и должна быть строкой, — не трогаем
+    assert ask_user.validate({"question": "[1, 2]?"})["question"] == "[1, 2]?"

@@ -1,7 +1,7 @@
 name: evals-live
 # Набор evals/harness на живой модели — только по кнопке: Actions → evals-live → Run workflow.
 # Расписания нет намеренно: каждый прогон стоит денег. По умолчанию дешёвая модель (DeepSeek Flash,
-# ≈ $0.1–0.2 за набор) и потолок расходов --budget. Нужен секрет OPENROUTER_API_KEY
+# ≈ $0.02 за набор) и потолок расходов --budget. Нужен секрет OPENROUTER_API_KEY
 # (Settings → Secrets and variables → Actions); без него прогон пропускается, а не падает.
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ on:
         default: "1"
       budget:
         description: "Потолок расходов, $"
-        default: "0.5"
+        default: "0.3"
 jobs:
   evals:
     runs-on: ubuntu-latest
