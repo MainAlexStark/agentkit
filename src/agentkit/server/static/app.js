@@ -745,38 +745,61 @@ async function doRewind(seq, text) {
 
 // ── сессии ──────────────────────────────────────────────────────────
 async function loadSessions() {
-  [S.sessions, S.projects] = await Promise.all([api("/api/sessions"), api("/api/projects").catch(() => S.projects || [])]);
+  [S.sessions, S.archived, S.projects] = await Promise.all([api("/api/sessions"),
+    api("/api/sessions?archived=true").catch(() => S.archived || []), api("/api/projects").catch(() => S.projects || [])]);
   const cur = S.sessions.find(s => s.id === S.sessionId);
   if (cur) $("#chat-title").textContent = cur.title;
   renderSessions();
 }
+// Строка разговора — одна для «Недавних», «Закреплённых», архива и разговоров внутри проекта:
+// у всех одно меню «⋯», иначе у вложенных в проект разговоров не было бы ни переименования, ни удаления.
+function sessionRow(s, { nested = false, proj = true } = {}) {
+  const more = h("button", { class: "icon-btn more", type: "button", title: "Ещё", "aria-haspopup": "menu", "aria-label": "Действия с разговором" }, icon("dots"));
+  const item = h("div", {
+    class: "session" + (nested ? " nested" : "") + (s.id === S.sessionId ? " active" : ""), role: "button", tabindex: "0", title: s.title,
+    onclick: e => { if (!e.target.closest(".more, input")) { openSession(s.id); toggleSidebar(false); } },
+    onkeydown: e => { if (e.key === "Enter" && e.target === item) openSession(s.id); },
+  }, h("span", {}, s.title),
+  s.pinned && nested ? h("small", { class: "s-proj", title: "Закреплён" }, icon("pin")) : null,
+  proj && s.project ? h("small", { class: "s-proj", title: `Проект «${s.project}»` }, icon("folder")) : null,
+  s.running ? h("i", { class: "dot", title: "Агент работает" }) : null, more);
+  more.addEventListener("click", e => { e.stopPropagation(); sessionMenu(s, item, more); });
+  return item;
+}
 function renderSessions() {
   const q = $("#session-filter").value.trim().toLowerCase();
-  const items = S.sessions.filter(s => !q || s.title.toLowerCase().includes(q));
+  const match = s => !q || s.title.toLowerCase().includes(q);
+  const items = S.sessions.filter(match);
   const day = 86400, now = new Date(); now.setHours(0, 0, 0, 0);
   const today = now.getTime() / 1000;
-  const groups = [["Сегодня", t => t >= today], ["Вчера", t => t >= today - day], ["Последние 7 дней", t => t >= today - 7 * day], ["Ранее", () => true]];
+  const groups = [["Сегодня", t => t >= today], ["Вчера", t => t >= today - day],
+    ["Последние 7 дней", t => t >= today - 7 * day], ["Ранее", () => true]];
+  // «Закреплённые» — отдельным разделом над «Недавними», а не датой внутри них.
+  const pinned = items.filter(s => s.pinned);
+  const used = new Set(pinned.map(s => s.id));
   const out = [];
-  const used = new Set();
   for (const [label, test] of groups) {
     const g = items.filter(s => !used.has(s.id) && test(s.updated_at));
     if (!g.length) continue;
     g.forEach(s => used.add(s.id));
-    out.push(h("div", { class: "group-label" }, label));
-    for (const s of g) {
-      const more = h("button", { class: "icon-btn more", type: "button", title: "Ещё", "aria-haspopup": "menu", "aria-label": "Действия с разговором" }, icon("dots"));
-      const item = h("div", {
-        class: "session" + (s.id === S.sessionId ? " active" : ""), role: "button", tabindex: "0", title: s.title,
-        onclick: e => { if (!e.target.closest(".more, input")) { openSession(s.id); toggleSidebar(false); } },
-        onkeydown: e => { if (e.key === "Enter" && e.target === item) openSession(s.id); },
-      }, h("span", {}, s.title), s.project ? h("small", { class: "s-proj", title: `Проект «${s.project}»` }, icon("folder")) : null,
-      s.running ? h("i", { class: "dot", title: "Агент работает" }) : null, more);
-      more.addEventListener("click", e => { e.stopPropagation(); sessionMenu(s, item, more); });
-      out.push(item);
-    }
+    out.push(h("div", { class: "group-label" }, label), ...g.map(s => sessionRow(s)));
   }
-  if (!out.length) out.push(h("div", { class: "group-label" }, q ? "Ничего не найдено" : "Разговоров пока нет"));
-  $("#sessions").replaceChildren(...(q ? [] : projectsSection()), ...out);
+  if (!out.length && !pinned.length) out.push(h("div", { class: "group-label" }, q ? "Ничего не найдено" : "Разговоров пока нет"));
+  const top = [];
+  if (pinned.length) top.push(h("div", { class: "side-sec plain" }, h("span", { class: "side-sec-label" }, "Закреплённые")), ...pinned.map(s => sessionRow(s)));
+  if (!q && (pinned.length || sideState.open) && out.length) top.push(h("div", { class: "side-sec plain" }, h("span", { class: "side-sec-label" }, "Недавние")));
+  $("#sessions").replaceChildren(...(q ? [] : projectsSection()), ...top, ...out, ...archiveSection(q, match));
+}
+// Архив — свёрнутый раздел внизу списка; при поиске показываем совпадения из него сразу.
+function archiveSection(q, match) {
+  const list = (S.archived || []).filter(match);
+  if (!list.length) return [];
+  const open = q || store.get("side_archive") === "1";
+  const head = h("div", { class: "side-sec plain" },
+    h("button", { class: "side-sec-toggle", type: "button", "aria-expanded": String(!!open),
+      onclick: () => { store.set("side_archive", open ? "0" : "1"); renderSessions(); } },
+      h("span", {}, `Архив · ${list.length}`), icon("chev", "chev" + (open ? " open" : ""))));
+  return open ? [head, ...list.map(s => sessionRow(s))] : [head];
 }
 
 // ── проекты в боковой панели (как в Claude): раскрываются в свои разговоры ──
@@ -800,16 +823,15 @@ function projectsSection() {
   const shown = sideState.all ? list : list.slice(0, 5);
   const rows = shown.map(p => {
     const chats = S.sessions.filter(x => x.project_id === p.id);
-    const exp = sideState.expanded.has(p.id) || (curProject === p.id && S.sessionId && chats.some(c => c.id === S.sessionId));
+    const exp = sideState.expanded.has(p.id);
     const tog = h("button", { class: "proj-tog", type: "button", "aria-label": exp ? "Свернуть" : "Показать разговоры", title: exp ? "Свернуть" : "Разговоры проекта",
       onclick: e => { e.stopPropagation(); exp ? sideState.expanded.delete(p.id) : sideState.expanded.add(p.id); sideState.save(); renderSessions(); } },
       icon("folder", "fold"), icon("chev", "chev" + (exp ? " open" : "")));
     const item = h("div", { class: "session proj-item" + (S.view === "project:" + p.id ? " active" : curProject === p.id ? " within" : ""), role: "button", tabindex: "0", title: p.name,
-      onclick: () => { toggleSidebar(false); openProject(p.id); }, onkeydown: e => { if (e.key === "Enter" && e.target === item) openProject(p.id); } },
+      onclick: () => projectClick(p.id), onkeydown: e => { if (e.key === "Enter" && e.target === item) projectClick(p.id); } },
       tog, h("span", {}, p.name), p.role !== "owner" || p.shared ? h("small", { class: "s-proj", title: p.role !== "owner" ? `Открыт вам: ${ROLE_NAMES[p.role]}` : "Общий проект" }, icon("users")) : null);
     if (!exp) return item;
-    const sub = chats.slice(0, 8).map(c => h("div", { class: "session nested" + (c.id === S.sessionId ? " active" : ""), role: "button", tabindex: "0", title: c.title,
-      onclick: () => { toggleSidebar(false); openSession(c.id); } }, h("span", {}, c.title), c.running ? h("i", { class: "dot" }) : null));
+    const sub = chats.slice(0, 8).map(c => sessionRow(c, { nested: true, proj: false }));
     return h("div", { class: "proj-group" }, item,
       sub.length ? sub : h("button", { class: "session nested new", type: "button", onclick: () => openProject(p.id) }, icon("plus"), h("span", {}, "Новый разговор")),
       chats.length > 8 ? h("button", { class: "side-more nested", type: "button", onclick: () => openProject(p.id) }, `Все ${chats.length}`) : null);
@@ -817,7 +839,16 @@ function projectsSection() {
   if (!list.length) rows.push(h("button", { class: "side-empty", type: "button", onclick: () => newProjectForm() }, icon("plus"), "Создать проект"));
   if (list.length > 5) rows.push(h("button", { class: "side-more", type: "button", onclick: () => { sideState.all = !sideState.all; renderSessions(); } },
     sideState.all ? "Свернуть" : `Ещё ${list.length - 5}`));
-  return [head, ...rows, h("div", { class: "side-sec plain" }, h("span", { class: "side-sec-label" }, "Недавние"))];
+  return [head, ...rows];
+}
+
+// Клик по проекту: не на его странице — переходим и раскрываем разговоры; уже на ней — свернуть/раскрыть.
+// Раньше раскрывала только стрелка, а клик лишь переходил — свернуть проект кликом было нельзя.
+function projectClick(id) {
+  const here = S.view === "project:" + id;
+  if (here && sideState.expanded.has(id)) sideState.expanded.delete(id); else sideState.expanded.add(id);
+  sideState.save();
+  if (here) renderSessions(); else { toggleSidebar(false); openProject(id); }
 }
 
 function greeting() {
@@ -863,6 +894,7 @@ async function openSession(id) {
   showPage(false);
   $("#chat-title").textContent = s.title || "Новый разговор";
   S.projectId = s.project?.id || null; setCrumb(s.project);
+  if (S.projectId && !sideState.expanded.has(S.projectId)) { sideState.expanded.add(S.projectId); sideState.save(); }
   if (s.state?.model) setModel(s.state.model);
   setMode(s.state?.mode || S.config.default_mode);
   if (!s.messages.length) box().replaceChildren(emptyState());
@@ -2487,18 +2519,74 @@ function toggleUserMenu() {
 function sessionMenu(s, item, btn) {
   closeMenus();
   const pop = $("#popover");
+  const mi = (ic, label, fn, cls = "") => h("button", { class: "menu-item " + cls, role: "menuitem", onclick: () => { closeMenus(); fn(); } }, icon(ic), label);
   pop.replaceChildren(
-    h("button", { class: "menu-item", role: "menuitem", onclick: () => { closeMenus(); renameSession(s, item); } }, icon("pen"), "Переименовать"),
-    h("button", { class: "menu-item danger", role: "menuitem", onclick: async () => {
-      closeMenus();
+    mi("pen", "Переименовать", () => renameSession(s, item)),
+    mi("pin", s.pinned ? "Открепить" : "Закрепить", () => patchSession(s, { pinned: !s.pinned })),
+    moveSubmenu(s),
+    mi("archive", s.archived ? "Вернуть из архива" : "В архив", () => patchSession(s, { archived: !s.archived },
+      s.archived ? null : ["Отменить", () => patchSession(s, { archived: false })])),
+    h("div", { class: "menu-sep" }),
+    mi("trash", "Удалить", async () => {
       if (!confirm(`Удалить разговор «${s.title}»?`)) return;
-      try { await api(`/api/sessions/${s.id}`, { method: "DELETE" }); } catch (e) { alert(e.message); return; }
+      try { await api(`/api/sessions/${s.id}`, { method: "DELETE" }); } catch (e) { toast(e.message); return; }
       if (s.id === S.sessionId) newChat();
       loadSessions();
-    } }, icon("trash"), "Удалить"));
-  const r = btn.getBoundingClientRect();
-  pop.style.left = `${Math.min(r.left, innerWidth - 200)}px`; pop.style.top = `${r.bottom + 4}px`;
+    }, "danger"));
   pop.hidden = false; pop._owner = btn; btn.setAttribute("aria-expanded", "true");
+  // Не вылезать за экран: у нижних разговоров меню открывается вверх.
+  const r = btn.getBoundingClientRect(), m = pop.getBoundingClientRect();
+  pop.style.left = `${Math.max(8, Math.min(r.left, innerWidth - m.width - 8))}px`;
+  pop.style.top = `${r.bottom + 4 + m.height > innerHeight - 8 ? Math.max(8, r.top - m.height - 4) : r.bottom + 4}px`;
+}
+// «Перенести в проект ▸» — подменю раскрывается при наведении (и по клику/→ с клавиатуры).
+function moveSubmenu(s) {
+  const projects = S.projects || [];
+  const move = async (pid, name) => {
+    await patchSession(s, { project_id: pid });
+    toast(pid ? `Перенесено в «${name}»` : "Разговор больше не в проекте");
+  };
+  const sub = h("div", { class: "menu submenu", role: "menu" },
+    ...projects.map(p => h("button", { class: "menu-item" + (p.id === s.project_id ? " on" : ""), role: "menuitemradio", "aria-checked": String(p.id === s.project_id),
+      disabled: p.id === s.project_id, onclick: () => { closeMenus(); move(p.id, p.name); } },
+      icon("folder"), h("span", { class: "grow ellipsis" }, p.name), p.id === s.project_id ? icon("check", "menu-aside") : null)),
+    projects.length ? null : h("div", { class: "menu-head" }, "Проектов пока нет"),
+    s.project_id ? h("div", { class: "menu-sep" }) : null,
+    s.project_id ? h("button", { class: "menu-item", role: "menuitem", onclick: () => { closeMenus(); move(null); } }, icon("x"), "Убрать из проекта") : null,
+    h("div", { class: "menu-sep" }),
+    h("button", { class: "menu-item", role: "menuitem", onclick: () => { closeMenus(); newProjectForm(); } }, icon("plus"), "Новый проект"));
+  const trigger = h("button", { class: "menu-item", role: "menuitem", "aria-haspopup": "menu", "aria-expanded": "false" },
+    icon("folder"), h("span", { class: "grow" }, "Перенести в проект"), icon("chev", "menu-aside"));
+  const wrap = h("div", { class: "menu-sub" }, trigger, sub);
+  let timer;
+  const show = () => {
+    clearTimeout(timer);
+    if (wrap.classList.contains("open")) return;
+    wrap.classList.add("open"); trigger.setAttribute("aria-expanded", "true");
+    // Справа места нет (сайдбар у правого края или узкий экран) — открываем влево; снизу — сдвигаем вверх.
+    sub.classList.remove("flip"); sub.style.top = "";
+    const r = sub.getBoundingClientRect();
+    if (r.right > innerWidth - 8) sub.classList.add("flip");
+    if (r.bottom > innerHeight - 8) sub.style.top = `${innerHeight - 8 - r.bottom - 5}px`;
+  };
+  // Задержка на уход: путь курсора к подменю по диагонали задевает соседний пункт — без неё подменю схлопывалось.
+  const hide = () => { clearTimeout(timer); timer = setTimeout(() => { wrap.classList.remove("open"); trigger.setAttribute("aria-expanded", "false"); }, 220); };
+  wrap.addEventListener("mouseenter", show);
+  wrap.addEventListener("mouseleave", hide);
+  trigger.addEventListener("click", e => { e.stopPropagation(); show(); });
+  trigger.addEventListener("keydown", e => { if (e.key === "ArrowRight" || e.key === "Enter") { e.preventDefault(); show(); sub.querySelector(".menu-item:not([disabled])")?.focus(); } });
+  sub.addEventListener("keydown", e => { if (e.key === "ArrowLeft") { e.stopPropagation(); wrap.classList.remove("open"); trigger.focus(); } });
+  return wrap;
+}
+async function patchSession(s, body, undo) {
+  try { await api(`/api/sessions/${s.id}`, { method: "PATCH", body }); } catch (e) { toast(e.message); return; }
+  if (body.archived) toast("Разговор в архиве", undo);
+  if ("project_id" in body && s.id === S.sessionId) {  // крошка «Проект ›» и контекст ввода — от нового проекта
+    const p = (S.projects || []).find(x => x.id === body.project_id);
+    S.projectId = p?.id || null; setCrumb(p ? { id: p.id, name: p.name } : null);
+  }
+  if (body.project_id) { sideState.expanded.add(body.project_id); sideState.save(); }
+  await loadSessions();
 }
 function renameSession(s, item) {
   const input = h("input", { class: "rename", value: s.title });

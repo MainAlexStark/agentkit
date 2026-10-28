@@ -355,6 +355,17 @@ body.dragging .composer { border-color: var(--accent); border-style: dashed; box
 .popover { position: fixed; min-width: 180px; }
 
 /* меню разговора */
+/* подменю «Перенести в проект ▸»: открывается при наведении, вплотную к пункту — иначе курсор «проваливается» в зазор */
+.menu-sub { position: relative; }
+.menu-sub > .menu-item .grow { flex: 1; }
+.menu-sub > .menu-item .menu-aside { width: 13px; height: 13px; }
+.menu-sub.open > .menu-item { background: var(--surface-2); }
+.submenu { display: none; position: absolute; left: calc(100% + 1px); top: -6px; min-width: 220px; max-width: 300px; max-height: min(360px, 70vh); overflow-y: auto; }
+.submenu.flip { left: auto; right: calc(100% + 1px); }
+.menu-sub.open > .submenu { display: block; }
+.submenu .menu-item .ellipsis { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.submenu .menu-item[disabled] { cursor: default; color: var(--text-2); background: none; }
+.submenu .menu-item .menu-aside { width: 14px; height: 14px; color: var(--accent); }
 .session { position: relative; }
 .session .more { opacity: 0; width: 22px; height: 22px; margin: -3px -4px -3px 0; }
 .session:hover .more, .session .more[aria-expanded="true"] { opacity: 1; }

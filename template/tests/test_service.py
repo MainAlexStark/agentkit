@@ -311,6 +311,35 @@ def test_projects_api_and_prompt(client):
     assert client.get(f"/api/sessions/{sid}", headers=bob).json()["project"] is None
 
 
+def test_session_pin_archive_move(client):
+    bob = {"Authorization": "Bearer t-bob"}
+    a = client.post("/api/sessions", json={"title": "А"}, headers=H).json()["id"]
+    b = client.post("/api/sessions", json={"title": "Б"}, headers=H).json()["id"]
+    before = {x["id"]: x["updated_at"] for x in client.get("/api/sessions", headers=H).json()}
+    # закреплённый — первым, хотя создан раньше; закрепление не двигает updated_at
+    client.patch(f"/api/sessions/{a}", json={"pinned": True}, headers=H)
+    listed = client.get("/api/sessions", headers=H).json()
+    assert [x["id"] for x in listed] == [a, b] and listed[0]["pinned"] and listed[0]["updated_at"] == before[a]
+    # архив: пропадает из основного списка, виден в ?archived=true, сообщение возвращает обратно
+    client.patch(f"/api/sessions/{b}", json={"archived": True}, headers=H)
+    assert [x["id"] for x in client.get("/api/sessions", headers=H).json()] == [a]
+    assert [x["id"] for x in client.get("/api/sessions?archived=true", headers=H).json()] == [b]
+    client.fake.push("ок")
+    client.post(f"/api/sessions/{b}/messages", json={"text": "привет"}, headers=H)
+    wait_idle(client, b)
+    assert {x["id"] for x in client.get("/api/sessions", headers=H).json()} == {a, b}
+    # перенос в проект и обратно; в чужой проект — нельзя
+    p = client.post("/api/projects", json={"name": "П"}, headers=H).json()
+    alien = client.post("/api/projects", json={"name": "Чужой"}, headers=bob).json()
+    assert client.patch(f"/api/sessions/{a}", json={"project_id": alien["id"]}, headers=H).status_code == 404
+    client.patch(f"/api/sessions/{a}", json={"project_id": p["id"]}, headers=H)
+    assert client.get(f"/api/sessions/{a}", headers=H).json()["project"]["name"] == "П"
+    client.patch(f"/api/sessions/{a}", json={"title": "А2"}, headers=H)  # без project_id — проект не трогаем
+    assert client.get(f"/api/sessions/{a}", headers=H).json()["project"]["id"] == p["id"]
+    client.patch(f"/api/sessions/{a}", json={"project_id": None}, headers=H)
+    assert client.get(f"/api/sessions/{a}", headers=H).json()["project"] is None
+
+
 def test_devices_api(client):
     r = client.post("/api/devices", json={"name": "Ноутбук"}, headers=H).json()
     assert r["key"].startswith(r["device"]["id"] + ".") and r["bridge_url"].endswith("/bridge.py")

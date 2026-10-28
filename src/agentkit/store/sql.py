@@ -56,6 +56,8 @@ sessions = Table(
     Column("created_at", Float, nullable=False),
     Column("updated_at", Float, nullable=False),
     Column("project_id", String(40), nullable=True, index=True),
+    Column("pinned_at", Float, nullable=True),
+    Column("archived_at", Float, nullable=True),
 )
 
 projects = Table(
@@ -261,13 +263,18 @@ class SQLStore(Store):
             r = (await c.execute(select(sessions).where(sessions.c.id == session_id))).mappings().first()
         return SessionRec(**r) if r else None
 
-    async def list_sessions(self, user_id, *, limit=50, include_children=False, project_id=None):
+    async def list_sessions(self, user_id, *, limit=50, include_children=False, project_id=None, archived=None):
         q = select(sessions).where(sessions.c.user_id == user_id)
         if project_id:
             q = q.where(sessions.c.project_id == project_id)
         if not include_children:
             q = q.where(sessions.c.parent_id.is_(None))
-        q = q.order_by(sessions.c.updated_at.desc()).limit(limit)
+        if archived is not None:
+            q = q.where(sessions.c.archived_at.is_not(None) if archived else sessions.c.archived_at.is_(None))
+        # Закреплённые — в начале выборки: иначе старый закреплённый разговор вылетал бы за limit
+        # и пропадал из «Закреплённых». «IS NULL» в ORDER BY одинаково сортируется в SQLite и PostgreSQL.
+        q = q.order_by(sessions.c.pinned_at.is_(None), sessions.c.pinned_at.desc(),
+                       sessions.c.updated_at.desc()).limit(limit)
         async with self.engine.connect() as c:
             return [SessionRec(**r) for r in (await c.execute(q)).mappings()]
 

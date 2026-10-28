@@ -51,6 +51,9 @@ class PatchSession(BaseModel):
     title: str | None = None
     model: str | None = None
     mode: str | None = None
+    project_id: str | None = None  # перенос: id проекта или null — «без проекта» (различаем по model_fields_set)
+    pinned: bool | None = None
+    archived: bool | None = None
 
 
 class SendMessage(BaseModel):
@@ -238,11 +241,13 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         return {p.id: p.name for p, _ in await svc.store.project_list_for(user.id)}
 
     @api.get("/sessions")
-    async def list_sessions(project_id: str | None = None, user: User = Depends(auth)):
-        items = await svc.store.list_sessions(user.id, limit=100, project_id=project_id)
+    async def list_sessions(project_id: str | None = None, archived: bool = False, user: User = Depends(auth)):
+        """Без архива по умолчанию; ?archived=true — только архив. Закреплённые — первыми."""
+        items = await svc.store.list_sessions(user.id, limit=100, project_id=project_id, archived=archived)
         names = await project_names(user)
         return [{"id": s.id, "title": s.title or "Новый разговор", "updated_at": s.updated_at,
                  "project_id": s.project_id if s.project_id in names else None, "project": names.get(s.project_id or ""),
+                 "pinned": s.pinned_at is not None, "archived": s.archived_at is not None,
                  "running": await svc.runs.active_run(s.id) is not None} for s in items]
 
     @api.post("/sessions")
@@ -281,6 +286,21 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         s = await own_session(session_id, user)
         if body.title is not None:
             await svc.store.update_session(session_id, title=body.title)
+        # Закрепление, архив и перенос — не активность в разговоре: updated_at не трогаем,
+        # иначе разговор прыгал бы в «Сегодня» от одного клика по меню.
+        flags: dict[str, Any] = {}
+        if body.pinned is not None:
+            flags["pinned_at"] = time.time() if body.pinned else None
+        if body.archived is not None:
+            flags["archived_at"] = time.time() if body.archived else None
+        if "project_id" in body.model_fields_set and (body.project_id or None) != s.project_id:
+            if await svc.runs.active_run(session_id):
+                raise HTTPException(409, "сначала остановите прогон — проект меняет контекст агента")
+            if body.project_id:
+                await app.state.project_access(body.project_id, user)  # как при создании: хотя бы читатель
+            flags["project_id"] = body.project_id or None
+        if flags:
+            await svc.store.update_session(session_id, updated_at=s.updated_at, **flags)
         if body.model is not None or body.mode is not None:
             state = dict(s.state or {})
             if body.model is not None:
@@ -301,7 +321,9 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
     @api.post("/sessions/{session_id}/messages")
     async def send(session_id: str, body: SendMessage, user: User = Depends(auth)):
         """Если агент занят — сообщение встаёт в очередь, и он подхватит его между шагами (queued: true)."""
-        await own_session(session_id, user)
+        s = await own_session(session_id, user)
+        if s.archived_at is not None:  # написали в архивный — он снова живой, иначе пропал бы из списка
+            await svc.store.update_session(session_id, archived_at=None)
         mode = _check_mode(body.mode, user)
         model = await svc.check_model(body.model)
         content = _content(session_id, body)
