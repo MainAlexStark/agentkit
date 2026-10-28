@@ -1,0 +1,58 @@
+name: evals-live
+# Набор evals/harness на живой модели — только по кнопке: Actions → evals-live → Run workflow.
+# Расписания нет намеренно: каждый прогон стоит денег. По умолчанию дешёвая модель (DeepSeek Flash,
+# ≈ $0.02 за набор) и потолок расходов --budget. Нужен секрет OPENROUTER_API_KEY
+# (Settings → Secrets and variables → Actions); без него прогон пропускается, а не падает.
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: "Модели через пробел (сильные — дороже в 5–20 раз)"
+        default: "openrouter:deepseek/deepseek-v4.1-flash"
+      repeat:
+        description: "Повторов каждого кейса"
+        default: "1"
+      budget:
+        description: "Потолок расходов, $"
+        default: "0.3"
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AGENT_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - name: ключ модели
+        id: key
+        run: |
+          if [ -z "$AGENT_OPENROUTER_API_KEY" ]; then
+            echo "::notice::Нет секрета OPENROUTER_API_KEY — прогон пропущен"
+            echo "Нет секрета OPENROUTER_API_KEY — прогон пропущен." >> "$GITHUB_STEP_SUMMARY"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.key.outputs.ok == 'true'
+      - uses: actions/setup-python@v5
+        if: steps.key.outputs.ok == 'true'
+        with: { python-version: "3.12" }
+      - if: steps.key.outputs.ok == 'true'
+        run: pip install -e ".[dev]"
+      - name: evals
+        if: steps.key.outputs.ok == 'true'
+        run: |
+          ARGS=""
+          for m in ${{ inputs.models }}; do ARGS="$ARGS --model $m"; done
+          agentkit eval evals/harness --app agentkit.bench:make_agent $ARGS \
+            --repeat "${{ inputs.repeat }}" --budget "${{ inputs.budget }}" --parallel 8 --timeout 300 \
+            --baseline evals/baseline.json --json evals-out.json --md "$GITHUB_STEP_SUMMARY" \
+            --save-runs evals-runs --min-pass-rate 0.8
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.key.outputs.ok == 'true'
+        with:
+          name: evals-${{ github.run_id }}
+          path: |
+            evals-out.json
+            evals-runs/
+          retention-days: 30

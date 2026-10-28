@@ -155,10 +155,16 @@ class Agent:
 
         if "tool_search" not in self.tools:
             self.tools.add(make_tool_search(lambda ctx: ctx.agent.tools))
-        if self.skills and self.skills.skills and "skill" not in self.tools:
+        # Инструмент skill — и при пустой папке: навыки пользователь может создать сам в настройках.
+        if self.skills is not None and "skill" not in self.tools:
             self.tools.add(self.skills.tool())
 
     # ── публичное API ────────────────────────────────────────────────
+
+    async def skills_for(self, user: User) -> SkillLibrary:
+        """Навыки, которые видит этот пользователь: из папки приложения + свои, без выключенных."""
+        base = self.skills or SkillLibrary()
+        return base.for_user(await self.store.kv_get("skills", user.id) or {})
 
     def workspace_for(self, session_id: str) -> Path | None:
         ws = self._workspace
@@ -218,7 +224,10 @@ class Agent:
                         await self.store.update_session(session_id, title=title.splitlines()[0][:80])
             return await self._loop(session_id, user, run_id, emit, model=model, mode=mode)
 
-        async for ev in self._drive(session_id, body, model=model, trigger=trigger):
+        # Текст запроса — в событие старта: по журналу (JSONL, ak_events) прогон потом
+        # разбирается и превращается в eval-кейс без доступа к таблице сообщений.
+        info = {"input": _plain_text(input)[:8000]} if input is not None else None
+        async for ev in self._drive(session_id, body, model=model, trigger=trigger, info=info):
             yield ev
 
     async def resolve_approval(
@@ -247,7 +256,11 @@ class Agent:
             tool = self.tools.get(rec.tool_name)
             args = edited_args if edited_args is not None else rec.args
             if not approve:
-                content = "Пользователь отклонил это действие." + (f" Комментарий: {comment}" if comment else "")
+                # Явно «не выполнено» и «не проси снова»: на голом «отклонил» haiku заново просил
+                # подтверждение, будто карточки ещё не было (кейс planning/rejected-approval-is-respected).
+                content = ("Человек отклонил это действие — оно НЕ выполнено. Сообщи, что не сделал его, "
+                           "и не запрашивай то же самое снова без новой просьбы."
+                           + (f" Комментарий: {comment}" if comment else ""))
                 result = ToolResult(content=content, is_error=True)
             elif tool is None:
                 result = ToolResult.error(f"инструмент {rec.tool_name} больше недоступен")
@@ -304,7 +317,7 @@ class Agent:
 
     # ── внутреннее: запуск с очередью событий ─────────────────────────
 
-    async def _drive(self, session_id, body, *, model: str, trigger: str):
+    async def _drive(self, session_id, body, *, model: str, trigger: str, info: dict[str, Any] | None = None):
         run = await self.store.create_run(session_id, model=self.router.resolve(model), trigger=trigger)
         q: asyncio.Queue[Event | None] = asyncio.Queue()
         cancel = self._cancel.setdefault(run.id, asyncio.Event())
@@ -332,7 +345,8 @@ class Agent:
             status = RunStatus.ERROR
             error = None
             try:
-                await emit(Event(EventType.RUN_STARTED, {"model": self.router.resolve(model), "trigger": trigger}))
+                await emit(Event(EventType.RUN_STARTED, {"model": self.router.resolve(model), "trigger": trigger,
+                                                         **(info or {})}))
                 status = await body(emit, run.id)
             except asyncio.CancelledError:
                 status = RunStatus.CANCELLED
@@ -399,7 +413,7 @@ class Agent:
         parts = PromptParts(
             agent_prompt=self.spec.prompt,
             rules=rules,
-            skills_index=self.skills.index() if self.skills else "",
+            skills_index=(await self.skills_for(user)).index() if self.skills else "",
             mcp_instructions=self.mcp_instructions() if self.mcp_instructions else "",
             deferred_tools=self.tools.deferred_names(loaded),
             memory=[f"[{m.id}] {m.text}" for m in mem],
@@ -432,12 +446,15 @@ class Agent:
             # вызовы предыдущего шага уже закрыты результатами, и сообщение
             # пользователя не разорвёт пару «вызов — результат».
             await self._take_inbox(session_id, run_id, emit)
+            # Выбор пользователя по инструментам (Всегда / Спрашивать / Заблокирован) — каждый шаг:
+            # переключил в настройках посреди долгой задачи — действует со следующего вызова.
+            perms = perms.with_mode(mode, await self.store.kv_get("tool_policy", user.id) or {})
             state = await self.store.get_state(session_id)
             loaded = set(state.get(LOADED_KEY, []))
             history = effective_history(await self.store.list_messages(session_id))
             turn = await self._turn_context(user, session_id)
             system = await self._system_prompt(user, loaded, mode, turn.text)
-            visible = [t for t in self.tools.visible(loaded) if t.name not in turn.hide_tools]
+            visible = [t for t in self.tools.visible(loaded) if t.name not in turn.hide_tools and not perms.blocked(t.name)]
             schemas = [t.schema() for t in visible]
             msgs = [Message.system(system), *self._prepare(history, session_id, model)]
 

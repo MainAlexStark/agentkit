@@ -311,6 +311,35 @@ def test_projects_api_and_prompt(client):
     assert client.get(f"/api/sessions/{sid}", headers=bob).json()["project"] is None
 
 
+def test_session_pin_archive_move(client):
+    bob = {"Authorization": "Bearer t-bob"}
+    a = client.post("/api/sessions", json={"title": "А"}, headers=H).json()["id"]
+    b = client.post("/api/sessions", json={"title": "Б"}, headers=H).json()["id"]
+    before = {x["id"]: x["updated_at"] for x in client.get("/api/sessions", headers=H).json()}
+    # закреплённый — первым, хотя создан раньше; закрепление не двигает updated_at
+    client.patch(f"/api/sessions/{a}", json={"pinned": True}, headers=H)
+    listed = client.get("/api/sessions", headers=H).json()
+    assert [x["id"] for x in listed] == [a, b] and listed[0]["pinned"] and listed[0]["updated_at"] == before[a]
+    # архив: пропадает из основного списка, виден в ?archived=true, сообщение возвращает обратно
+    client.patch(f"/api/sessions/{b}", json={"archived": True}, headers=H)
+    assert [x["id"] for x in client.get("/api/sessions", headers=H).json()] == [a]
+    assert [x["id"] for x in client.get("/api/sessions?archived=true", headers=H).json()] == [b]
+    client.fake.push("ок")
+    client.post(f"/api/sessions/{b}/messages", json={"text": "привет"}, headers=H)
+    wait_idle(client, b)
+    assert {x["id"] for x in client.get("/api/sessions", headers=H).json()} == {a, b}
+    # перенос в проект и обратно; в чужой проект — нельзя
+    p = client.post("/api/projects", json={"name": "П"}, headers=H).json()
+    alien = client.post("/api/projects", json={"name": "Чужой"}, headers=bob).json()
+    assert client.patch(f"/api/sessions/{a}", json={"project_id": alien["id"]}, headers=H).status_code == 404
+    client.patch(f"/api/sessions/{a}", json={"project_id": p["id"]}, headers=H)
+    assert client.get(f"/api/sessions/{a}", headers=H).json()["project"]["name"] == "П"
+    client.patch(f"/api/sessions/{a}", json={"title": "А2"}, headers=H)  # без project_id — проект не трогаем
+    assert client.get(f"/api/sessions/{a}", headers=H).json()["project"]["id"] == p["id"]
+    client.patch(f"/api/sessions/{a}", json={"project_id": None}, headers=H)
+    assert client.get(f"/api/sessions/{a}", headers=H).json()["project"] is None
+
+
 def test_devices_api(client):
     r = client.post("/api/devices", json={"name": "Ноутбук"}, headers=H).json()
     assert r["key"].startswith(r["device"]["id"] + ".") and r["bridge_url"].endswith("/bridge.py")
@@ -379,3 +408,71 @@ def test_file_preview_for_word(client, tmp_path):
     assert r["kind"] == "doc" and r["blocks"][0] == {"type": "h", "level": 1, "text": "Отчёт"}
     assert client.get(f"/api/sessions/{sid}/files/preview", params={"path": "x.bin"}, headers=H).status_code == 415
     assert client.get(f"/api/sessions/{sid}/files/preview", params={"path": "../a.db"}, headers=H).status_code == 404
+
+
+def test_tool_policy_always_allow_and_block(client):
+    """Свой выбор по инструменту: «Всегда разрешать» снимает карточку, «Заблокирован» прячет от модели."""
+    bob = {"Authorization": "Bearer t-bob"}
+    assert client.put("/api/tools/policy", json={"tools": {"nope": "allow"}}, headers=H).status_code == 404
+    r = client.put("/api/tools/policy", json={"tools": {"notes_add": "allow"}}, headers=H)
+    assert r.json()["policy"] == {"notes_add": "allow"}
+    assert client.get("/api/tools", headers=H).json()["policy"] == {"notes_add": "allow"}
+    assert client.get("/api/tools", headers=bob).json()["policy"] == {}  # у каждого свой выбор
+
+    client.fake.push({"tool_calls": [("notes_add", {"text": "Позвонить"})]}, "Записал.")
+    sid = client.post("/api/sessions", json={}, headers=H).json()["id"]
+    client.post(f"/api/sessions/{sid}/messages", json={"text": "запиши"}, headers=H)
+    wait_idle(client, sid)
+    s = client.get(f"/api/sessions/{sid}", headers=H).json()
+    assert s["approvals"] == [] and s["messages"][-1]["content"] == "Записал."
+
+    client.put("/api/tools/policy", json={"tools": {"notes_add": "deny"}}, headers=H)
+    client.post(f"/api/sessions/{sid}/messages", json={"text": "ещё"}, headers=H)
+    wait_idle(client, sid)
+    names = [t["function"]["name"] for t in (client.fake.requests[-1].tools or [])]
+    assert names and "notes_add" not in names
+    client.put("/api/tools/policy", json={"tools": {"notes_add": None}}, headers=H)
+    assert client.get("/api/tools", headers=H).json()["policy"] == {}
+
+
+def test_config_offers_three_modes(client):
+    assert client.get("/api/config", headers=H).json()["modes"] == ["default", "auto", "bypass"]
+    assert client.get("/api/config", headers={"Authorization": "Bearer t-bob"}).json()["modes"] == ["default", "auto"]
+
+
+def test_skills_crud(client):
+    bob = {"Authorization": "Bearer t-bob"}
+    app_names = {k["name"] for k in client.get("/api/skills", headers=H).json()["skills"]}
+    assert "weekly-review" in app_names
+    bad = client.post("/api/skills", json={"name": "Плохое имя", "description": "x", "body": "y"}, headers=H)
+    assert bad.status_code == 400
+    assert client.post("/api/skills", json={"name": "weekly-review", "description": "x", "body": "y"},
+                       headers=H).status_code == 409
+    ok = client.post("/api/skills", json={"name": "mail-digest", "description": "Сводка почты", "body": "1. Прочитай"},
+                     headers=H)
+    assert ok.status_code == 200
+    mine = [k for k in client.get("/api/skills", headers=H).json()["skills"] if k["source"] == "user"]
+    assert [(k["name"], k["enabled"]) for k in mine] == [("mail-digest", True)]
+    assert all(k["source"] == "app" for k in client.get("/api/skills", headers=bob).json()["skills"])
+
+    # навык попадает в промпт и открывается инструментом skill
+    client.fake.push({"tool_calls": [("skill", {"name": "mail-digest"})]}, "Готово")
+    sid = client.post("/api/sessions", json={}, headers=H).json()["id"]
+    client.post(f"/api/sessions/{sid}/messages", json={"text": "почта"}, headers=H)
+    wait_idle(client, sid)
+    req = client.fake.requests[-1]
+    assert "mail-digest: Сводка почты" in req.messages[0].text
+    assert any("1. Прочитай" in (m.text or "") for m in req.messages if m.role == "tool")
+
+    # переименование, выключение, удаление
+    assert client.post("/api/skills", json={"name": "mail-sum", "description": "Сводка", "body": "2",
+                                            "original_name": "mail-digest"}, headers=H).status_code == 200
+    assert client.patch("/api/skills/mail-sum", json={"enabled": False}, headers=H).status_code == 200
+    assert client.patch("/api/skills/weekly-review", json={"enabled": False}, headers=H).status_code == 200
+    client.post(f"/api/sessions/{sid}/messages", json={"text": "ещё"}, headers=H)
+    wait_idle(client, sid)
+    system = client.fake.requests[-1].messages[0].text
+    assert "mail-sum" not in system and "weekly-review" not in system
+    assert client.delete("/api/skills/weekly-review", headers=H).status_code == 409
+    assert client.delete("/api/skills/mail-sum", headers=H).status_code == 200
+    assert [k["name"] for k in client.get("/api/skills", headers=H).json()["skills"]] == ["weekly-review"]

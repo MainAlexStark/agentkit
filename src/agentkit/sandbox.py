@@ -108,6 +108,10 @@ class LocalBackend:
     def env(self, work: Path) -> dict[str, str]:
         from agentkit.kernel import default_sock  # noqa: PLC0415
 
+        # Абсолютный путь: при относительном data_dir (сервис запущен из template/) HOME был
+        # «data/workspaces/s_…», и `cd ~/lab` уводил в data/workspaces/s_…/data/workspaces/s_…/lab —
+        # агент тратил шаги на поиски своих же файлов (видно в `agentkit replay`).
+        work = work.resolve()
         # Сокет ядра считает сервер, а не дочерний процесс: у того другое окружение (TMPDIR),
         # и сервер потом не нашёл бы ядро, чтобы остановить его.
         return {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": str(work), "LANG": "C.UTF-8",

@@ -1,0 +1,58 @@
+# Поведение агента в целом: экономность, параллельность, субагенты, язык, расчёты.
+name: agent
+cases:
+  - id: no-tools-for-arithmetic
+    tags: [efficiency]
+    input: "Сколько будет 17 × 23?"
+    expect:
+      status: done
+      contains: ["391"]
+      max_tool_calls: 0
+
+  - id: greeting-no-tools
+    tags: [efficiency]
+    input: "Привет! Ты тут?"
+    expect:
+      status: done
+      max_tool_calls: 0
+      max_steps: 1
+
+  - id: parallel-reads
+    tags: [efficiency, parallel]
+    input: "Прочитай a.txt, b.txt и c.txt и сложи числа из них."
+    files: {a.txt: "10\n", b.txt: "20\n", c.txt: "30\n"}
+    expect:
+      status: done
+      contains: ["60"]
+      max_steps: 3
+
+  - id: computes-not-guesses
+    tags: [data, shell]
+    input: "Посчитай общую выручку по sales.csv (qty × price) — точное число."
+    files:
+      sales.csv: "item,qty,price\nболт,12,15\nгайка,30,4\nшайба,25,2\nкронштейн,3,250\nскоба,17,13\nуголок,41,7\n"
+    expect:
+      status: done
+      regex: "1\\s?608"
+
+  - id: explore-subagent
+    tags: [subagents]
+    input: "Запусти субагента, чтобы он нашёл в проекте, какой таймаут задан у HTTP-клиента, и скажи мне значение."
+    files:
+      src/app.py: "from src.http import make_client\n\nclient = make_client()\n"
+      src/http.py: "import httpx\n\nTIMEOUT = 17.5\n\n\ndef make_client():\n    return httpx.Client(timeout=TIMEOUT)\n"
+      src/db.py: "POOL = 5\nTIMEOUT_DB = 3\n"
+      src/jobs.py: "INTERVAL = 60\n"
+      README.md: "# Сервис\nКлиент — src/http.py\n"
+    expect:
+      status: done
+      tools_called: [task]
+      contains: ["17.5"]
+
+  - id: answers-in-users-language
+    tags: [language]
+    input: "Hi! In one sentence: what is a harness for an AI agent?"
+    expect:
+      status: done
+      max_tool_calls: 0
+      judge: "Ответ на английском языке, одно-два предложения, по сути верный (цикл, инструменты, контекст и права вокруг модели)."

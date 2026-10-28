@@ -2,7 +2,9 @@
 
   agentkit new <имя> [--dest DIR] [--git]     новый проект-агент из шаблона
   agentkit vendor [--dest DIR]                 обновить vendor/agentkit в проекте
-  agentkit eval <путь> --app mod:fn [--offline] [--only ID] [--json FILE]
+  agentkit eval <путь> --app mod:fn [--offline|--live] [--only ID] [--tag T] [--model M …] [--repeat N]
+                [--parallel N] [--budget $] [--json FILE] [--md FILE] [--baseline FILE] [--save-runs DIR] [--min-pass-rate X]
+  agentkit replay <база|jsonl|папка> [ID] [--list] [--full] [--to-eval FILE --id ИМЯ --judge "…" --workspace DIR]
 """
 
 from __future__ import annotations
@@ -104,37 +106,115 @@ def new(name: str, dest: Path | None, use_git: bool) -> None:
 Что менять в первую очередь: app/domain/prompt.md, app/domain/tools.py, mcp.json, evals/.""")
 
 
-def eval_cmd(path: Path, app: str, offline: bool, only: str | None, out: str | None) -> int:
-    from agentkit.evals import load_suite, run_case
+def eval_cmd(a: argparse.Namespace) -> int:
+    from agentkit.evals import (  # noqa: PLC0415
+        Report,
+        compare,
+        load_report,
+        load_suite,
+        markdown,
+        run_cases,
+        save_run,
+        select_cases,
+        summarize,
+    )
 
     sys.path.insert(0, str(Path.cwd()))
-    mod, _, fn = app.partition(":")
+    mod, _, fn = a.app.partition(":")
     make_agent = getattr(importlib.import_module(mod), fn or "make_agent")
-    files = sorted(path.glob("*.yaml")) + sorted(path.glob("*.yml")) if path.is_dir() else [path]
+    from agentkit.evals import suite_files  # noqa: PLC0415
+
+    files = suite_files(a.path)
+    models = a.model or [None]
+    stats: dict = {"spent": 0.0, "skipped": 0}  # общий на все наборы: бюджет — на весь прогон
 
     async def go() -> list[dict]:
         reports = []
         for f in files:
             name, cases = load_suite(f)
-            results = []
-            for case in cases:
-                if only and case.get("id") != only:
-                    continue
-                if offline and not case.get("script"):
-                    continue
-                results.append(await run_case(case, make_agent))
-            from agentkit.evals import Report
+            cases = select_cases(cases, only=a.only, tags=a.tag, offline=a.offline, live=a.live)
+            if not cases:
+                continue
 
+            def progress(r, name=name):
+                if a.parallel > 1:  # при параллельном прогоне — строка по мере готовности, иначе тишина минутами
+                    print(f"  {'✓' if r.passed else '✗'} {name}/{r.id} {r.model} #{r.attempt + 1} "
+                          f"[{r.seconds:.0f} с, ${r.usage.get('cost', 0):.4f}]", file=sys.stderr, flush=True)
+
+            results = await run_cases(cases, make_agent, models=models, repeat=a.repeat, parallel=a.parallel,
+                                      timeout=a.timeout, judge_model=a.judge_model, on_result=progress,
+                                      budget=a.budget, stats=stats)
             rep = Report(suite=name, results=results)
             print(rep.table())
+            if a.save_runs:
+                for r in results:
+                    if a.save_all or not r.passed:
+                        save_run(a.save_runs, name, r)
             reports.append(rep.to_dict())
         return reports
 
     reports = asyncio.run(go())
-    if out:
-        Path(out).write_text(json.dumps(reports, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
-    failed = sum(r["total"] - r["passed"] for r in reports)
-    return 1 if failed else 0
+    if stats["skipped"]:
+        print(f"бюджет ${a.budget} исчерпан (потрачено ${stats['spent']:.4f}): не запущено кейсов — {stats['skipped']}")
+    rows = [r for rep in reports for r in rep["results"]]
+    summary = summarize(rows)
+    if len(rows):
+        print()
+        for m, s in summary.items():
+            print(f"{m or 'модель по умолчанию'}: {s['passed']}/{s['runs']} ({s['pass_rate']:.0%}), pass^k {s['pass_all']:.0%}, "
+                  f"${s['cost']:.4f}, {s['avg_steps']} шагов и {s['avg_seconds']} с на прогон")
+    diff = compare(reports, load_report(a.baseline)) if a.baseline and Path(a.baseline).exists() else None
+    if diff:
+        print(f"против baseline: {diff['pass_rate_was']:.0%} → {diff['pass_rate_now']:.0%}, "
+              f"сломалось {len(diff['regressions'])}, починилось {len(diff['fixed'])}")
+    if a.json:
+        Path(a.json).write_text(json.dumps(reports, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+    if a.md:
+        text = markdown(reports, diff)
+        if a.md == "-":
+            print(text)
+        else:
+            with open(a.md, "a", encoding="utf-8") as fh:  # дописываем: так работает $GITHUB_STEP_SUMMARY
+                fh.write(text)
+    total = len(rows)
+    passed = sum(r["passed"] for r in rows)
+    if a.min_pass_rate is not None:
+        return 0 if total and passed / total >= a.min_pass_rate else 1
+    return 1 if total - passed else 0
+
+
+def replay_cmd(a: argparse.Namespace) -> int:
+    from agentkit import replay as rp  # noqa: PLC0415
+
+    events, messages = asyncio.run(rp.load(a.source, a.id))
+    rs = rp.runs(events)
+    if not rs:
+        sys.exit("в журнале нет прогонов" + (f" для {a.id}" if a.id else ""))
+    if a.list:
+        print(rp.run_list(rs, a.limit))
+        return 0
+    if a.id and a.id.startswith("r_"):
+        tl = rp.turns(rs)
+        turn = next((t for t in tl if any(r["id"] == a.id for r in t)), None)
+        if turn is None:
+            sys.exit(f"нет прогона {a.id}")
+    else:
+        # Без id — последний ход; по сессии — показываем все ходы, в eval идёт последний.
+        if not a.id:
+            rs = [r for r in rs if r["session_id"] == rs[-1]["session_id"]]
+        turn = rp.turns(rs)[-1]
+    if not a.to_eval:
+        shown = turn if (a.id or "").startswith("r_") else rs
+        print(rp.timeline(shown, full=a.full))
+        return 0
+    cases = rp.to_cases(turn, case_id=a.case_id, judge=a.judge, messages=messages,
+                        workspace=Path(a.workspace) if a.workspace else None)
+    if a.to_eval == "-":
+        print(rp.dump_cases(cases, a.source))
+    else:
+        rp.append_cases(Path(a.to_eval), cases, a.source)
+        print(f"в {a.to_eval} добавлены кейсы {', '.join(c['id'] for c in cases)}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -150,8 +230,31 @@ def main(argv: list[str] | None = None) -> None:
     p_e.add_argument("path", type=Path)
     p_e.add_argument("--app", required=True, help="модуль:функция, собирающая агента (store, fake) → Agent")
     p_e.add_argument("--offline", action="store_true", help="только кейсы со script (без реальной модели)")
-    p_e.add_argument("--only")
-    p_e.add_argument("--json")
+    p_e.add_argument("--live", action="store_true", help="только кейсы без script (реальная модель)")
+    p_e.add_argument("--only", help="id кейса или шаблон: files-*")
+    p_e.add_argument("--tag", action="append", help="только кейсы с тегом (можно несколько)")
+    p_e.add_argument("--model", action="append", help="модель вместо main, «провайдер:модель»; можно несколько")
+    p_e.add_argument("--repeat", type=int, default=1, help="прогонов каждого кейса (модель недетерминирована)")
+    p_e.add_argument("--parallel", type=int, default=1, help="кейсов одновременно")
+    p_e.add_argument("--timeout", type=float, default=None, help="секунд на кейс")
+    p_e.add_argument("--judge-model", default="small", help="модель судьи (по умолчанию роль small)")
+    p_e.add_argument("--json", help="отчёт в JSON (годится как --baseline в следующий раз)")
+    p_e.add_argument("--md", help="сводка в Markdown: файл (дописывается) или «-»")
+    p_e.add_argument("--baseline", help="прошлый отчёт JSON: что сломалось и что починилось")
+    p_e.add_argument("--save-runs", help="папка для журналов упавших прогонов (читаются agentkit replay)")
+    p_e.add_argument("--save-all", action="store_true", help="сохранять журналы и прошедших прогонов")
+    p_e.add_argument("--budget", type=float, help="потолок расходов на прогон, $: дальше кейсы не запускаются")
+    p_e.add_argument("--min-pass-rate", type=float, help="код выхода 1, только если доля успешных ниже (0..1)")
+    p_r = sub.add_parser("replay", help="ход прогона по журналу; прогон → eval-кейс")
+    p_r.add_argument("source", help="база (data/agent.db, sqlite:///…, postgresql://…), файл JSONL или папка трейсов")
+    p_r.add_argument("id", nargs="?", help="r_… — прогон, s_… — сессия; без id — последний")
+    p_r.add_argument("--list", action="store_true", help="список прогонов")
+    p_r.add_argument("--limit", type=int, default=30)
+    p_r.add_argument("--full", action="store_true", help="аргументы и вывод целиком")
+    p_r.add_argument("--to-eval", help="дописать кейсы в YAML-набор (или «-» — вывести)")
+    p_r.add_argument("--id", dest="case_id", help="имя кейса")
+    p_r.add_argument("--judge", help="критерий правильного ответа для живого кейса")
+    p_r.add_argument("--workspace", help="папка разговора: взять оттуда файлы, которые читал агент")
     # Мост и песочница разбирают свои аргументы сами — здесь только передаём остаток.
     sub.add_parser("bridge", help="мост: папки и команды этого компьютера для агента", add_help=False)
     sub.add_parser("sandbox", help="песочница для run_python / run_bash", add_help=False)
@@ -167,7 +270,9 @@ def main(argv: list[str] | None = None) -> None:
     elif a.cmd == "vendor":
         vendor(a.dest)
     elif a.cmd == "eval":
-        sys.exit(eval_cmd(a.path, a.app, a.offline, a.only, a.json))
+        sys.exit(eval_cmd(a))
+    elif a.cmd == "replay":
+        sys.exit(replay_cmd(a))
 
 
 if __name__ == "__main__":

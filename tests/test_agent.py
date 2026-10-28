@@ -365,3 +365,41 @@ async def test_session_start_and_prompt_hooks(store, user):
     assert any("Ромашка" in m.text for m in fake.requests[0].messages)
     evs = await collect(agent.run(s.id, user, "казино"))
     assert status(evs) == "error" and len(fake.requests) == 1
+
+
+async def test_parallel_results_all_kept_in_memory_store(store, user, tmp_path):
+    from agentkit import standard_tools
+
+    # In-memory SQLite: одно соединение на всех — параллельные записи теряли результат.
+    for n, v in (("a", "10"), ("b", "20"), ("c", "30")):
+        (tmp_path / f"{n}.txt").write_text(v)
+    seen = []
+    fake = FakeLLM([{"tool_calls": [("read_file", {"path": f"{n}.txt"}) for n in "abc"]},
+                    lambda req: seen.append(req) or "ok"])
+    agent = make_agent(store, fake, tools=standard_tools(subagents=False), workspace=tmp_path)
+    s = await store.create_session(user.id)
+    await collect(agent.run(s.id, user, "сложи"))
+    results = [m.text for m in seen[0].messages if m.role == "tool"]
+    assert [r.split("\t")[-1] for r in results] == ["10", "20", "30"]
+
+
+async def test_subagent_sees_parent_workspace(store, user, tmp_path):
+    from agentkit import DEFAULT_SUBAGENTS, standard_tools, task_tool
+
+    def ws(sid):
+        p = tmp_path / sid
+        p.mkdir(exist_ok=True)
+        return p
+
+    fake = FakeLLM([
+        {"tool_calls": [("task", {"agent_type": "explore", "description": "найти", "prompt": "что в файлах?"})]},
+        {"tool_calls": [("glob_files", {"pattern": "**/*"})]},
+        lambda req: "нашёл: " + req.messages[-1].text,
+        lambda req: req.messages[-1].text,
+    ])
+    agent = make_agent(store, fake, tools=standard_tools(subagents=False, extra=[task_tool(DEFAULT_SUBAGENTS)]),
+                       workspace=ws, subagents=DEFAULT_SUBAGENTS)
+    s = await store.create_session(user.id)
+    (ws(s.id) / "http.py").write_text("TIMEOUT = 17.5\n")
+    evs = await collect(agent.run(s.id, user, "найди"))
+    assert "нашёл: http.py" in [e.data.get("content") for e in evs if str(e.type) == "message"][-1]

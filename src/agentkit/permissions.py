@@ -1,17 +1,23 @@
 """Права на вызов инструментов: режимы и правила allow / ask / deny.
 
 Порядок решения (первое совпадение побеждает):
-  1. deny-правило                         → deny
+  1. deny-правило или «Заблокирован» у инструмента → deny
   2. режим plan и инструмент не read_only  → deny (план без изменений)
   3. режим readonly и инструмент пишет     → deny
-  4. ask-правило                          → ask
-  5. allow-правило                        → allow
+  4. ask-правило или «Спрашивать» у инструмента → ask
+  5. allow-правило или «Всегда разрешать»  → allow
   6. режим bypass                          → allow
   7. needs_approval у инструмента          → ask (даже в auto: это доменная страховка)
   8. read_only                             → allow
-  9. режим auto                            → allow
- 10. accept_edits (или workspace_edits) и группа files → allow (кроме destructive)
- 11. иначе (режим default)                 → ask
+  9. зона агента (группа sandbox)          → allow (кроме destructive)
+ 10. режим auto                            → allow
+ 11. accept_edits (или workspace_edits) и группа files → allow (кроме destructive)
+ 12. иначе (режим default)                 → ask
+
+В интерфейсе три режима: default («Спрашивать»), auto («Автоматически»),
+bypass («Без вопросов»); остальные — для субагентов и хост-приложений.
+Выбор «Всегда разрешать / Спрашивать / Заблокирован» у конкретного инструмента —
+`tool_policy` ({имя: allow|ask|deny}), его задаёт пользователь в «Инструментах».
 
 Правило — строка «имя_инструмента» или «имя(шаблон)»: шаблон сравнивается
 со «смысловым» аргументом инструмента (command у shell, path у файлов, url у
@@ -94,27 +100,41 @@ class Permissions:
     # Правки рабочей папки без вопроса в любом пишущем режиме — когда папка своя у каждого разговора
     # (сервис): иначе каждая правка HTML-черновика ждала человека (8 подтверждений на один дашборд).
     workspace_edits: bool = False
+    # Зона агента — группы, которые работают без вопроса в любом пишущем режиме. Песочница —
+    # отдельный контейнер на разговор: без этого каждый run_python в локальной песочнице
+    # (url=local, там инструменты не read_only) ждал карточку, и агент не мог ничего посчитать сам.
+    agent_zone: tuple[str, ...] = ("sandbox",)
+    # Выбор пользователя по инструментам: {имя: allow|ask|deny}. Правила сервиса (deny/ask) сильнее.
+    tool_policy: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._allow = [Rule.parse(r) for r in self.allow]
         self._ask = [Rule.parse(r) for r in self.ask]
         self._deny = [Rule.parse(r) for r in self.deny]
 
-    def with_mode(self, mode: Mode | str) -> Permissions:
+    def with_mode(self, mode: Mode | str, tool_policy: dict[str, str] | None = None) -> Permissions:
         return Permissions(mode=Mode(mode), allow=self.allow, ask=self.ask, deny=self.deny, edit_groups=self.edit_groups,
-                           workspace_edits=self.workspace_edits)
+                           workspace_edits=self.workspace_edits, agent_zone=self.agent_zone,
+                           tool_policy=self.tool_policy if tool_policy is None else tool_policy)
+
+    def blocked(self, name: str) -> bool:
+        """Заблокирован пользователем — такой инструмент не показываем модели вовсе."""
+        return self.tool_policy.get(name) == "deny"
 
     def check(self, tool: Tool, args: dict[str, Any], ctx: ToolContext | None = None) -> Verdict:
         name = tool.name
+        own = self.tool_policy.get(name)
         if any(r.matches(name, args) for r in self._deny):
             return Verdict(Decision.DENY, "запрещено правилом")
+        if own == "deny":
+            return Verdict(Decision.DENY, "инструмент заблокирован в настройках «Инструменты»")
         if self.mode == Mode.PLAN and not tool.read_only:
             return Verdict(Decision.DENY, "режим планирования: изменения запрещены, сначала покажи план")
         if self.mode == Mode.READONLY and not tool.read_only:
             return Verdict(Decision.DENY, "режим только чтения")
-        if any(r.matches(name, args) for r in self._ask):
-            return Verdict(Decision.ASK, "правило требует подтверждения")
-        if any(r.matches(name, args) for r in self._allow):
+        if any(r.matches(name, args) for r in self._ask) or own == "ask":
+            return Verdict(Decision.ASK, "правило требует подтверждения" if own != "ask" else "")
+        if any(r.matches(name, args) for r in self._allow) or own == "allow":
             return Verdict(Decision.ALLOW)
         if self.mode == Mode.BYPASS:
             return Verdict(Decision.ALLOW)
@@ -126,6 +146,8 @@ class Permissions:
         elif need:
             return Verdict(Decision.ASK, "")
         if tool.read_only:
+            return Verdict(Decision.ALLOW)
+        if tool.group in self.agent_zone and not tool.destructive:
             return Verdict(Decision.ALLOW)
         if self.mode in (Mode.AUTO, Mode.BYPASS):
             return Verdict(Decision.ALLOW)

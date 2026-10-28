@@ -334,3 +334,39 @@ async def test_openrouter_cyrillic_app_name_does_not_break_requests():
     p = OpenAICompatProvider(openrouter("k", app_name="Метролог ЕИ"), client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     assert await p.list_models() == [{"id": "a/b"}]
     assert seen["title"] == "Metrolog EI"
+
+
+# ── файлы: подсказки и контекст grep ────────────────────────────────
+
+async def test_missing_file_suggests_similar(store, tmp_path):
+    from agentkit.tools.base import ToolContext, User
+    from agentkit.tools.files import grep, read_file
+
+    (tmp_path / "conf").mkdir()
+    (tmp_path / "settings.yaml").write_text("timeout: 42s\n")
+    (tmp_path / "conf" / "db.yaml").write_text("port: 5432\n")
+    ctx = ToolContext(session_id="s", run_id="r", user=User(id="u"), agent=None, store=store, emit=None,
+                      workspace=tmp_path)
+    r = await read_file.call({"path": "settings.yml"}, ctx)
+    assert r.is_error and "Похожие: settings.yaml" in r.content
+    r = await read_file.call({"path": "db.yaml"}, ctx)
+    assert "conf/db.yaml" in r.content
+    r = await read_file.call({"path": "zzz.bin"}, ctx)
+    assert r.content.endswith("нет файла zzz.bin")
+
+    (tmp_path / "n.py").write_text("def alert_owner(e):\n    text = e\n    send_sms(text)\n    send_sms(2)\n    return 1\n")
+    r = await grep.call({"pattern": "send_sms", "glob": "*.py", "context": 2}, ctx)
+    assert r.content.splitlines() == [
+        "n.py-1- def alert_owner(e):", "n.py-2-     text = e", "n.py:3:     send_sms(text)",
+        "n.py:4:     send_sms(2)", "n.py-5-     return 1"]
+
+
+async def test_stringified_list_args_are_parsed():
+    from agentkit.tools.core import ask_user, todo_write
+
+    args = ask_user.validate({"question": "Какие?", "options": '[{"label": "все"}, {"label": "никакие"}]'})
+    assert [o["label"] for o in args["options"]] == ["все", "никакие"]
+    args = todo_write.validate({"todos": '[{"content": "a", "status": "pending"}]'})
+    assert args["todos"][0]["content"] == "a"
+    # строка, которая и должна быть строкой, — не трогаем
+    assert ask_user.validate({"question": "[1, 2]?"})["question"] == "[1, 2]?"

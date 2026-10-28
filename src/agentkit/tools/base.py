@@ -107,6 +107,7 @@ class Tool:
 
     def validate(self, args: dict[str, Any]) -> dict[str, Any]:
         """Проверяет аргументы до вызова; ошибка уходит модели, чтобы она исправилась."""
+        args = _unstring(args, self.parameters)
         if self.args_model is not None:
             try:
                 return self.args_model.model_validate(args).model_dump()
@@ -124,6 +125,35 @@ class Tool:
         if inspect.isawaitable(res):
             res = await (asyncio.wait_for(res, self.timeout) if self.timeout else res)
         return coerce_result(res)
+
+
+def _unstring(args: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
+    """Список или объект, присланный JSON-строкой, — разворачиваем.
+
+    Дешёвые модели (DeepSeek Flash) кладут массив в аргумент строкой: options="[{…}]".
+    Без этого — лишний шаг на «Input should be a valid list» и повтор
+    (evals/harness planning/ask-when-ambiguous). Только верхний уровень и только
+    там, где схема ждёт array/object, а строка действительно разбирается.
+    """
+    props = (schema or {}).get("properties") or {}
+    out = None
+    for k, v in args.items():
+        if not isinstance(v, str) or not v.lstrip().startswith(("[", "{")):
+            continue
+        sch = props.get(k) or {}
+        types = {sch.get("type")} | {x.get("type") for x in sch.get("anyOf", []) if isinstance(x, dict)}
+        if "$ref" in sch or "items" in sch:
+            types.add("array" if "items" in sch else "object")
+        if not types & {"array", "object"} or "string" in types:
+            continue
+        try:
+            parsed = json.loads(v)
+        except ValueError:
+            continue
+        if isinstance(parsed, list | dict):
+            out = out if out is not None else dict(args)
+            out[k] = parsed
+    return out if out is not None else args
 
 
 class ToolArgsError(ValueError):
