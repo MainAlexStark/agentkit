@@ -21,6 +21,14 @@ cd template && pytest -q && agentkit eval evals/ --app app.evals:make_agent --of
 agentkit new smoke-agent --dest /tmp && (cd /tmp/smoke-agent && pip install -r requirements.txt -q && pytest -q)
 ```
 
+Правка поведения ядра (CORE_RULES, описания и тексты ошибок инструментов, `context.py`, цикл) — ещё и живой прогон набора ядра против baseline (нужен ключ модели; стоит около доллара на две модели):
+
+```bash
+agentkit eval evals/harness --app agentkit.bench:make_agent --model openrouter:anthropic/claude-sonnet-4.5 \
+    --model openrouter:anthropic/claude-haiku-4.5 --parallel 8 --baseline evals/baseline.json --save-runs evals/runs
+agentkit replay evals/runs/<модель>/<набор>__<кейс>__1.jsonl   # почему упал
+```
+
 UI проверяется Playwright-скриптом против сервиса с `FakeLLM` (см. `template/tests/test_service.py` — как подменить модели через `AgentService(router=…)`).
 
 ## Где что

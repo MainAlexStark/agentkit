@@ -62,8 +62,11 @@ async def si_type_create(ctx, name: str, number: str) -> str: ...
 
 ```bash
 pytest && agentkit eval evals/ --app app.evals:make_agent --offline   # бесплатно
-agentkit eval evals/ --app app.evals:make_agent                        # на модели
+agentkit eval evals/ --app app.evals:make_agent --repeat 3 --json evals/baseline.json   # на модели
+agentkit eval evals/ --app app.evals:make_agent --baseline evals/baseline.json --md -   # после правки промпта
 ```
+
+Все поля кейса — в docstring `agentkit/evals.py`; главное: `files` (папка до и проверка после), `turns` и `answers` (несколько ходов, ответы на вопросы), `history` и `memory`, `tool_args`, `max_cost`. Провал из прода превращается в кейс: `agentkit replay data/agent.db r_… --to-eval evals/regress.yaml --judge "каким должен быть ответ" --workspace data/workspaces/s_…`.
 
 ## 8. Развернуть
 

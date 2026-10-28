@@ -10,3 +10,6 @@ dist/
 template/data/
 template/deploy/*.env
 !template/deploy/*.env.example
+# отчёты и журналы локальных прогонов evals (baseline.json — в репозитории)
+evals/out*.json
+evals/runs/

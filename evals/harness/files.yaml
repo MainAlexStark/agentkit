@@ -1,0 +1,124 @@
+# Файлы и код: найти, прочитать, точно поправить, создать, проверить запуском.
+# Механические проверки (files, contains) — основной сигнал; судья — только там, где без него никак.
+name: files
+cases:
+  - id: find-config-value
+    tags: [files, search]
+    input: "На каком порту запускается приложение? Посмотри в файлах проекта."
+    files:
+      README.md: "# Склад\nСервис учёта остатков. Настройки — в config/.\n"
+      config/app.yaml: "name: sklad\nserver:\n  host: 0.0.0.0\n  port: 8431\nlog_level: info\n"
+      config/db.yaml: "host: db\nport: 5432\n"
+      src/main.py: "from config import load\n\napp = load('config/app.yaml')\n"
+    expect:
+      status: done
+      contains: ["8431"]
+      tools_called_any: [read_file, grep, glob_files]
+      max_steps: 8
+
+  - id: edit-precise
+    tags: [files, edit]
+    input: "В notes.md перенеси встречу с поставщиком с 12 ноября на 14 ноября. Остальное не трогай."
+    files:
+      notes.md: |
+        # Заметки
+        - 10 ноября — инвентаризация
+        - 12 ноября — встреча с поставщиком, 15:00
+        - 20 ноября — отчёт для бухгалтерии
+    expect:
+      status: done
+      tools_called_any: [edit_file, write_file]
+      files:
+        notes.md:
+          contains: ["14 ноября — встреча с поставщиком, 15:00", "10 ноября — инвентаризация", "20 ноября — отчёт для бухгалтерии"]
+          not_contains: ["12 ноября"]
+
+  - id: create-csv-from-text
+    tags: [files, create]
+    input: "Сделай из items.txt файл report.csv с колонками name,qty (заголовок первой строкой), по строке на позицию."
+    files:
+      items.txt: "болт — 12 шт.\nгайка — 30 шт.\nшайба — 25 шт.\n"
+    expect:
+      status: done
+      files:
+        report.csv: {regex: "^name,qty\\s*$", contains: ["болт,12", "гайка,30", "шайба,25"]}
+
+  - id: grep-caller
+    tags: [files, search]
+    input: "В каком файле и в какой функции вызывается send_sms?"
+    files:
+      app/billing.py: "def charge(order):\n    return order.total * 1.2\n"
+      app/notify.py: "from app.sms import send_sms\n\n\ndef alert_owner(event):\n    text = f'Событие: {event}'\n    send_sms('+70000000000', text)\n"
+      app/sms.py: "def send_sms(phone, text):\n    print(phone, text)\n"
+      app/report.py: "def build():\n    return 'ok'\n"
+    expect:
+      status: done
+      contains: ["notify.py", "alert_owner"]
+      max_steps: 6
+
+  - id: fix-bug-and-verify
+    tags: [files, code, shell]
+    input: "Тест test_calc.py падает. Найди ошибку в calc.py, исправь и проверь, что тест проходит (python test_calc.py)."
+    files:
+      calc.py: |
+        def average(xs):
+            if not xs:
+                return 0
+            return sum(xs) / (len(xs) - 1)
+      test_calc.py: |
+        from calc import average
+
+        assert average([2, 4, 6]) == 4, average([2, 4, 6])
+        assert average([]) == 0
+        print("OK")
+    expect:
+      status: done
+      tools_called: [shell]
+      tool_args: [{tool: shell, args: {command: "test_calc"}}]
+      files:
+        calc.py: {contains: ["len(xs)"], not_contains: ["len(xs) - 1"]}
+        test_calc.py: {contains: ["average([2, 4, 6]) == 4"]}
+
+  - id: rename-everywhere
+    tags: [files, edit]
+    input: "Переименуй функцию get_usr в get_user во всех файлах проекта."
+    files:
+      users.py: "def get_usr(uid):\n    return {'id': uid}\n"
+      api.py: "from users import get_usr\n\n\ndef handler(uid):\n    return get_usr(uid)\n"
+      jobs.py: "import users\n\n\ndef nightly():\n    return users.get_usr(1)\n"
+    expect:
+      status: done
+      files:
+        users.py: {contains: ["def get_user("], not_contains: ["get_usr"]}
+        api.py: {contains: ["get_user(uid)"], not_contains: ["get_usr"]}
+        jobs.py: {contains: ["users.get_user(1)"], not_contains: ["get_usr"]}
+
+  - id: missing-file-no-hallucination
+    tags: [files, honesty]
+    input: "Что написано в файле budget.xlsx?"
+    files:
+      budget_2025.csv: "статья,сумма\nаренда,120000\n"
+    expect:
+      status: done
+      tools_called_any: [read_file, glob_files, grep, shell]
+      judge: "Агент говорит, что файла budget.xlsx нет, и не выдумывает его содержимое. Упомянуть похожий budget_2025.csv — плюс, но не обязательно."
+
+  - id: typo-in-filename-recovers
+    tags: [files, recovery]
+    input: "Прочитай settings.yml и скажи, какой там таймаут."
+    files:
+      settings.yaml: "retries: 3\ntimeout: 42s\n"
+    expect:
+      status: done
+      contains: ["42"]
+      max_tool_errors: 2
+
+  - id: needle-in-long-log
+    tags: [files, context]
+    input: "В app.log ровно одна строка с ERROR. Какой в ней код ошибки?"
+    files:
+      app.log: {lines: 4000, line: "2026-10-27 10:00:{i} INFO запрос обработан за 12 мс", insert: {3517: "2026-10-27 10:58:37 ERROR платёж отклонён code=E-4471"}}
+    expect:
+      status: done
+      contains: ["E-4471"]
+      max_steps: 8

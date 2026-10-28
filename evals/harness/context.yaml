@@ -1,0 +1,75 @@
+# Контекст: история, несколько ходов, сжатие, обрезанный вывод, память.
+name: context
+cases:
+  - id: recall-from-history
+    tags: [context, history]
+    history:
+      - {role: user, content: "Мой заказ номер 58213, доставка в Киров на четверг."}
+      - {role: assistant, content: "Понял: заказ 58213, доставка в Киров в четверг."}
+      - {role: user, content: "Ещё вопрос: есть ли у вас крепёж М8?"}
+      - {role: assistant, content: "Да, М8 есть в наличии."}
+    input: "Напомни, какой у меня номер заказа?"
+    expect:
+      status: done
+      contains: ["58213"]
+      max_tool_calls: 0
+
+  - id: multi-turn-file
+    tags: [context, files]
+    input: "Запиши в plan.md список из трёх пунктов: купить, собрать, проверить."
+    turns: ["Добавь в конец четвёртый пункт: отправить. Остальное не меняй."]
+    expect:
+      status: done
+      files:
+        plan.md: {regex: "(?is)купить.*собрать.*проверить.*отправить"}
+
+  - id: fact-survives-compaction
+    tags: [context, compaction]
+    config: {context_window: 6000, keep_user_turns: 1}
+    history:
+      - {role: user, content: "Кодовое слово проекта — АЛЬБАТРОС. Запомни на время разговора."}
+      - {role: assistant, content: "Принял: кодовое слово — АЛЬБАТРОС."}
+      - {role: user, content: {repeat: "Пишу черновик описания склада, тут много подробностей про стеллажи и паллеты. ", times: 60}}
+      - {role: assistant, content: "Понял, черновик принял."}
+      - {role: user, content: {repeat: "Продолжение черновика: погрузчики, смены, учёт брака и возвратов. ", times: 60}}
+      - {role: assistant, content: "Принял продолжение."}
+      - {role: user, content: {repeat: "И ещё: поставщики, сроки поставок, штрихкоды и маркировка. ", times: 60}}
+      - {role: assistant, content: "Принял."}
+    input: "Какое кодовое слово проекта?"
+    expect:
+      status: done
+      compacted: true
+      contains: ["АЛЬБАТРОС"]
+
+  - id: truncated-output-read-further
+    tags: [context, truncation, shell]
+    config: {max_output_chars: 2000}
+    input: "Запусти python gen.py и скажи, какой маркер в самой последней строке вывода."
+    files:
+      gen.py: |
+        for i in range(600):
+            print(f"строка {i}: обычный вывод расчёта")
+        print("ИТОГ маркер=DONE-7731")
+    expect:
+      status: done
+      contains: ["DONE-7731"]
+
+  - id: uses-memory-preference
+    tags: [context, memory]
+    memory: ["Отчёты пользователь хочет в виде Markdown-таблицы, без лишнего текста."]
+    input: "Сделай отчёт по продажам из sales.csv: позиция, количество, выручка."
+    files:
+      sales.csv: "item,qty,price\nболт,12,15\nгайка,30,4\nшайба,25,2\nкронштейн,3,250\n"
+    expect:
+      status: done
+      # Механика вместо судьи: small-модель путалась в колонках и валила верные таблицы.
+      contains: ["180", "120", "750"]
+      regex: "^\\s*\\|.*\\|.*\\|"
+
+  - id: saves-stated-preference
+    tags: [context, memory]
+    input: "Запомни на будущее: мой часовой пояс — Екатеринбург, время называй по нему."
+    expect:
+      status: done
+      tools_called: [memory_save]
+      tool_args: [{tool: memory_save, args: {text: "Екатеринбург"}}]

@@ -224,7 +224,10 @@ class Agent:
                         await self.store.update_session(session_id, title=title.splitlines()[0][:80])
             return await self._loop(session_id, user, run_id, emit, model=model, mode=mode)
 
-        async for ev in self._drive(session_id, body, model=model, trigger=trigger):
+        # Текст запроса — в событие старта: по журналу (JSONL, ak_events) прогон потом
+        # разбирается и превращается в eval-кейс без доступа к таблице сообщений.
+        info = {"input": _plain_text(input)[:8000]} if input is not None else None
+        async for ev in self._drive(session_id, body, model=model, trigger=trigger, info=info):
             yield ev
 
     async def resolve_approval(
@@ -253,7 +256,11 @@ class Agent:
             tool = self.tools.get(rec.tool_name)
             args = edited_args if edited_args is not None else rec.args
             if not approve:
-                content = "Пользователь отклонил это действие." + (f" Комментарий: {comment}" if comment else "")
+                # Явно «не выполнено» и «не проси снова»: на голом «отклонил» haiku заново просил
+                # подтверждение, будто карточки ещё не было (кейс planning/rejected-approval-is-respected).
+                content = ("Человек отклонил это действие — оно НЕ выполнено. Сообщи, что не сделал его, "
+                           "и не запрашивай то же самое снова без новой просьбы."
+                           + (f" Комментарий: {comment}" if comment else ""))
                 result = ToolResult(content=content, is_error=True)
             elif tool is None:
                 result = ToolResult.error(f"инструмент {rec.tool_name} больше недоступен")
@@ -310,7 +317,7 @@ class Agent:
 
     # ── внутреннее: запуск с очередью событий ─────────────────────────
 
-    async def _drive(self, session_id, body, *, model: str, trigger: str):
+    async def _drive(self, session_id, body, *, model: str, trigger: str, info: dict[str, Any] | None = None):
         run = await self.store.create_run(session_id, model=self.router.resolve(model), trigger=trigger)
         q: asyncio.Queue[Event | None] = asyncio.Queue()
         cancel = self._cancel.setdefault(run.id, asyncio.Event())
@@ -338,7 +345,8 @@ class Agent:
             status = RunStatus.ERROR
             error = None
             try:
-                await emit(Event(EventType.RUN_STARTED, {"model": self.router.resolve(model), "trigger": trigger}))
+                await emit(Event(EventType.RUN_STARTED, {"model": self.router.resolve(model), "trigger": trigger,
+                                                         **(info or {})}))
                 status = await body(emit, run.id)
             except asyncio.CancelledError:
                 status = RunStatus.CANCELLED

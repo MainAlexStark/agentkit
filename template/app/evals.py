@@ -18,7 +18,9 @@ from app.domain import build_domain
 
 
 def make_agent(store, fake: FakeLLM | None):
-    settings = Settings(data_dir=Path(tempfile.mkdtemp(prefix="eval-")), scheduler=False, default_mode="default")
+    # trace_dir=None: иначе прогоны evals дописывались бы в трейсы сервиса из .env (data/traces).
+    settings = Settings(data_dir=Path(tempfile.mkdtemp(prefix="eval-")), scheduler=False, default_mode="default",
+                        trace_dir=None)
     router = None
     if fake is not None:
         router = ModelRouter(providers={"fake": fake}, roles={"main": "fake:main", "small": "fake:small"},
