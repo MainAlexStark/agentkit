@@ -33,6 +33,7 @@ from agentkit.server.auth import require_admin
 from agentkit.server.platform_api import register as register_platform
 from agentkit.server.preview import register as register_preview
 from agentkit.server.service import MCP_NAME, AgentService
+from agentkit.skills import skill_problem
 from agentkit.store.base import ScheduleRec
 from agentkit.tools.base import User
 
@@ -117,6 +118,22 @@ class MCPServerIn(BaseModel):
     enabled: bool = True
     deferred: bool | None = None
     original_name: str | None = None  # правка существующего (в том числе переименование)
+
+
+class ToolPolicyIn(BaseModel):
+    # {имя инструмента: allow | ask | deny | null}; null — вернуть как задано по умолчанию.
+    tools: dict[str, Literal["allow", "ask", "deny"] | None]
+
+
+class SkillIn(BaseModel):
+    name: str
+    description: str
+    body: str
+    original_name: str | None = None  # правка (в том числе переименование)
+
+
+class SkillToggle(BaseModel):
+    enabled: bool
 
 
 class MCPTestIn(BaseModel):
@@ -204,7 +221,10 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         favs = [m for m in prefs["favorites"] if svc.model_allowed(m, policy)]
         return {"name": s.name, "models": favs or [s.model_main],
                 "default_model": prefs["default"] if svc.model_allowed(prefs["default"], policy) else s.model_main,
-                "modes": [m.value for m in Mode if m != Mode.BYPASS or user.has_role("admin")],
+                # В выборе — три режима, как у Claude: спрашивать / автоматически / без вопросов.
+                # plan, readonly, accept_edits остаются в ядре — для субагентов и хост-приложений.
+                "modes": [m.value for m in (Mode.DEFAULT, Mode.AUTO, Mode.BYPASS)
+                          if m != Mode.BYPASS or user.has_role("admin")],
                 "default_mode": s.default_mode, "is_admin": user.has_role("admin"),
                 "description": svc.domain.description or s.description,
                 "suggestions": svc.domain.suggestions or [x.strip() for x in s.suggestions.split("|") if x.strip()],
@@ -412,9 +432,91 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
                       for t in svc.registry.all()],
             "mcp": [_mcp_view(c, svc.mcp.status.get(c.name), custom.get(c.name), user.has_role("admin"),
                               c.name not in svc.mcp_file_names) for c in svc.mcp_all],
-            "skills": [{"name": k.name, "description": k.description} for k in (svc.agent.skills.skills.values()
-                                                                               if svc.agent.skills else [])],
+            "skills": [{"name": k.name, "description": k.description}
+                       for k in (await svc.agent.skills_for(user)).skills.values()],
+            "policy": await svc.store.kv_get("tool_policy", user.id) or {},
         }
+
+    @api.put("/tools/policy")
+    async def tools_policy(body: ToolPolicyIn, user: User = Depends(auth)):
+        """Свой выбор по инструментам: «Всегда разрешать», «Спрашивать», «Заблокирован».
+
+        У каждого пользователя свой: правила сервиса (AGENT_DENY_RULES/ASK_RULES) всё равно сильнее."""
+        known = {t.name for t in svc.registry.all()}
+        policy = dict(await svc.store.kv_get("tool_policy", user.id) or {})
+        for name, v in body.tools.items():
+            if v is None:
+                policy.pop(name, None)
+            elif name in known or name in policy:
+                policy[name] = v
+            else:
+                raise HTTPException(404, f"нет инструмента {name}")
+        await svc.store.kv_set("tool_policy", user.id, policy)
+        return {"ok": True, "policy": policy}
+
+    # ── навыки ───────────────────────────────────────────────────────
+    async def _skills_doc(user: User) -> dict:
+        doc = await svc.store.kv_get("skills", user.id) or {}
+        return {"custom": dict(doc.get("custom") or {}), "off": list(doc.get("off") or [])}
+
+    @api.get("/skills")
+    async def skills_list(user: User = Depends(auth)):
+        """Навыки пользователя: из папки приложения (только чтение) и свои — с текстом для редактора."""
+        doc = await _skills_doc(user)
+        app_skills = svc.agent.skills.skills if svc.agent.skills else {}
+        off = set(doc["off"])
+        out = [{"name": k.name, "description": k.description, "body": k.body, "files": k.files, "source": "app",
+                "enabled": k.name not in off} for k in app_skills.values()]
+        out += [{"name": n, "description": d.get("description", ""), "body": d.get("body", ""), "files": [],
+                 "source": "user", "enabled": n not in off, "updated_at": d.get("updated_at")}
+                for n, d in sorted(doc["custom"].items()) if n not in app_skills]
+        return {"skills": out, "dir": str(svc.settings.skills_dir)}
+
+    @api.post("/skills")
+    async def skills_save(body: SkillIn, user: User = Depends(auth)):
+        name = body.name.strip()
+        if problem := skill_problem(name, body.description, body.body):
+            raise HTTPException(400, problem)
+        doc = await _skills_doc(user)
+        app_skills = svc.agent.skills.skills if svc.agent.skills else {}
+        old = body.original_name
+        if name in app_skills:
+            raise HTTPException(409, f"навык {name} уже есть в папке приложения — выберите другое имя")
+        if name in doc["custom"] and name != old:
+            raise HTTPException(409, f"навык {name} уже есть")
+        if old and old not in doc["custom"]:
+            raise HTTPException(404, f"нет своего навыка {old}")
+        prev = doc["custom"].pop(old, {}) if old else {}
+        doc["custom"][name] = {"description": body.description.strip(), "body": body.body.strip(),
+                               "created_at": prev.get("created_at") or time.time(), "updated_at": time.time()}
+        if old and old != name and old in doc["off"]:
+            doc["off"] = [n if n != old else name for n in doc["off"]]
+        await svc.store.kv_set("skills", user.id, doc)
+        return {"ok": True}
+
+    @api.patch("/skills/{name}")
+    async def skills_toggle(name: str, body: SkillToggle, user: User = Depends(auth)):
+        doc = await _skills_doc(user)
+        app_skills = svc.agent.skills.skills if svc.agent.skills else {}
+        if name not in app_skills and name not in doc["custom"]:
+            raise HTTPException(404, f"нет навыка {name}")
+        off = [n for n in doc["off"] if n != name]
+        if not body.enabled:
+            off.append(name)
+        doc["off"] = off
+        await svc.store.kv_set("skills", user.id, doc)
+        return {"ok": True}
+
+    @api.delete("/skills/{name}")
+    async def skills_delete(name: str, user: User = Depends(auth)):
+        doc = await _skills_doc(user)
+        if name not in doc["custom"]:
+            raise HTTPException(404 if not (svc.agent.skills and name in svc.agent.skills.skills) else 409,
+                                "навыки из папки приложения удаляются из репозитория; здесь их можно выключить")
+        doc["custom"].pop(name)
+        doc["off"] = [n for n in doc["off"] if n != name]
+        await svc.store.kv_set("skills", user.id, doc)
+        return {"ok": True}
 
     # ── модели ───────────────────────────────────────────────────────
     @api.get("/models")

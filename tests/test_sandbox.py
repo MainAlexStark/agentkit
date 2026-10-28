@@ -323,6 +323,32 @@ def test_workspace_edits_skip_approval_but_not_plan_mode():
     assert Permissions().check(write_file, {"path": "a", "content": ""}).decision == Decision.ASK
 
 
+def test_sandbox_is_agent_zone_in_every_writing_mode():
+    """Песочница — зона агента: даже локальная (там run_python не read_only) не ждёт карточки."""
+    run = {t.name: t for t in sandbox_tools("local")}["run_python"]
+    assert not run.read_only
+    for mode in (Mode.DEFAULT, Mode.AUTO, Mode.BYPASS):
+        assert Permissions(mode=mode).check(run, {"code": "1"}).decision == Decision.ALLOW
+    assert Permissions(mode=Mode.READONLY).check(run, {"code": "1"}).decision == Decision.DENY
+    # свой выбор и правила сервиса сильнее зоны
+    assert Permissions(tool_policy={"run_python": "ask"}).check(run, {"code": "1"}).decision == Decision.ASK
+    assert Permissions(tool_policy={"run_python": "deny"}).check(run, {"code": "1"}).decision == Decision.DENY
+
+
+def test_tool_policy_order():
+    p = Permissions(tool_policy={"write_file": "allow"})
+    assert p.check(write_file, {"path": "a", "content": ""}).decision == Decision.ALLOW
+    assert p.with_mode(Mode.PLAN).check(write_file, {"path": "a", "content": ""}).decision == Decision.DENY
+    # deny-правило сервиса не перебить «Всегда разрешать»
+    strict = Permissions(deny=["write_file"], tool_policy={"write_file": "allow"})
+    assert strict.check(write_file, {"path": "a", "content": ""}).decision == Decision.DENY
+    # «Спрашивать» действует и в режиме «Без вопросов»
+    asked = Permissions(mode=Mode.BYPASS, tool_policy={"write_file": "ask"})
+    assert asked.check(write_file, {"path": "a", "content": ""}).decision == Decision.ASK
+    assert asked.with_mode(Mode.AUTO).tool_policy == {"write_file": "ask"}
+    assert asked.with_mode(Mode.AUTO, {}).tool_policy == {}
+
+
 # ── превью серверов песочницы ────────────────────────────────────────
 
 def _http_server():

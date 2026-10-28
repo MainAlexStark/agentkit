@@ -1173,3 +1173,34 @@ a.link-card .fc-open { opacity: 1; }
 .viz-top { padding-right: 32px; }
 .pv-pdf { display: grid; justify-items: center; gap: 12px; padding: 12px; background: var(--surface-2); min-height: 100%; }
 .pv-pdf canvas { background: #fff; box-shadow: var(--shadow-2); border-radius: 2px; }
+
+/* ── выбор по инструменту: всегда / спрашивать / заблокирован ── */
+.policy { display: inline-flex; gap: 1px; padding: 2px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); flex: none; }
+.policy button { display: grid; place-items: center; width: 26px; height: 24px; border: 0; background: none; border-radius: 5px; cursor: pointer; color: var(--faint); }
+.policy button svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.policy button:hover { color: var(--text); background: var(--surface-2); }
+.policy button.on[data-v="allow"] { color: var(--ok); background: color-mix(in srgb, var(--ok) 13%, transparent); }
+.policy button.on[data-v="ask"] { color: var(--warn); background: color-mix(in srgb, var(--warn) 15%, transparent); }
+.policy button.on[data-v="deny"] { color: var(--err); background: color-mix(in srgb, var(--err) 13%, transparent); }
+/* Без своего выбора — подсветка бледнее: это значение по умолчанию, а не решение человека. */
+.policy.implicit button.on { background: var(--surface-2); }
+.tr-tags { align-items: center; }
+.bulk-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 14px 8px 58px; border-bottom: 1px solid var(--line); background: var(--surface-2); font-size: 12px; font-weight: 600; color: var(--muted); }
+.bulk-row + .tool-row { border-top: 0; }
+.pop-foot { display: flex; align-items: center; gap: 7px; margin: 4px 0 0; padding: 8px 9px 4px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+.pop-foot svg { width: 14px; height: 14px; flex: none; }
+
+/* ── навыки ── */
+.skill-card .src-head { min-width: 0; }
+.skill-card .src-sub { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.skill-card .src-actions { display: flex; align-items: center; gap: 6px; }
+.skill-card.disabled .src-sub { opacity: .5; }
+.skill-body { min-height: 260px; resize: vertical; font: 12.5px/1.55 var(--mono); }
+.skill-editor textarea { width: 100%; }
+.help-line { display: flex; justify-content: space-between; gap: 10px; }
+.help-line .help.over { color: var(--err); }
+.skill-md { max-height: 420px; overflow: auto; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface-2); font-size: 13.5px; }
+@media (max-width: 720px) {
+  .bulk-row { padding-left: 14px; }
+  .tool-row .tr-tags { align-self: flex-start; }
+}

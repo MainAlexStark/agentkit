@@ -945,13 +945,16 @@ function popMenu(btn, items) {
 }
 
 // ── права агента ────────────────────────────────────────────────────
+// Три режима, как у Claude. Песочница и папка разговора — зона агента: там он работает без
+// вопросов в любом режиме, режим решает только про то, что выходит наружу (MCP, компьютер, письма).
+// Остальные значения — из старых разговоров и хост-приложений: показываем, но не предлагаем.
 const MODES = {
-  default: { icon: "ask", name: "Спрашивать", help: "Любое изменение — через карточку подтверждения" },
+  default: { icon: "hand", name: "Вручную", full: "Подтверждать вручную", help: "Действия вне песочницы — через карточку подтверждения" },
+  auto: { icon: "bolt", name: "Автоматически", full: "Подтверждать автоматически", help: "Делает сам; спросит только там, где инструмент требует подтверждения всегда", tone: "warn" },
+  bypass: { icon: "unlock", name: "Без вопросов", full: "Пропускать все подтверждения", help: "Никаких карточек — только для доверенных задач", tone: "err" },
   accept_edits: { icon: "pen", name: "Правки без вопросов", help: "Файлы рабочей папки правит сам, остальное — с подтверждением" },
   plan: { icon: "map", name: "Только план", help: "Изучает и предлагает план, ничего не меняет" },
   readonly: { icon: "eye", name: "Только чтение", help: "Читает и ищет, ничего не меняет" },
-  auto: { icon: "bolt", name: "Авто", help: "Меняет без вопросов, кроме необратимого", tone: "warn" },
-  bypass: { icon: "unlock", name: "Без вопросов", help: "Всё без подтверждения — только для доверенных задач", tone: "err" },
 };
 const modeInfo = m => MODES[m] || { icon: "shield", name: m, help: "" };
 function setMode(m, { save = false } = {}) {
@@ -967,15 +970,18 @@ function openModePicker() {
   const pop = $("#mode-pop"), btn = $("#mode-btn");
   if (!pop.hidden) { closeMenus(); return; }
   closeMenus();
-  const items = S.config.modes.map(m => {
+  // Режим из старого разговора (plan, accept_edits…) — тоже в списке, иначе не видно, что выбрано.
+  const modes = S.config.modes.includes(S.mode) ? S.config.modes : [...S.config.modes, S.mode];
+  const items = modes.map(m => {
     const info = modeInfo(m);
     return h("button", { class: "mode-opt" + (m === S.mode ? " on" : ""), type: "button", role: "option", "aria-selected": String(m === S.mode),
       "data-tone": info.tone || "", onclick: () => { setMode(m, { save: true }); closeMenus(); btn.focus(); } },
       h("span", { class: "mode-ic" }, icon(info.icon)),
-      h("span", { class: "mode-text" }, h("b", {}, info.name), h("span", {}, info.help)),
+      h("span", { class: "mode-text" }, h("b", {}, info.full || info.name), h("span", {}, info.help)),
       m === S.mode ? h("span", { class: "mo-check" }, icon("check")) : null);
   });
-  pop.replaceChildren(h("div", { class: "pop-label" }, "Права агента в этом разговоре"), ...items);
+  pop.replaceChildren(h("div", { class: "pop-label" }, "Права агента в этом разговоре"), ...items,
+    S.config.titles?.run_python ? h("div", { class: "pop-foot" }, icon("cube"), "В песочнице агент работает без вопросов в любом режиме") : null);
   const r = btn.getBoundingClientRect();
   pop.style.left = `${Math.max(8, Math.min(r.left, innerWidth - 336))}px`;
   pop.style.bottom = `${innerHeight - r.top + 6}px`;
@@ -1353,18 +1359,50 @@ function mcpEditor(srv, onClose) {
   setTimeout(() => (editing ? url : url).focus(), 0);
   return el;
 }
+// Свой выбор по инструменту, как у Claude: всегда разрешать / спрашивать / заблокирован.
+const POLICIES = [
+  ["allow", "ok-circle", "Всегда разрешать"],
+  ["ask", "hand", "Спрашивать подтверждение"],
+  ["deny", "block", "Заблокирован — агент его не видит"],
+];
+// Без своего выбора: читающее и песочница — без вопросов, остальное — как скажет режим прав.
+const defaultPolicy = t => t.read_only || t.group === "sandbox" ? "allow" : "ask";
+function policyPicker(value, onPick, { implicit = false, label = "" } = {}) {
+  const el = h("div", { class: "policy" + (implicit ? " implicit" : ""), role: "radiogroup", "aria-label": label || "Разрешение" });
+  const paint = v => el.querySelectorAll("button").forEach(b => {
+    const on = b.dataset.v === v; b.classList.toggle("on", on); b.setAttribute("aria-checked", String(on)); });
+  for (const [v, ic, title] of POLICIES) {
+    el.append(h("button", { type: "button", role: "radio", "data-v": v, title, "aria-label": title, onclick: async e => {
+      e.stopPropagation();
+      const prev = el.querySelector("button.on")?.dataset.v, wasImplicit = el.classList.contains("implicit");
+      paint(v); el.classList.remove("implicit");
+      try { await onPick(v); } catch (err) { paint(prev); el.classList.toggle("implicit", wasImplicit); toast(err.message); }
+    } }, icon(ic)));
+  }
+  paint(value);
+  return el;
+}
 async function toolsTab(body) {
   const d = await api("/api/tools");
   const admin = S.config.is_admin;
   let q = "";
-  const access = t => t.read_only ? ["eye", "чтение", "ok"] : t.destructive ? ["shield", "необратимо", "err"] : ["pen", "изменяет", "warn"];
-  const toolRow = t => {
-    const [ic, label, cls] = access(t);
-    return h("div", { class: "tool-row" },
-      h("div", { class: "tr-main" }, h("div", { class: "tr-title" }, h("span", {}, toolTitle(t.name, t.title)), h("code", {}, t.name)),
-        t.description ? h("div", { class: "tr-desc" }, t.description.replace(/^\[[^\]]+\]\s*/, "")) : null),
-      h("div", { class: "tr-tags" }, t.deferred ? h("span", { class: "tag", title: "Описание подгружается, когда агенту понадобится инструмент — экономит контекст" }, "по запросу") : null,
-        h("span", { class: "tag " + cls, title: { ok: "Только читает данные", warn: "Изменяет данные — спросит подтверждение", err: "Необратимое действие — всегда с подтверждением" }[cls] }, icon(ic), label)));
+  const policyOf = t => d.policy[t.name] || defaultPolicy(t);
+  const setPolicy = async (names, v) => {
+    const r = await api("/api/tools/policy", { method: "PUT", body: { tools: Object.fromEntries(names.map(n => [n, v])) } });
+    d.policy = r.policy;
+  };
+  const toolRow = t => h("div", { class: "tool-row" },
+    h("div", { class: "tr-main" }, h("div", { class: "tr-title" }, h("span", {}, toolTitle(t.name, t.title)), h("code", {}, t.name)),
+      t.description ? h("div", { class: "tr-desc" }, t.description.replace(/^\[[^\]]+\]\s*/, "")) : null),
+    h("div", { class: "tr-tags" }, t.deferred ? h("span", { class: "tag", title: "Описание подгружается, когда агенту понадобится инструмент — экономит контекст" }, "по запросу") : null,
+      policyPicker(policyOf(t), async v => { await setPolicy([t.name], v); draw(); },
+        { implicit: !d.policy[t.name], label: toolTitle(t.name, t.title) })));
+  // Строка «для всех инструментов» сверху раскрытой карточки: выбор сразу на весь сервер.
+  const bulkRow = tools => {
+    const vals = new Set(tools.map(policyOf));
+    return h("div", { class: "bulk-row" }, h("span", {}, "Все инструменты"),
+      policyPicker(vals.size === 1 ? [...vals][0] : null, async v => { await setPolicy(tools.map(t => t.name), v); draw(); },
+        { implicit: tools.every(t => !d.policy[t.name]), label: "Все инструменты" }));
   };
   const card = ({ key, ic, title, sub, status, actions, tools, extra }) => {
     const matched = tools.filter(t => !q || `${t.name} ${t.title} ${t.description}`.toLowerCase().includes(q));
@@ -1380,13 +1418,15 @@ async function toolsTab(body) {
       status || null,
       (tools.length || extra) ? h("span", { class: "src-chev" }, icon("chev")) : null);
     el.append(h("div", { class: "src-top" }, headBtn, actions ? h("div", { class: "src-actions" }, actions) : null),
-      h("div", { class: "src-body" }, extra || null, ...matched.map(toolRow)));
+      h("div", { class: "src-body" }, extra || null, tools.length > 1 && !q ? bulkRow(tools) : null, ...matched.map(toolRow)));
     return el;
   };
   const count = n => `${n} ${plural(n, "инструмент", "инструмента", "инструментов")}`;
   const pill = (cls, text) => h("span", { class: "pill " + cls }, h("i"), text);
   const cards = h("div", { class: "src-list" });
+  const blockedNum = h("b");
   const draw = () => {
+    blockedNum.textContent = d.tools.filter(t => d.policy[t.name] === "deny").length;
     const domain = d.tools.filter(t => t.source === "domain");
     const builtin = d.tools.filter(t => t.source === "builtin");
     const out = [];
@@ -1421,7 +1461,7 @@ async function toolsTab(body) {
       const c = card({ key: "mcp:" + s.name, ic: s.transport === "stdio" ? "tools" : "server", title: s.name, sub, tools,
         actions: acts.length ? acts : null,
         status: !s.enabled ? pill("", "выключен") : s.ok ? pill("ok", "на связи") : s.needs_auth ? pill("warn", "нужен вход") : pill("err", "ошибка"),
-        extra: admin && s.address ? h("div", { class: "src-addr" }, h("code", {}, s.address), h("span", { class: "tag" }, s.custom ? "добавлен в настройках" : "mcp.json")) : null });
+        extra: admin && s.address ? h("div", { class: "src-addr" }, h("code", {}, s.address)) : null });
       c?.classList.toggle("disabled", !s.enabled);
       out.push(c);
     }
@@ -1433,11 +1473,6 @@ async function toolsTab(body) {
     if (builtin.length) {
       const groups = [...new Set(builtin.map(t => t.group || "core"))];
       out.push(card({ key: "builtin", ic: "gear", title: "Встроенные", sub: `${count(builtin.length)} · ${groups.map(g => TOOL_GROUPS[g] || g).join(", ")}`, tools: builtin }));
-    }
-    if (d.skills.length) {
-      const matched = d.skills.filter(k => !q || `${k.name} ${k.description}`.toLowerCase().includes(q));
-      if (!q || matched.length) out.push(card({ key: "skills", ic: "book", title: "Навыки", sub: `${d.skills.length} ${plural(d.skills.length, "навык", "навыка", "навыков")} — длинные инструкции, которые агент открывает по необходимости`, tools: [],
-        extra: h("div", {}, matched.map(k => h("div", { class: "tool-row" }, h("div", { class: "tr-main" }, h("div", { class: "tr-title" }, h("span", {}, k.name)), h("div", { class: "tr-desc" }, k.description))))) }));
     }
     cards.replaceChildren(...out.filter(Boolean));
     if (!cards.childElementCount) cards.append(h("p", { class: "muted center" }, "Ничего не нашлось"));
@@ -1453,7 +1488,7 @@ async function toolsTab(body) {
     h("div", { class: "tiles" },
       h("div", { class: "tile" }, h("b", {}, d.tools.length), h("span", {}, plural(d.tools.length, "инструмент", "инструмента", "инструментов"))),
       h("div", { class: "tile" }, h("b", {}, d.mcp.length ? `${okMcp}/${d.mcp.length}` : "0"), h("span", {}, "MCP-серверов на связи")),
-      h("div", { class: "tile" }, h("b", {}, d.tools.filter(t => !t.read_only).length), h("span", {}, "изменяют данные — с подтверждением"))),
+      h("div", { class: "tile" }, blockedNum, h("span", {}, "заблокировано"))),
     h("div", { class: "toolbar" }, search, admin ? h("button", { class: "btn sm", title: "Перечитать mcp.json и папку навыков без перезапуска", onclick: async e => {
       e.currentTarget.disabled = true; await api("/api/reload", { method: "POST" }); openSettings("tools"); toast("Инструменты перечитаны"); } }, icon("refresh"), "Перечитать") : null),
     slot, cards);
@@ -1594,9 +1629,141 @@ async function schedulesTab(body) {
   else body.append(h("div", { class: "sch-list" }, items.map(card)));
 }
 
+// ── навыки ──────────────────────────────────────────────────────────
+// Свои навыки — у каждого пользователя свои, лежат в базе; навыки из папки приложения общие,
+// их можно открыть и выключить для себя, а меняются они в репозитории (app/skills).
+const SKILL_STUB = "## Когда использовать\n\n…\n\n## Шаги\n\n1. …\n2. …\n\n## Формат результата\n\n…";
+function parseSkillFile(text) {
+  const m = text.match(/^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/);
+  if (!m) return { body: text.trim() };
+  const meta = {};
+  // Шапка SKILL.md — простой YAML «ключ: значение»; многострочные описания с | или > тоже встречаются.
+  let key = null;
+  for (const line of m[1].split("\n")) {
+    const kv = line.match(/^([a-zA-Z_-]+):\s*(.*)$/);
+    if (kv) { key = kv[1]; meta[key] = kv[2].replace(/^["']|["']$/g, "").replace(/^[|>]-?$/, ""); }
+    else if (key && line.trim()) meta[key] = (meta[key] ? meta[key] + " " : "") + line.trim();
+  }
+  return { name: meta.name, description: meta.description, body: m[2].trim() };
+}
+const skillSlug = v => v.toLowerCase().trim().replace(/[\s_]+/g, "-").replace(/[^a-z0-9-]/g, "").replace(/^-+/, "").slice(0, 64);
+function skillEditor(sk, onClose) {
+  const editing = !!sk?.name && sk.source === "user";
+  const name = h("input", { value: sk?.name || "", placeholder: "weekly-report", spellcheck: "false", autocomplete: "off" });
+  const desc = h("textarea", { rows: 2, placeholder: "Когда агенту открыть навык: «Еженедельный отчёт по продажам — когда просят итоги недели»" }, sk?.description || "");
+  const body = h("textarea", { rows: 14, class: "mono skill-body", spellcheck: "false", placeholder: SKILL_STUB }, sk?.body || "");
+  const count = h("span", { class: "help" });
+  const syncCount = () => { count.textContent = `${desc.value.length} / 1024`; count.classList.toggle("over", desc.value.length > 1024); };
+  desc.addEventListener("input", syncCount); syncCount();
+  name.addEventListener("blur", () => { name.value = skillSlug(name.value); });
+  const save = h("button", { class: "btn primary sm", type: "button", onclick: async () => {
+    save.disabled = true;
+    try {
+      await api("/api/skills", { method: "POST", body: { name: skillSlug(name.value), description: desc.value, body: body.value,
+        original_name: editing ? sk.name : null } });
+      toast(editing ? "Навык сохранён" : `Навык «${skillSlug(name.value)}» создан — агент увидит его в следующем сообщении`);
+      onClose(true);
+    } catch (e) { toast(e.message); save.disabled = false; }
+  } }, editing ? "Сохранить" : "Создать");
+  const el = h("div", { class: "sch-editor skill-editor" },
+    h("div", { class: "ed-head" }, h("b", {}, editing ? `Навык ${sk.name}` : "Новый навык"),
+      h("button", { class: "icon-btn", type: "button", "aria-label": "Закрыть", onclick: () => onClose(false) }, icon("x"))),
+    fieldRow("Имя", name, "Латиницей через дефис — так агент вызывает навык"),
+    h("div", { class: "field-row" }, h("label", {}, "Описание"), desc,
+      h("div", { class: "help-line" }, h("span", { class: "help" }, "Всегда лежит в промпте: по нему агент решает, открыть ли навык"), count)),
+    fieldRow("Инструкция", body, "Markdown. Агент читает её целиком, когда берётся за задачу"),
+    h("div", { class: "compose-bar" }, h("span", { class: "grow" }),
+      h("button", { class: "btn ghost sm", type: "button", onclick: () => onClose(false) }, "Отмена"), save));
+  setTimeout(() => (sk?.name ? body : name).focus(), 0);
+  return el;
+}
+function skillView(sk, onClose) {
+  return h("div", { class: "sch-editor skill-editor" },
+    h("div", { class: "ed-head" }, h("b", {}, sk.name), h("span", { class: "tag" }, "из папки приложения"),
+      h("span", { class: "grow" }),
+      h("button", { class: "icon-btn", type: "button", "aria-label": "Закрыть", onclick: () => onClose(false) }, icon("x"))),
+    h("p", { class: "muted", style: "margin:0;font-size:13px" }, sk.description),
+    (() => { const b = h("div", { class: "md skill-md" }); renderMd(b, sk.body); return b; })(),
+    sk.files?.length ? h("div", { class: "help" }, "Файлы рядом: ", sk.files.join(", ")) : null,
+    h("div", { class: "help" }, "Меняется в репозитории — папка ", h("code", {}, "app/skills/" + sk.name), ". Здесь можно только выключить для себя."));
+}
+async function skillsTab(body) {
+  const d = await api("/api/skills");
+  let q = "";
+  const slot = h("div");
+  const list = h("div", { class: "src-list" });
+  const reload = () => openSettings("skills");
+  const open = (el) => { slot.replaceChildren(el); slot.scrollIntoView({ block: "nearest", behavior: "smooth" }); };
+  const edit = sk => open(skillEditor(sk, saved => { slot.replaceChildren(); if (saved) reload(); }));
+  const view = sk => open(skillView(sk, () => slot.replaceChildren()));
+  const file = h("input", { type: "file", accept: ".md,text/markdown,text/plain", hidden: true });
+  file.addEventListener("change", async () => {
+    const f = file.files[0]; file.value = "";
+    if (!f) return;
+    const p = parseSkillFile(await f.text());
+    edit({ name: skillSlug(p.name || f.name.replace(/\.md$/i, "").replace(/^skill$/i, "")), description: p.description || "", body: p.body || "" });
+  });
+  const skillCard = sk => {
+    const own = sk.source === "user";
+    const more = h("button", { class: "icon-btn", type: "button", title: "Ещё", "aria-label": `Действия: ${sk.name}`, "aria-haspopup": "menu" }, icon("dots"));
+    more.addEventListener("click", e => { e.stopPropagation(); popMenu(more, own ? [
+      ["pen", "Изменить", () => edit(sk)],
+      ["copy", "Дублировать", () => edit({ ...sk, name: `${sk.name}-copy`, source: "new" })],
+      ["download", "Скачать SKILL.md", () => {
+        const text = `---\nname: ${sk.name}\ndescription: ${JSON.stringify(sk.description)}\n---\n\n${sk.body}\n`;
+        const a = h("a", { href: URL.createObjectURL(new Blob([text], { type: "text/markdown" })), download: `${sk.name}.SKILL.md` });
+        a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      }],
+      ["trash", "Удалить", async () => {
+        if (!confirm(`Удалить навык ${sk.name}?`)) return;
+        try { await api(`/api/skills/${encodeURIComponent(sk.name)}`, { method: "DELETE" }); toast("Навык удалён"); reload(); } catch (err) { toast(err.message); }
+      }, true],
+    ] : [
+      ["eye", "Открыть", () => view(sk)],
+      ["copy", "Сделать свою копию", () => edit({ ...sk, name: `${sk.name}-my`, source: "new" })],
+    ]); });
+    const el = h("div", { class: "src-card skill-card" + (sk.enabled ? "" : " disabled") },
+      h("div", { class: "src-top" },
+        h("button", { class: "src-head", type: "button", onclick: () => own ? edit(sk) : view(sk) },
+          h("span", { class: "src-icon" }, icon("book")),
+          h("span", { class: "src-title" }, h("b", {}, sk.name, own ? null : h("span", { class: "tag", style: "margin-left:8px" }, "приложение")),
+            h("span", { class: "src-sub" }, sk.description))),
+        h("div", { class: "src-actions" },
+          toggle(sk.enabled, async on => {
+            await api(`/api/skills/${encodeURIComponent(sk.name)}`, { method: "PATCH", body: { enabled: on } });
+            sk.enabled = on; el.classList.toggle("disabled", !on);
+          }, `Навык ${sk.name} включён`), more)));
+    return el;
+  };
+  const draw = () => {
+    const items = d.skills.filter(k => !q || `${k.name} ${k.description}`.toLowerCase().includes(q));
+    const mine = items.filter(k => k.source === "user"), app = items.filter(k => k.source !== "user");
+    const out = [];
+    out.push(h("div", { class: "src-label" }, h("span", {}, "Мои навыки")));
+    if (mine.length) out.push(...mine.map(skillCard));
+    else if (!q) out.push(h("button", { class: "add-card", type: "button", onclick: () => edit(null) },
+      h("span", { class: "src-icon" }, icon("plus")), h("span", { class: "src-title" }, h("b", {}, "Создать навык"),
+        h("span", { class: "src-sub" }, "Инструкция для типовой задачи: отчёт, разбор почты, ответ клиенту. Агент откроет её, когда задача подойдёт под описание"))));
+    else out.push(h("p", { class: "muted" }, "Среди своих ничего не нашлось"));
+    if (app.length) out.push(h("div", { class: "src-label" }, h("span", {}, "Из приложения")), ...app.map(skillCard));
+    list.replaceChildren(...out);
+  };
+  const [search] = searchBox("Найти навык", v => { q = v; draw(); });
+  const on = d.skills.filter(k => k.enabled).length;
+  body.append(
+    h("p", { class: "lead-text" }, "Навык — инструкция для типовой задачи. В промпте лежит только имя и описание, текст агент открывает сам, когда он нужен — так десятки навыков почти не тратят контекст."),
+    h("div", { class: "toolbar" }, search,
+      h("button", { class: "btn sm", type: "button", title: "Взять SKILL.md с компьютера — имя и описание подставятся из шапки", onclick: () => file.click() }, icon("upload"), "Загрузить"),
+      h("button", { class: "btn primary sm", type: "button", onclick: () => edit(null) }, icon("plus"), "Создать"), file),
+    d.skills.length ? h("div", { class: "muted", style: "font-size:12.5px;margin:-4px 2px 4px" }, `Включено ${on} из ${d.skills.length}`) : null,
+    slot, list);
+  draw();
+}
+
 const panels = {
   memory: memoryTab,
   tools: toolsTab,
+  skills: skillsTab,
   schedules: schedulesTab,
   async usage(body) {
     const u = await api("/api/usage?days=30");
@@ -2405,6 +2572,7 @@ const tabs = {
   computer: computerTab,
   memory: (b) => panels.memory(b),
   tools: (b) => panels.tools(b),
+  skills: (b) => panels.skills(b),
   schedules: (b) => panels.schedules(b),
   usage: (b) => panels.usage(b),
   async plan(body) {
@@ -2444,7 +2612,7 @@ const tabs = {
         } }, "Удалить"))));
   },
 };
-const TAB_TITLES = { general: "Общие", models: "Модели", computer: "Компьютер", memory: "Память", tools: "Инструменты", schedules: "Расписание", usage: "Расход", plan: "Подписка", account: "Аккаунт" };
+const TAB_TITLES = { general: "Общие", models: "Модели", computer: "Компьютер", memory: "Память", tools: "Инструменты", skills: "Навыки", schedules: "Расписание", usage: "Расход", plan: "Подписка", account: "Аккаунт" };
 
 function themeCards() {
   const cur = store.get("agent_theme") || "auto";

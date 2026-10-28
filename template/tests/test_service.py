@@ -379,3 +379,71 @@ def test_file_preview_for_word(client, tmp_path):
     assert r["kind"] == "doc" and r["blocks"][0] == {"type": "h", "level": 1, "text": "Отчёт"}
     assert client.get(f"/api/sessions/{sid}/files/preview", params={"path": "x.bin"}, headers=H).status_code == 415
     assert client.get(f"/api/sessions/{sid}/files/preview", params={"path": "../a.db"}, headers=H).status_code == 404
+
+
+def test_tool_policy_always_allow_and_block(client):
+    """Свой выбор по инструменту: «Всегда разрешать» снимает карточку, «Заблокирован» прячет от модели."""
+    bob = {"Authorization": "Bearer t-bob"}
+    assert client.put("/api/tools/policy", json={"tools": {"nope": "allow"}}, headers=H).status_code == 404
+    r = client.put("/api/tools/policy", json={"tools": {"notes_add": "allow"}}, headers=H)
+    assert r.json()["policy"] == {"notes_add": "allow"}
+    assert client.get("/api/tools", headers=H).json()["policy"] == {"notes_add": "allow"}
+    assert client.get("/api/tools", headers=bob).json()["policy"] == {}  # у каждого свой выбор
+
+    client.fake.push({"tool_calls": [("notes_add", {"text": "Позвонить"})]}, "Записал.")
+    sid = client.post("/api/sessions", json={}, headers=H).json()["id"]
+    client.post(f"/api/sessions/{sid}/messages", json={"text": "запиши"}, headers=H)
+    wait_idle(client, sid)
+    s = client.get(f"/api/sessions/{sid}", headers=H).json()
+    assert s["approvals"] == [] and s["messages"][-1]["content"] == "Записал."
+
+    client.put("/api/tools/policy", json={"tools": {"notes_add": "deny"}}, headers=H)
+    client.post(f"/api/sessions/{sid}/messages", json={"text": "ещё"}, headers=H)
+    wait_idle(client, sid)
+    names = [t["function"]["name"] for t in (client.fake.requests[-1].tools or [])]
+    assert names and "notes_add" not in names
+    client.put("/api/tools/policy", json={"tools": {"notes_add": None}}, headers=H)
+    assert client.get("/api/tools", headers=H).json()["policy"] == {}
+
+
+def test_config_offers_three_modes(client):
+    assert client.get("/api/config", headers=H).json()["modes"] == ["default", "auto", "bypass"]
+    assert client.get("/api/config", headers={"Authorization": "Bearer t-bob"}).json()["modes"] == ["default", "auto"]
+
+
+def test_skills_crud(client):
+    bob = {"Authorization": "Bearer t-bob"}
+    app_names = {k["name"] for k in client.get("/api/skills", headers=H).json()["skills"]}
+    assert "weekly-review" in app_names
+    bad = client.post("/api/skills", json={"name": "Плохое имя", "description": "x", "body": "y"}, headers=H)
+    assert bad.status_code == 400
+    assert client.post("/api/skills", json={"name": "weekly-review", "description": "x", "body": "y"},
+                       headers=H).status_code == 409
+    ok = client.post("/api/skills", json={"name": "mail-digest", "description": "Сводка почты", "body": "1. Прочитай"},
+                     headers=H)
+    assert ok.status_code == 200
+    mine = [k for k in client.get("/api/skills", headers=H).json()["skills"] if k["source"] == "user"]
+    assert [(k["name"], k["enabled"]) for k in mine] == [("mail-digest", True)]
+    assert all(k["source"] == "app" for k in client.get("/api/skills", headers=bob).json()["skills"])
+
+    # навык попадает в промпт и открывается инструментом skill
+    client.fake.push({"tool_calls": [("skill", {"name": "mail-digest"})]}, "Готово")
+    sid = client.post("/api/sessions", json={}, headers=H).json()["id"]
+    client.post(f"/api/sessions/{sid}/messages", json={"text": "почта"}, headers=H)
+    wait_idle(client, sid)
+    req = client.fake.requests[-1]
+    assert "mail-digest: Сводка почты" in req.messages[0].text
+    assert any("1. Прочитай" in (m.text or "") for m in req.messages if m.role == "tool")
+
+    # переименование, выключение, удаление
+    assert client.post("/api/skills", json={"name": "mail-sum", "description": "Сводка", "body": "2",
+                                            "original_name": "mail-digest"}, headers=H).status_code == 200
+    assert client.patch("/api/skills/mail-sum", json={"enabled": False}, headers=H).status_code == 200
+    assert client.patch("/api/skills/weekly-review", json={"enabled": False}, headers=H).status_code == 200
+    client.post(f"/api/sessions/{sid}/messages", json={"text": "ещё"}, headers=H)
+    wait_idle(client, sid)
+    system = client.fake.requests[-1].messages[0].text
+    assert "mail-sum" not in system and "weekly-review" not in system
+    assert client.delete("/api/skills/weekly-review", headers=H).status_code == 409
+    assert client.delete("/api/skills/mail-sum", headers=H).status_code == 200
+    assert [k["name"] for k in client.get("/api/skills", headers=H).json()["skills"]] == ["weekly-review"]

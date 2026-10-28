@@ -155,10 +155,16 @@ class Agent:
 
         if "tool_search" not in self.tools:
             self.tools.add(make_tool_search(lambda ctx: ctx.agent.tools))
-        if self.skills and self.skills.skills and "skill" not in self.tools:
+        # Инструмент skill — и при пустой папке: навыки пользователь может создать сам в настройках.
+        if self.skills is not None and "skill" not in self.tools:
             self.tools.add(self.skills.tool())
 
     # ── публичное API ────────────────────────────────────────────────
+
+    async def skills_for(self, user: User) -> SkillLibrary:
+        """Навыки, которые видит этот пользователь: из папки приложения + свои, без выключенных."""
+        base = self.skills or SkillLibrary()
+        return base.for_user(await self.store.kv_get("skills", user.id) or {})
 
     def workspace_for(self, session_id: str) -> Path | None:
         ws = self._workspace
@@ -399,7 +405,7 @@ class Agent:
         parts = PromptParts(
             agent_prompt=self.spec.prompt,
             rules=rules,
-            skills_index=self.skills.index() if self.skills else "",
+            skills_index=(await self.skills_for(user)).index() if self.skills else "",
             mcp_instructions=self.mcp_instructions() if self.mcp_instructions else "",
             deferred_tools=self.tools.deferred_names(loaded),
             memory=[f"[{m.id}] {m.text}" for m in mem],
@@ -432,12 +438,15 @@ class Agent:
             # вызовы предыдущего шага уже закрыты результатами, и сообщение
             # пользователя не разорвёт пару «вызов — результат».
             await self._take_inbox(session_id, run_id, emit)
+            # Выбор пользователя по инструментам (Всегда / Спрашивать / Заблокирован) — каждый шаг:
+            # переключил в настройках посреди долгой задачи — действует со следующего вызова.
+            perms = perms.with_mode(mode, await self.store.kv_get("tool_policy", user.id) or {})
             state = await self.store.get_state(session_id)
             loaded = set(state.get(LOADED_KEY, []))
             history = effective_history(await self.store.list_messages(session_id))
             turn = await self._turn_context(user, session_id)
             system = await self._system_prompt(user, loaded, mode, turn.text)
-            visible = [t for t in self.tools.visible(loaded) if t.name not in turn.hide_tools]
+            visible = [t for t in self.tools.visible(loaded) if t.name not in turn.hide_tools and not perms.blocked(t.name)]
             schemas = [t.schema() for t in visible]
             msgs = [Message.system(system), *self._prepare(history, session_id, model)]
 

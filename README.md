@@ -16,10 +16,10 @@ agentkit new ei-assistant        # готовый проект: сервис, в
 | `llm/` | OpenAI-совместимый клиент (OpenRouter, Yandex AI Studio, OpenAI, Ollama), «провайдер:модель», роли main/small, повторы, запасные модели, prompt caching для Claude, стоимость |
 | `tools/` | `@tool` из сигнатуры функции; базовые: задачи, вопрос человеку, файлы, shell, web, память; реестр с отложенной загрузкой (`tool_search`) |
 | `mcp.py` | Клиент MCP без SDK: Streamable HTTP и stdio, Bearer или OAuth; инструменты сервера → `mcp__<сервер>__<имя>` с read-only/destructive из аннотаций |
-| `permissions.py` | Режимы (default / accept_edits / plan / readonly / auto / bypass) и правила `allow/ask/deny` вида `shell(git status*)` |
+| `permissions.py` | Режимы (в интерфейсе: вручную / автоматически / без вопросов), песочница как зона агента, правила `allow/ask/deny` вида `shell(git status*)` и выбор пользователя по инструменту |
 | `hooks.py` | session_start, user_prompt_submit, pre/post_tool_use, stop, pre_compact |
 | `context.py` | Системный промпт слоями под кэш, сжатие истории, обрезка вывода |
-| `skills.py` | SKILL.md-пакеты: в промпте оглавление, текст — по запросу |
+| `skills.py` | SKILL.md-пакеты: в промпте оглавление, текст — по запросу; свои навыки пользователя — в базе |
 | `subagents.py` | `task`: explore / plan / general в своих сессиях, параллельно |
 | `store/` | SQLite / PostgreSQL: сессии, сообщения, прогоны, события, подтверждения, память, расписание |
 | `runs.py` | Прогоны в фоне, SSE с курсором, один прогон на сессию, сообщения на ходу |
