@@ -3,7 +3,7 @@
   agentkit new <имя> [--dest DIR] [--git]     новый проект-агент из шаблона
   agentkit vendor [--dest DIR]                 обновить vendor/agentkit в проекте
   agentkit eval <путь> --app mod:fn [--offline|--live] [--only ID] [--tag T] [--model M …] [--repeat N]
-                [--parallel N] [--json FILE] [--md FILE] [--baseline FILE] [--save-runs DIR] [--min-pass-rate X]
+                [--parallel N] [--budget $] [--json FILE] [--md FILE] [--baseline FILE] [--save-runs DIR] [--min-pass-rate X]
   agentkit replay <база|jsonl|папка> [ID] [--list] [--full] [--to-eval FILE --id ИМЯ --judge "…" --workspace DIR]
 """
 
@@ -126,6 +126,7 @@ def eval_cmd(a: argparse.Namespace) -> int:
 
     files = suite_files(a.path)
     models = a.model or [None]
+    stats: dict = {"spent": 0.0, "skipped": 0}  # общий на все наборы: бюджет — на весь прогон
 
     async def go() -> list[dict]:
         reports = []
@@ -141,7 +142,8 @@ def eval_cmd(a: argparse.Namespace) -> int:
                           f"[{r.seconds:.0f} с, ${r.usage.get('cost', 0):.4f}]", file=sys.stderr, flush=True)
 
             results = await run_cases(cases, make_agent, models=models, repeat=a.repeat, parallel=a.parallel,
-                                      timeout=a.timeout, judge_model=a.judge_model, on_result=progress)
+                                      timeout=a.timeout, judge_model=a.judge_model, on_result=progress,
+                                      budget=a.budget, stats=stats)
             rep = Report(suite=name, results=results)
             print(rep.table())
             if a.save_runs:
@@ -152,6 +154,8 @@ def eval_cmd(a: argparse.Namespace) -> int:
         return reports
 
     reports = asyncio.run(go())
+    if stats["skipped"]:
+        print(f"бюджет ${a.budget} исчерпан (потрачено ${stats['spent']:.4f}): не запущено кейсов — {stats['skipped']}")
     rows = [r for rep in reports for r in rep["results"]]
     summary = summarize(rows)
     if len(rows):
@@ -239,6 +243,7 @@ def main(argv: list[str] | None = None) -> None:
     p_e.add_argument("--baseline", help="прошлый отчёт JSON: что сломалось и что починилось")
     p_e.add_argument("--save-runs", help="папка для журналов упавших прогонов (читаются agentkit replay)")
     p_e.add_argument("--save-all", action="store_true", help="сохранять журналы и прошедших прогонов")
+    p_e.add_argument("--budget", type=float, help="потолок расходов на прогон, $: дальше кейсы не запускаются")
     p_e.add_argument("--min-pass-rate", type=float, help="код выхода 1, только если доля успешных ниже (0..1)")
     p_r = sub.add_parser("replay", help="ход прогона по журналу; прогон → eval-кейс")
     p_r.add_argument("source", help="база (data/agent.db, sqlite:///…, postgresql://…), файл JSONL или папка трейсов")

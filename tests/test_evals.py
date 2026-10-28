@@ -250,3 +250,30 @@ def test_cli_eval_json_md_baseline(tmp_path, capsys, monkeypatch):
 def test_case_result_to_dict_has_no_events():
     r = CaseResult(id="x", passed=True, events=[{"type": "run_started"}])
     assert "events" not in r.to_dict()
+
+
+async def test_budget_stops_new_cases(tmp_path):
+    from agentkit.messages import Usage
+
+    def costly(req):
+        return {"text": "ok"}
+
+    case = {"id": "c", "input": "x", "expect": {}}
+    calls = []
+
+    def mk(store, fake):
+        f = FakeLLM([costly])
+        orig = f.stream
+
+        async def stream(req):
+            calls.append(1)
+            async for ch in orig(req):
+                if ch.kind == "done":
+                    ch.response.usage = Usage(cost=0.3)
+                yield ch
+        f.stream = stream
+        return factory(tmp_path)(store, f)
+
+    stats: dict = {}
+    rs = await run_cases([case], mk, repeat=5, parallel=1, budget=0.5, stats=stats)
+    assert len(rs) == 2 and stats["skipped"] == 3 and abs(stats["spent"] - 0.6) < 1e-9

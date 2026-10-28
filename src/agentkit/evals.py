@@ -415,18 +415,31 @@ def select_cases(cases: list[dict[str, Any]], *, only: str | None = None, tags: 
 
 async def run_cases(cases: list[dict[str, Any]], make_agent: MakeAgent, *, models: list[str | None] | None = None,
                     repeat: int = 1, parallel: int = 1, timeout: float | None = None, judge_model: str = "small",
-                    on_result: Callable[[CaseResult], None] | None = None) -> list[CaseResult]:
-    """Все кейсы × модели × повторы; parallel — сколько одновременно (у живых моделей кейс идёт минутами)."""
+                    on_result: Callable[[CaseResult], None] | None = None, budget: float | None = None,
+                    stats: dict[str, Any] | None = None) -> list[CaseResult]:
+    """Все кейсы × модели × повторы; parallel — сколько одновременно (у живых моделей кейс идёт минутами).
+
+    budget — потолок расходов в $ на этот вызов: когда потрачено столько, новые кейсы не
+    начинаются (уже идущие доигрывают — перерасход не больше parallel кейсов). Сколько
+    пропущено и потрачено — в stats["skipped"], stats["spent"].
+    """
     jobs = [(c, m, a) for m in (models or [None]) for c in cases for a in range(repeat)]
     sem = asyncio.Semaphore(max(1, parallel))
     results: list[CaseResult | None] = [None] * len(jobs)
+    st = stats if stats is not None else {}
+    st.setdefault("spent", 0.0)
+    st.setdefault("skipped", 0)
 
     async def one(i: int, c: dict, m: str | None, a: int) -> None:
         async with sem:
             # Офлайн-кейсу модель не нужна: прогонять его на каждой модели незачем.
             if c.get("script") and m is not None and m != (models or [None])[0]:
                 return
+            if budget is not None and st["spent"] >= budget:
+                st["skipped"] += 1
+                return
             r = await run_case(c, make_agent, model=m, attempt=a, timeout=timeout, judge_model=judge_model)
+            st["spent"] += float(r.usage.get("cost") or 0)
             results[i] = r
             if on_result:
                 on_result(r)
