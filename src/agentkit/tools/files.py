@@ -11,6 +11,7 @@ edit_file — замена точной уникальной строки, а н
 
 from __future__ import annotations
 
+import difflib
 import re
 from pathlib import Path
 from typing import Annotated
@@ -34,6 +35,27 @@ def rel(ctx: ToolContext, p: Path) -> str:
     return str(p.relative_to(ctx.workspace.resolve()))  # type: ignore[union-attr]
 
 
+def missing(ctx: ToolContext, path: str) -> ToolResult:
+    """«Нет файла» с похожими именами: на голое «нет файла settings.yml» модели искали **/settings.yml
+    и сдавались, хотя рядом лежал settings.yaml (кейс files/typo-in-filename-recovers)."""
+    root = ctx.workspace.resolve()  # type: ignore[union-attr]
+    names: list[str] = []
+    for i, p in enumerate(root.rglob("*")):
+        if i > 5000:
+            break
+        parts = p.relative_to(root).parts
+        if p.is_file() and not any(part.startswith(".") for part in parts):
+            names.append("/".join(parts))
+    want = path.lstrip("/")
+    close = difflib.get_close_matches(want, names, n=3, cutoff=0.6)
+    # Тот же файл в другой папке: сравниваем и одни имена, без пути.
+    base = Path(want).name
+    for name in difflib.get_close_matches(base, [Path(n).name for n in names], n=3, cutoff=0.6):
+        close += [n for n in names if Path(n).name == name and n not in close]
+    hint = f". Похожие: {', '.join(close[:3])}" if close else ""
+    return ToolResult.error(f"нет файла {path}{hint}")
+
+
 async def checkpoint(ctx: ToolContext, p: Path) -> None:
     existed = p.exists()
     content = p.read_text(encoding="utf-8", errors="replace") if existed else ""
@@ -51,7 +73,7 @@ async def read_file(
     """Читает текстовый файл с номерами строк. Для больших файлов читай по частям через offset/limit."""
     p = resolve(ctx, path)
     if not p.is_file():
-        return ToolResult.error(f"нет файла {path}")
+        return missing(ctx, path)
     lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
     start = max(offset, 1) - 1
     chunk = lines[start: start + limit]
@@ -93,7 +115,7 @@ async def edit_file(
     """Заменяет точный фрагмент текста в файле. Сначала прочитай файл, затем копируй old_string дословно."""
     p = resolve(ctx, path)
     if not p.is_file():
-        return ToolResult.error(f"нет файла {path}")
+        return missing(ctx, path)
     text = p.read_text(encoding="utf-8", errors="replace")
     n = text.count(old_string)
     if n == 0:
@@ -126,26 +148,49 @@ async def grep(
     pattern: Annotated[str, "Регулярное выражение (Python re)"],
     glob: Annotated[str, "Ограничить файлами по шаблону"] = "**/*",
     ignore_case: Annotated[bool, "Без учёта регистра"] = False,
-    max_results: Annotated[int, "Максимум строк в ответе"] = 200,
+    max_results: Annotated[int, "Максимум совпадений в ответе"] = 200,
+    context: Annotated[int, "Строк контекста до и после совпадения (как grep -C)"] = 0,
 ) -> ToolResult:
-    """Ищет строки по регулярному выражению в файлах рабочей папки. Ответ: файл:строка: текст."""
+    """Ищет строки по регулярному выражению в файлах рабочей папки. Ответ: файл:строка: текст
+    (строки контекста — файл-строка- текст). Чтобы понять, в какой функции совпадение, — context=5
+    или read_file, а не догадка по имени файла."""
     root = resolve(ctx, ".")
     try:
         rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
     except re.error as e:
         return ToolResult.error(f"неверное выражение: {e}")
     out: list[str] = []
+    found = 0
+    ctx_n = max(0, min(context, 20))
     for p in sorted(root.glob(glob)):
         if not p.is_file() or p.stat().st_size > 5_000_000:
             continue
         try:
-            for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
-                if rx.search(line):
-                    out.append(f"{rel(ctx, p)}:{i}: {line[:300]}")
-                    if len(out) >= max_results:
-                        return ToolResult(content="\n".join(out) + "\n… (лимит; уточни запрос)")
+            lines = p.read_text(encoding="utf-8").splitlines()
         except UnicodeDecodeError:
             continue
+        name = rel(ctx, p)
+        last = 0  # последняя выведенная строка этого файла: контексты соседних совпадений не дублируются
+        for i, line in enumerate(lines, 1):
+            if not rx.search(line):
+                continue
+            if ctx_n:
+                lo = max(i - ctx_n, last + 1)
+                if out and lo > last + 1:
+                    out.append("--")
+                for j in range(lo, i):
+                    out.append(f"{name}-{j}- {lines[j - 1][:300]}")
+                last = i
+            out.append(f"{name}:{i}: {line[:300]}")
+            found += 1
+            if ctx_n:
+                for j in range(i + 1, min(i + ctx_n, len(lines)) + 1):
+                    if rx.search(lines[j - 1]):
+                        break  # следующее совпадение выведется само
+                    out.append(f"{name}-{j}- {lines[j - 1][:300]}")
+                    last = j
+            if found >= max_results:
+                return ToolResult(content="\n".join(out) + "\n… (лимит; уточни запрос)")
     return ToolResult(content="\n".join(out) or "Совпадений нет.")
 
 

@@ -70,6 +70,11 @@ def task_tool(specs: dict[str, AgentSpec]) -> Tool:
             state={"model": (parent.state or {}).get("model")} if parent and spec.model == "main" else {},
         )
         child = ctx.agent.child(spec)
+        if ctx.workspace is not None:
+            # Папка — родительская: папки по id сессии давали субагенту пустую свою, и explore
+            # отвечал «в проекте ничего нет» (evals/harness agent/explore-subagent). Правки general
+            # чекпоинтятся в его сессии — откат главного разговора их не вернёт.
+            child._workspace = ctx.workspace
         await ctx.emit(Event(EventType.SUBAGENT_STARTED, {"session_id": child_session.id, "type": spec.name,
                                                           "description": description, "tool_call_id": ctx.tool_call_id}))
         text = ""

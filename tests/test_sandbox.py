@@ -49,6 +49,15 @@ def test_local_timeout_kills_whole_tree(tmp_path):
     assert r["exit_code"] is None and "прервано" in r["stderr"] and time.monotonic() - t0 < 10
 
 
+@posix_only
+def test_local_home_is_absolute_with_relative_root(tmp_path, monkeypatch):
+    # Сервис из template/ с data_dir=data: HOME был относительным, и `cd ~/x` уводил во вложенную копию пути.
+    monkeypatch.chdir(tmp_path)
+    r = execute(Path("data/workspaces"), "s_1", "bash", "mkdir -p ~/lab && cd ~/lab && pwd", 30)
+    assert r["exit_code"] == 0
+    assert r["stdout"].strip() == str((tmp_path / "data/workspaces/s_1/lab").resolve())
+
+
 class FakeDocker:
     """Запоминает команды docker и отвечает, как настоящий: контейнера нет → run, есть → exec."""
 
