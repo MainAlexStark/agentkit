@@ -25,6 +25,8 @@ from pydantic import BaseModel
 from agentkit.attachments import UPLOADS, save_upload
 from agentkit.events import EventType
 from agentkit.mcp import MCPAuthRequired, MCPClient, MCPServerConfig
+from agentkit.memory_auto import PREFS_NS as MEMORY_PREFS_NS
+from agentkit.memory_auto import enabled_for as auto_memory_enabled
 from agentkit.oauth import OAuthError, OAuthOptions
 from agentkit.permissions import Mode
 from agentkit.runs import Busy
@@ -78,6 +80,10 @@ class ProfileIn(BaseModel):
     call_me: str = ""  # как обращаться
     work: str = ""  # чем занимается
     instructions: str = ""  # пожелания к ответам — уходят в системный промпт
+
+
+class MemoryPrefs(BaseModel):
+    auto: bool  # фоновая память: запоминать факты из разговоров без «запомни»
 
 
 class MemoryIn(BaseModel):
@@ -412,6 +418,16 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         rec = await svc.store.memory_add("global" if body.scope == "global" else f"user:{user.id}", body.text,
                                          created_by=user.id)
         return rec.__dict__
+
+    @api.get("/memory/prefs")
+    async def memory_prefs(user: User = Depends(auth)):
+        # available=false — фоновая память выключена для всех (AGENT_AUTO_MEMORY), переключатель не нужен.
+        return {"auto": await auto_memory_enabled(svc.store, user.id), "available": svc.settings.auto_memory}
+
+    @api.put("/memory/prefs")
+    async def memory_prefs_save(body: MemoryPrefs, user: User = Depends(auth)):
+        await svc.store.kv_set(MEMORY_PREFS_NS, user.id, {"auto": body.auto})
+        return {"auto": body.auto, "available": svc.settings.auto_memory}
 
     async def own_memory(memory_id: str, user: User) -> None:
         """Своё правит каждый, общее («для всех») — только админ."""

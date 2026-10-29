@@ -28,6 +28,7 @@ class EventType(StrEnum):
     SUBAGENT_STARTED = "subagent_started"
     SUBAGENT_FINISHED = "subagent_finished"
     COMPACTED = "compacted"  # история сжата
+    MEMORY_UPDATED = "memory_updated"  # фоновая память записала или исправила факты (после run_finished)
     USAGE = "usage"  # расход токенов за шаг
     NOTICE = "notice"  # служебное сообщение для человека (ретрай, fallback модели)
     ERROR = "error"

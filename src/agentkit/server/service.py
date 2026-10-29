@@ -471,6 +471,7 @@ def assemble_agent(
         skills=SkillLibrary.from_dirs(s.skills_dir),
         mcp_instructions=mcp_instructions,
         config=AgentConfig(context_window=s.context_window, tz=s.tz, max_output_chars=s.max_output_chars,
+                           auto_memory=s.auto_memory,
                            vision_models=[x.strip() for x in s.vision_models.split(",") if x.strip()] or None),
         deps=domain.deps,
         workspace=workspace if s.enable_files or s.enable_shell else None,

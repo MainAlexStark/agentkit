@@ -18,15 +18,23 @@ from app.domain import build_domain
 H = {"Authorization": "Bearer t-alex"}
 
 
-@pytest.fixture
-def client(tmp_path):
+def make_client(tmp_path, **kw):
     fake = FakeLLM(default="ok")
+    # Фоновая память в общих тестах выключена: её запрос к модели шёл бы последним и путал
+    # проверки fake.requests[-1]. Её проводку проверяет test_auto_memory_through_service.
     settings = Settings(data_dir=tmp_path, database_url=f"sqlite:///{tmp_path}/a.db", tokens="alex:t-alex:admin,bob:t-bob:",
-                        service_token="svc", mcp_config=tmp_path / "none.json", scheduler=False)
+                        service_token="svc", mcp_config=tmp_path / "none.json", scheduler=False,
+                        **{"auto_memory": False, **kw})
     router = ModelRouter(providers={"fake": fake}, roles={"main": "fake:m", "small": "fake:s"},
                          retry=RetryPolicy(attempts=1))
     svc = AgentService(settings, build_domain(settings), router=router)
-    with TestClient(build_app(svc)) as c:
+    return TestClient(build_app(svc)), fake
+
+
+@pytest.fixture
+def client(tmp_path):
+    tc, fake = make_client(tmp_path)
+    with tc as c:
         c.fake = fake
         yield c
 
@@ -246,6 +254,29 @@ def test_memory_edit_and_schedule_lifecycle(client):
         time.sleep(0.02)
     assert msgs[-1]["content"] == "Обзор готов"
     assert client.delete(f"/api/schedules/{s['id']}", headers={"Authorization": "Bearer t-alex"}).status_code == 200
+
+
+def test_auto_memory_through_service(tmp_path):
+    tc, fake = make_client(tmp_path, auto_memory=True)
+    bob = {"Authorization": "Bearer t-bob"}
+    with tc as c:
+        assert c.get("/api/memory/prefs", headers=bob).json() == {"auto": True, "available": True}
+        fake.push("Привет!", '{"add": ["Работает в Кирове"], "update": []}')
+        sid = c.post("/api/sessions", json={}, headers=bob).json()["id"]
+        c.post(f"/api/sessions/{sid}/messages", json={"text": "Я работаю в Кирове"}, headers=bob)
+        wait_idle(c, sid, headers=bob)
+        mem = c.get("/api/memory", headers=bob).json()
+        assert [(m["text"], m["source"]) for m in mem] == [("Работает в Кирове", "auto")]
+        evs = [e["type"] for e in c.get(f"/api/sessions/{sid}/poll?after=0", headers=bob).json()["events"]]
+        assert evs.index("memory_updated") > evs.index("run_finished")
+        # Выключил у себя — следующий ход модель памяти не зовёт.
+        assert c.put("/api/memory/prefs", json={"auto": False}, headers=bob).json()["auto"] is False
+        n = len(fake.requests)
+        c.post(f"/api/sessions/{sid}/messages", json={"text": "Я из Казани"}, headers=bob)
+        wait_idle(c, sid, headers=bob)
+        assert len(fake.requests) == n + 1
+        # Чужая настройка не влияет: у alex по-прежнему включено.
+        assert c.get("/api/memory/prefs", headers=H).json()["auto"] is True
 
 
 def test_custom_mcp_servers(client):
@@ -483,7 +514,8 @@ def limited(tmp_path):
     # Дневной лимит $1, каждый ответ модели — $0.6; admin (alex) лимитом не ограничен.
     fake = FakeLLM(default="ok", cost=0.6)
     settings = Settings(data_dir=tmp_path, database_url=f"sqlite:///{tmp_path}/a.db", tokens="alex:t-alex:admin,bob:t-bob:",
-                        mcp_config=tmp_path / "none.json", scheduler=False, daily_budget_usd=1.0, monthly_budget_usd=50)
+                        mcp_config=tmp_path / "none.json", scheduler=False, daily_budget_usd=1.0, monthly_budget_usd=50,
+                        auto_memory=False)
     router = ModelRouter(providers={"fake": fake}, roles={"main": "fake:m", "small": "fake:s"},
                          retry=RetryPolicy(attempts=1))
     svc = AgentService(settings, build_domain(settings), router=router)

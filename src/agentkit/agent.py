@@ -40,6 +40,8 @@ from agentkit.events import Event, EventType, RunStatus
 from agentkit.hooks import HookEvent, Hooks, fold
 from agentkit.llm.base import LLMError, LLMRequest
 from agentkit.llm.router import ModelRouter
+from agentkit.memory_auto import enabled_for as auto_memory_enabled
+from agentkit.memory_auto import extract as auto_memory_extract
 from agentkit.messages import Message, ToolCall, Usage, new_id
 from agentkit.permissions import Decision, Mode, Permissions
 from agentkit.redact import DEFAULT as DEFAULT_REDACTOR
@@ -86,6 +88,12 @@ class AgentConfig:
     max_stop_continues: int = 3  # сколько раз stop-хук может не дать закончить
     persist_thinking: bool = False
     vision_models: list[str] | None = None  # шаблоны моделей, которым отдавать картинки; None — по умолчанию
+    # Фоновая память: после хода (статус done) модель small выбирает из слов человека устойчивые
+    # факты в его личную память — см. memory_auto.py. Выключено по умолчанию: это ещё один запрос
+    # к модели на каждый ход; сервис включает (AGENT_AUTO_MEMORY), человек может выключить у себя.
+    auto_memory: bool = False
+    auto_memory_model: str = "small"
+    auto_memory_timeout: float = 60.0
 
 
 @dataclass
@@ -240,7 +248,7 @@ class Agent:
         # Текст запроса — в событие старта: по журналу (JSONL, ak_events) прогон потом
         # разбирается и превращается в eval-кейс без доступа к таблице сообщений.
         info = {"input": _plain_text(input)[:8000]} if input is not None else None
-        async for ev in self._drive(session_id, body, model=model, trigger=trigger, info=info):
+        async for ev in self._drive(session_id, body, model=model, trigger=trigger, info=info, user=user):
             yield ev
 
     async def resolve_approval(
@@ -298,7 +306,7 @@ class Agent:
                 return RunStatus.WAITING_APPROVAL
             return await self._loop(rec.session_id, user, run_id, emit, model=model, mode=mode)
 
-        async for ev in self._drive(rec.session_id, body, model=model, trigger="approval"):
+        async for ev in self._drive(rec.session_id, body, model=model, trigger="approval", user=user):
             yield ev
 
     async def run_to_end(self, session_id: str, user: User, input: str | None, **kw: Any) -> RunOutcome:
@@ -330,7 +338,8 @@ class Agent:
 
     # ── внутреннее: запуск с очередью событий ─────────────────────────
 
-    async def _drive(self, session_id, body, *, model: str, trigger: str, info: dict[str, Any] | None = None):
+    async def _drive(self, session_id, body, *, model: str, trigger: str, info: dict[str, Any] | None = None,
+                     user: User | None = None):
         run = await self.store.create_run(session_id, model=self.router.resolve(model), trigger=trigger)
         q: asyncio.Queue[Event | None] = asyncio.Queue()
         cancel = self._cancel.setdefault(run.id, asyncio.Event())
@@ -345,9 +354,9 @@ class Agent:
             if ev.type not in EPHEMERAL:
                 await self.store.add_event(ev)
             if ev.type == EventType.USAGE:
-                # Расход субагентов входит в стоимость прогона, шаги — только свои.
+                # Расход субагентов и фоновой памяти входит в стоимость прогона, шаги — только свои.
                 usage.add(Usage(**{k: v for k, v in ev.data.items() if k in Usage.__dataclass_fields__}))
-                steps += 0 if ev.agent else 1
+                steps += 0 if ev.agent or ev.data.get("memory") else 1
                 # Расход — в базу на каждом шаге, а не только в конце: иначе лимит не видел бы
                 # идущих прогонов (часовая задача или пять параллельных разговоров тратили бы
                 # «бесплатно» до самого конца), а упавший процесс терял бы потраченное.
@@ -383,6 +392,11 @@ class Agent:
                 await emit(Event(EventType.RUN_FINISHED, {"status": str(status), "usage": usage.to_dict(),
                                                           "error": error}))
                 self._cancel.pop(run.id, None)
+                # Память — после run_finished: человек уже видит ответ и может писать дальше
+                # (сообщение встанет в очередь и уйдёт сразу за проходом), а сессия ещё
+                # заблокирована — два прохода по одним сообщениям не пойдут параллельно.
+                if status == RunStatus.DONE and user is not None:
+                    await self._auto_memory(session_id, user, emit)
                 await q.put(None)
 
         task = asyncio.create_task(runner())
@@ -397,6 +411,29 @@ class Agent:
             # в фоне: иначе в истории остался бы вызов инструмента без результата.
             if task.done():
                 await task
+
+    async def _auto_memory(self, session_id: str, user: User, emit) -> None:
+        if not self.config.auto_memory:
+            return
+        try:
+            session = await self.store.get_session(session_id)
+            # Только свой разговор и не субагент: решение по чужой карточке (admin) не пишет
+            # в его память, а дочерняя сессия субагента — не слова человека.
+            if session is None or session.parent_id or session.user_id != user.id:
+                return
+            if not await auto_memory_enabled(self.store, user.id) or await self._over_budget(user):
+                return
+            res = await asyncio.wait_for(auto_memory_extract(
+                store=self.store, router=self.router, session_id=session_id, user_id=user.id,
+                model=self.config.auto_memory_model, redactor=self.redactor), self.config.auto_memory_timeout)
+        except Exception:  # noqa: BLE001 — память best-effort: ответ человек уже получил
+            log.exception("auto memory failed in %s", session_id)
+            return
+        if res.usage.cost or res.usage.input_tokens:
+            await emit(Event(EventType.USAGE, {**res.usage.to_dict(), "model": self.router.resolve(
+                self.config.auto_memory_model), "step": "memory", "memory": True}))
+        if res.changed:
+            await emit(Event(EventType.MEMORY_UPDATED, {"added": res.added, "updated": res.updated}))
 
     # ── внутреннее: цикл ──────────────────────────────────────────────
 
@@ -787,7 +824,8 @@ class Agent:
         child = Agent(
             router=self.router, store=self.store, tools=tools, spec=spec, subagents={},
             permissions=self.permissions if spec.mode is None else self.permissions.with_mode(spec.mode),
-            hooks=self.hooks, skills=self.skills, mcp_instructions=self.mcp_instructions, config=self.config,
+            hooks=self.hooks, skills=self.skills, mcp_instructions=self.mcp_instructions,
+            config=replace(self.config, auto_memory=False),
             deps=self.deps, workspace=self._workspace, rules=self.rules, memory_scopes=self.memory_scopes,
             tracers=self.tracers, can_ask=False, budget=self.budget, redactor=self.redactor,
         )

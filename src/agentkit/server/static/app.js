@@ -542,6 +542,17 @@ function closeCard(id, approved, expired) {
 }
 
 function note(text) { add(h("div", { class: "note" }, text)); }
+// Фоновая память записала факт (после ответа) — тихая строка под ответом, как «Memory updated» у Claude.
+function memoryNote(d) {
+  const items = [...(d.added || []), ...(d.updated || [])];
+  if (!items.length) return;
+  const first = items[0].text.length > 70 ? items[0].text.slice(0, 68) + "…" : items[0].text;
+  const more = items.length > 1 ? ` и ещё ${items.length - 1}` : "";
+  // В обёртке .msg.assistant — по колонке ответа, а не по краю ленты.
+  add(h("div", { class: "msg assistant mem-row" }, h("button", { class: "mem-note", type: "button",
+    title: items.map(i => "• " + i.text).join("\n"), onclick: () => openSettings("memory") },
+    icon("memory"), h("span", {}, (d.added?.length ? "Запомнил: " : "Обновил в памяти: ") + first + more))));
+}
 function alertMsg(text) { add(h("div", { class: "alert", role: "alert" }, text)); }
 
 function renderTodos(todos) {
@@ -612,6 +623,7 @@ function onEvent(ev) {
     case "ask_user": add(choices(d.question, d.options)); break;
     case "todo": if (!ev.agent) renderTodos(d.todos); break;
     case "compacted": note("История сжата, чтобы поместиться в контекст"); break;
+    case "memory_updated": memoryNote(d); break;
     case "notice": note(d.message); break;
     case "error": alertMsg(d.message); break;
     case "usage": setCost(S.cost + (d.cost || 0)); break;
@@ -1243,7 +1255,7 @@ async function modelsTab(body) {
 // ── память ──────────────────────────────────────────────────────────
 const MEMORY_EXAMPLES = ["Отвечай коротко, по пунктам", "Суммы — в рублях с пробелами: 12 500 ₽", "Наш основной склад — в Кирове"];
 async function memoryTab(body) {
-  const items = await api("/api/memory");
+  const [items, prefs] = await Promise.all([api("/api/memory"), api("/api/memory/prefs").catch(() => ({ available: false }))]);
   const admin = S.config.is_admin;
   const own = m => m.scope === `user:${S.me.id}`;
   let scope = "user", filter = "all", q = "";
@@ -1267,6 +1279,7 @@ async function memoryTab(body) {
     const text = h("div", { class: "mem-text" }, m.text);
     const el = h("div", { class: "mem-card" }, h("div", { class: "mem-dot " + (m.scope === "global" ? "shared" : "") }), h("div", { class: "mem-body" }, text,
       h("div", { class: "mem-meta" }, h("span", { class: "tag" + (m.scope === "global" ? " shared" : "") }, m.scope === "global" ? "для всех" : "только мне"),
+        m.source === "auto" ? h("span", { class: "tag", title: "Агент запомнил сам из разговора — поправьте или удалите, если не так" }, "из разговора") : null,
         m.created_at ? h("span", {}, fmtDay(m.created_at)) : null,
         m.scope === "global" && m.created_by ? h("span", {}, `добавил ${m.created_by}`) : null)),
       canEdit ? h("div", { class: "mem-actions" },
@@ -1304,8 +1317,11 @@ async function memoryTab(body) {
     else if (!shown.length) list.replaceChildren(h("p", { class: "muted center" }, "Ничего не нашлось"));
   };
   const [search] = searchBox("Поиск по памяти", v => { q = v; draw(); });
+  const auto = prefs.available ? group(null, null, settingLine("Запоминать из разговоров",
+    "Агент сам сохраняет устойчивые факты о вас и вашей работе — только для вас. «Запомни: …» в чате работает всегда.",
+    toggle(prefs.auto, async on => { await api("/api/memory/prefs", { method: "PUT", body: { auto: on } }); }, "Запоминать из разговоров"))) : null;
   body.append(h("p", { class: "lead-text tab-lead" }, "Агент помнит это во всех разговорах. Добавляйте правила, факты о работе и предпочтения."),
-    compose, items.length ? h("div", { class: "toolbar" }, search, seg) : null, list);
+    auto, compose, items.length ? h("div", { class: "toolbar" }, search, seg) : null, list);
   draw();
 }
 

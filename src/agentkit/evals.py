@@ -35,6 +35,7 @@
         max_tool_errors: 2
         asked_user: false
         compacted: true           # история сжималась
+        memory: {contains: ["Киров"], not_contains: ["Париж"], max: 2}   # личная память после (с config: {auto_memory: true})
         contains: ["исправил"]    # в итоговом ответе, без учёта регистра
         not_contains: []
         regex: "len\\(xs\\)"
@@ -244,6 +245,22 @@ def _check_files(ws: Path | None, spec: dict[str, Any]) -> list[str]:
     return out
 
 
+def _check_memory(texts: list[str], spec: dict[str, Any]) -> list[str]:
+    """Личная память после кейса: подстроки без учёта регистра, по всем записям вместе."""
+    out: list[str] = []
+    low = "\n".join(texts).lower()
+    shown = "; ".join(texts) or "пусто"
+    for s in _as_list(spec.get("contains")):
+        if s.lower() not in low:
+            out.append(f"в памяти нет «{s}» (там: {shown[:300]})")
+    for s in _as_list(spec.get("not_contains")):
+        if s.lower() in low:
+            out.append(f"в памяти есть «{s}» (там: {shown[:300]})")
+    if (mx := spec.get("max")) is not None and len(texts) > mx:
+        out.append(f"в памяти {len(texts)} записей > {mx} (там: {shown[:300]})")
+    return out
+
+
 def _as_list(v: Any) -> list[str]:
     if v is None:
         return []
@@ -295,7 +312,7 @@ async def run_case(case: dict[str, Any], make_agent: MakeAgent, *, model: str | 
                 counters["tool_errors"] += 1
             elif ev.type == EventType.USAGE:
                 usage.add(Usage(**{k: v for k, v in ev.data.items() if k in Usage.__dataclass_fields__}))
-                counters["steps"] += 1 if main else 0
+                counters["steps"] += 1 if main and not ev.data.get("memory") else 0
             elif ev.type == EventType.ASK_USER and main:
                 counters["asked"] += 1
             elif ev.type == EventType.COMPACTED and main:
@@ -385,6 +402,8 @@ async def run_case(case: dict[str, Any], make_agent: MakeAgent, *, model: str | 
             failures.append(f"стоимость ${usage.cost:.4f} > ${mx}")
         if expect.get("files"):
             failures += _check_files(ws, expect["files"])
+        if (mm := expect.get("memory")) is not None:
+            failures += _check_memory([m.text for m in await store.memory_list([f"user:{user.id}"])], mm)
         if (rubric := expect.get("judge")) and fake is None and not failures:
             # Судья — только если механические проверки прошли: дешевле и не путает причины.
             try:

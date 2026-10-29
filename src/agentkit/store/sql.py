@@ -155,6 +155,7 @@ memory = Table(
     Column("text", Text, nullable=False),
     Column("created_by", String(120), default=""),
     Column("created_at", Float, nullable=False),
+    Column("source", String(20), nullable=True),
 )
 
 blobs = Table(
@@ -451,8 +452,9 @@ class SQLStore(Store):
             await c.execute(update(approvals).where(approvals.c.id == approval_id).values(**fields))
 
     # ── память ───────────────────────────────────────────────────────
-    async def memory_add(self, scope, text, *, created_by=""):
-        rec = MemoryRec(id=new_id("m_"), scope=scope, text=text, created_by=created_by, created_at=time.time())
+    async def memory_add(self, scope, text, *, created_by="", source=None):
+        rec = MemoryRec(id=new_id("m_"), scope=scope, text=text, created_by=created_by, created_at=time.time(),
+                        source=source)
         async with self._begin() as c:
             await c.execute(insert(memory).values(**rec.__dict__))
         return rec

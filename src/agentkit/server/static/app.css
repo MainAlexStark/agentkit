@@ -263,6 +263,12 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 
 .note { display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--faint); font-size: 12px; margin: 14px auto; }
 .note::before, .note::after { content: ""; height: 1px; background: var(--line); flex: 1; max-width: 120px; }
+.msg.mem-row { margin-top: -6px; }
+.msg.assistant:has(+ .mem-row:last-child) .msg-actions { opacity: 1; } /* строка памяти — не повод прятать действия ответа */
+.mem-note { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; margin: 0; padding: 3px 9px 3px 7px; border: 1px solid var(--line); border-radius: 999px; background: transparent; color: var(--muted); font: inherit; font-size: 12px; cursor: pointer; }
+.mem-note span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mem-note svg { width: 13px; height: 13px; flex: none; }
+.mem-note:hover { color: var(--text); background: var(--surface-2); }
 .alert { margin: 12px auto; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--err) 30%, var(--line)); background: var(--err-soft); color: var(--err); border-radius: var(--r); font-size: 13px; }
 
 /* ── ввод ───────────────────────────────────────────────────────── */
