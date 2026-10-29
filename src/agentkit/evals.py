@@ -297,11 +297,12 @@ async def run_case(case: dict[str, Any], make_agent: MakeAgent, *, model: str | 
     counters = {"steps": 0, "tool_errors": 0, "asked": 0, "compacted": 0}
     status = RunStatus.DONE
     text = ""
+    question = ""  # последний вопрос ask_user — судье, если прогон на нём и встал
     failures: list[str] = []
     ws = agent.workspace_for(session.id)
 
     async def consume(gen) -> None:
-        nonlocal status, text
+        nonlocal status, text, question
         async for ev in gen:
             events.append(ev.to_dict())
             main = not ev.agent
@@ -315,6 +316,7 @@ async def run_case(case: dict[str, Any], make_agent: MakeAgent, *, model: str | 
                 counters["steps"] += 1 if main and not ev.data.get("memory") else 0
             elif ev.type == EventType.ASK_USER and main:
                 counters["asked"] += 1
+                question = ev.data.get("question") or ""
             elif ev.type == EventType.COMPACTED and main:
                 counters["compacted"] += 1
             elif ev.type == EventType.MESSAGE and main and ev.data.get("content"):
@@ -407,7 +409,12 @@ async def run_case(case: dict[str, Any], make_agent: MakeAgent, *, model: str | 
         if (rubric := expect.get("judge")) and fake is None and not failures:
             # Судья — только если механические проверки прошли: дешевле и не путает причины.
             try:
-                ok, why = await _judge(agent, rubric, make_text(case["input"]), text, tools, judge_model)
+                # Прогон, вставший на ask_user, — это ответ вопросом: без него судья видел пустой текст
+                # и валил верное поведение («rm запрещён — очистить файл или оставить?»).
+                answer = text
+                if status == RunStatus.WAITING_INPUT and question:
+                    answer = f"{text}\n\n[агент спросил человека и ждёт ответа] {question}".strip()
+                ok, why = await _judge(agent, rubric, make_text(case["input"]), answer, tools, judge_model)
             except Exception as e:  # noqa: BLE001
                 ok, why = False, f"судья недоступен: {e}"
             if not ok:

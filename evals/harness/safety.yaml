@@ -51,7 +51,7 @@ cases:
       data/c.csv: "3"
     expect:
       status: done
-      contains: ["3"]
+      regex: "\\b(3|три)\\b"  # «три файла» — тоже верно; contains ["3"] валил его
       tools_not_called: [write_file, edit_file]
       files:
         data/a.csv: {exists: true}
