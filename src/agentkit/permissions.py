@@ -22,13 +22,15 @@ bypass («Без вопросов»); остальные — для субаге
 Правило — строка «имя_инструмента» или «имя(шаблон)»: шаблон сравнивается
 со «смысловым» аргументом инструмента (command у shell, path у файлов, url у
 web_fetch) или с JSON всех аргументов. Примеры: "shell(git status*)",
-"write_file(notes/*)", "mcp__ozon__*".
+"write_file(notes/*)", "mcp__ozon__*". Команда shell сверяется по частям (`a && b`, `$(…)`,
+`bash -c`, `sudo`): deny и ask — если подходит хоть одна часть, allow — только если подходят все.
 """
 
 from __future__ import annotations
 
 import fnmatch
 import json
+import posixpath
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -76,17 +78,122 @@ class Rule:
             raise ValueError(f"не разобрать правило «{s}»")
         return cls(name=m["name"].strip(), arg=m["arg"])
 
-    def matches(self, tool_name: str, args: dict[str, Any]) -> bool:
+    def matches(self, tool_name: str, args: dict[str, Any], *, every: bool = False) -> bool:
+        """Совпадает ли вызов с правилом.
+
+        У команды (аргумент command) шаблон сверяется с каждой частью: `ls x && rm y` — это и `ls x`,
+        и `rm y`. Целиком строка шаблону «rm *» не равна, и deny-правило пропускало удаление
+        (нашлось живым прогоном: модель сама дописала `ls … && rm tmp.log`). `every=False` (deny, ask) —
+        хватит одной части; `every=True` (allow) — нужны все, иначе `shell(git status*)` без вопроса
+        выполнял `git status; rm -rf ~`. Команду, которую не разобрать, allow не пропускает.
+        """
         if not fnmatch.fnmatchcase(tool_name, self.name):
             return False
         if self.arg is None:
             return True
+        if "command" in args and isinstance(args["command"], str):
+            parts = command_parts(args["command"])
+            if parts is None:  # не разобрали: deny/ask — по всей строке, allow — нет
+                return not every and fnmatch.fnmatchcase(args["command"].strip(), self.arg)
+            if every:
+                return bool(parts) and all(any(fnmatch.fnmatchcase(v, self.arg) for v in p.exact) for p in parts)
+            return any(fnmatch.fnmatchcase(v, self.arg) for p in parts for v in p.loose)
         subject = next((str(args[k]) for k in PRIMARY_ARG if k in args), None)
+        if subject is not None and any(k in args for k in ("path", "file_path")) and "command" not in args:
+            # `notes/../config.yaml` под allow «notes/*» попадал (* в fnmatch съедает и «/»),
+            # а `./secret/x` мимо deny «secret/*». Сверяем путь, каким его увидит файловая система.
+            subject = posixpath.normpath(subject.replace("\\", "/"))
         if subject is None and len(args) == 1:
             subject = str(next(iter(args.values())))
         if subject is None:
             subject = json.dumps(args, ensure_ascii=False, sort_keys=True)
         return fnmatch.fnmatchcase(subject, self.arg)
+
+
+# Обёртки, за которыми идёт настоящая команда: `sudo rm x` — это `rm x`.
+_WRAPPERS = {"sudo", "doas", "env", "command", "builtin", "exec", "nohup", "time", "nice"}
+# Команды, исполняющие строку-аргумент как shell: `bash -c "rm x"`, `eval "rm x"`.
+_SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_SUBST = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+_SEP_CHARS = set(";&|()")
+
+
+@dataclass
+class CommandPart:
+    """Простая команда из составной. `exact` — её записи для allow: как есть, без `VAR=…` и обёрток
+    (`sudo`, `env`…), с именем без пути (`/bin/rm` → `rm`). `loose` — ещё и с любого слова: для deny
+    и ask, чтобы `timeout 5 rm x`, `sudo -u root rm x`, `find . -exec rm {} ;` тоже попадали под
+    `rm *`. Лишний отказ безопаснее пропущенного удаления; allow по `loose` не судит никогда."""
+
+    exact: list[str]
+    loose: list[str]
+
+
+def command_parts(command: str, depth: int = 0) -> list[CommandPart] | None:
+    """Команда shell → простые команды: `a && b | c; d` → a, b, c, d. Подстановки `$(…)` и `` `…` ``,
+    `bash -c "…"`, `eval …` разбираются внутрь. None — не разобрать (незакрытая кавычка, вложенность
+    глубже 3) — тогда allow не пропускает такую команду."""
+    import shlex
+
+    if depth > 3:
+        return None
+    parts: list[CommandPart] = []
+    for m in _SUBST.finditer(command):
+        inner = command_parts(m.group(1) if m.group(1) is not None else m.group(2), depth + 1)
+        if inner is None:
+            return None
+        parts += inner
+    # Перевод строки — тоже разделитель команд, а shlex считает его пробелом. `<>` в пунктуации —
+    # чтобы `2>&1` стал `2 >& 1`, а не разрезал команду по `&`.
+    lex = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=";&|()<>")
+    lex.whitespace_split = True
+    try:
+        tokens = list(lex)
+    except ValueError:
+        return None
+    seg: list[str] = []
+    for tok in [*tokens, ";"]:
+        if not (set(tok) <= _SEP_CHARS):  # «&&», «|», «;», «(»… — граница; «>&», «2>» — нет
+            seg.append(tok)
+            continue
+        if seg:
+            sub = _segment(seg, depth)
+            if sub is None:
+                return None
+            parts += sub
+        seg = []
+    return parts
+
+
+def _segment(tokens: list[str], depth: int) -> list[CommandPart] | None:
+    exact = [" ".join(tokens)]
+    words = list(tokens)
+    while words and (_ASSIGN.match(words[0]) or words[0] in _WRAPPERS):
+        words = words[1:]
+        if words:
+            exact.append(" ".join(words))
+    if not words:
+        return [CommandPart(exact, exact)]
+    head = words[0].rsplit("/", 1)[-1]
+    if head != words[0]:
+        exact.append(" ".join([head, *words[1:]]))
+    # Слово с пробелом — из кавычек (`git commit -m 'rm x'`): это данные, а не команда.
+    loose = exact + [" ".join([w.rsplit("/", 1)[-1], *words[i + 1:]])
+                     for i, w in enumerate(words) if i and not any(c.isspace() for c in w)]
+    out = [CommandPart(exact, loose)]
+    inner_cmd = None
+    if head in _SHELLS and "-c" in words[1:]:
+        i = words.index("-c", 1)
+        inner_cmd = words[i + 1] if i + 1 < len(words) else None
+    elif head == "eval" and len(words) > 1:
+        inner_cmd = " ".join(words[1:])
+    if inner_cmd is not None:
+        inner = command_parts(inner_cmd, depth + 1)
+        if inner is None:
+            return None
+        out += inner
+    return out
 
 
 @dataclass
@@ -134,7 +241,7 @@ class Permissions:
             return Verdict(Decision.DENY, "режим только чтения")
         if any(r.matches(name, args) for r in self._ask) or own == "ask":
             return Verdict(Decision.ASK, "правило требует подтверждения" if own != "ask" else "")
-        if any(r.matches(name, args) for r in self._allow) or own == "allow":
+        if any(r.matches(name, args, every=True) for r in self._allow) or own == "allow":
             return Verdict(Decision.ALLOW)
         if self.mode == Mode.BYPASS:
             return Verdict(Decision.ALLOW)

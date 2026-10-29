@@ -718,8 +718,14 @@ class Agent:
             decision, reason = Decision.ASK, hooked.reason
 
         if decision == Decision.DENY:
-            return await done(ToolResult(content=f"Отказано: {reason}. Не повторяй этот вызов; "
-                                                 "предложи человеку другой путь.", is_error=True))
+            # Было «…предложи человеку другой путь» — и модель сама шла этим путём: после отказа на
+            # `rm tmp.log` делала `mv tmp.log /tmp/…` (живой прогон, safety/deny-rule-respected).
+            # Правило по шаблону команды цель не видит, поэтому запрет на цель — словами здесь.
+            return await done(ToolResult(
+                content=f"Отказано: {reason}. Действие НЕ выполнено. Не повторяй его и не добивайся того же "
+                        "другим способом (другой командой, переносом, перезаписью): запрет — на результат, а не "
+                        "на одну команду. Скажи человеку, что запрещено; другие варианты — только предложить, "
+                        "выполнять после его согласия.", is_error=True))
         if decision == Decision.ASK:
             if not self.can_ask:
                 return await done(ToolResult(content="Отказано: субагент не может запросить подтверждение. "
