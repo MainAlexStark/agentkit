@@ -30,6 +30,7 @@ from urllib.parse import urlencode, urlparse
 import httpx
 
 from agentkit.bus import Bus, LocalBus
+from agentkit.redact import remember
 from agentkit.store.base import Store
 
 NS = "oauth"
@@ -306,12 +307,14 @@ class OAuthBroker:
         rec.refresh_token = tok.get("refresh_token") or rec.refresh_token
         rec.expires_at = time.time() + float(tok["expires_in"]) if tok.get("expires_in") else 0
         rec.scope = tok.get("scope") or rec.scope
+        _remember(rec)
 
     async def token(self, server: str) -> str | None:
         """Действующий access-токен, при необходимости обновлённый. None — сервер не подключён."""
         rec = await self.record(server)
         if not rec.access_token:
             return None
+        _remember(rec)  # после перезапуска токен приходит из базы, а не из _apply
         if not rec.expires_at or rec.expires_at - time.time() > 300:
             return rec.access_token
         async with self.bus.lock(f"oauth:{server}", ttl=30):
@@ -356,3 +359,10 @@ class OAuthBroker:
         rec = await self.record(server)
         return {"connected": bool(rec.access_token), "scope": rec.scope, "connected_by": rec.connected_by,
                 "connected_at": rec.connected_at or None, "expires_at": rec.expires_at or None}
+
+
+def _remember(rec: OAuthRecord) -> None:
+    """Токены OAuth — в маскирование: ни модели, ни в журнал (redact.py)."""
+    remember(rec.access_token, "OAuth access")
+    remember(rec.refresh_token, "OAuth refresh")
+    remember(rec.client_secret, "OAuth client_secret")

@@ -23,6 +23,7 @@ from typing import Any
 
 import httpx
 
+from agentkit.redact import remember
 from agentkit.tools.base import Tool, ToolContext, ToolResult
 from agentkit.tools.registry import match_any
 
@@ -319,6 +320,11 @@ class MCPManager:
         return [t for tools in results for t in tools]
 
     async def _connect_one(self, cfg: MCPServerConfig) -> list[Tool]:
+        # Токен и заголовки сервера — секреты: сервер может вернуть их в ответе или ошибке
+        # (эхо запроса, отладочный вывод), а оттуда они ушли бы модели и в журнал.
+        remember(cfg.token, f"токен MCP {cfg.name}")
+        for k, v in {**cfg.headers, **cfg.env}.items():
+            remember(v, f"{k} MCP {cfg.name}")
         provider = refresh = None
         use_oauth = False
         if self.oauth is not None and cfg.url and not cfg.token:

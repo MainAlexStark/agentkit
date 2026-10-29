@@ -42,6 +42,8 @@ from agentkit.llm.base import LLMError, LLMRequest
 from agentkit.llm.router import ModelRouter
 from agentkit.messages import Message, ToolCall, Usage, new_id
 from agentkit.permissions import Decision, Mode, Permissions
+from agentkit.redact import DEFAULT as DEFAULT_REDACTOR
+from agentkit.redact import MARKER, Redactor, contains_marker
 from agentkit.skills import SkillLibrary
 from agentkit.store.base import ApprovalRec, Store
 from agentkit.tools.base import Tool, ToolArgsError, ToolContext, ToolDenied, ToolResult, User
@@ -50,6 +52,8 @@ from agentkit.tools.registry import LOADED_KEY, ToolRegistry, make_tool_search
 log = logging.getLogger("agentkit.agent")
 
 EPHEMERAL = {EventType.TEXT_DELTA, EventType.THINKING_DELTA}
+REDACTED_NOTE = ("\n\n[Система] «[секрет скрыт: …]» — ключ или пароль, скрытый от тебя кодом; значения ты не узнаешь. "
+                 "Не вписывай эту метку в файлы и команды: правь строки рядом, а сам секрет пусть впишет человек.")
 
 
 @dataclass
@@ -132,8 +136,12 @@ class Agent:
         tracers: list[Any] | None = None,
         can_ask: bool = True,
         budget: BudgetCheck | None = None,
+        redactor: Redactor | None = None,
     ):
         self.router = router
+        # Секреты (ключи сервиса из окружения, токены MCP/OAuth, типовые форматы) — маркером:
+        # в результате инструмента до модели и в каждом событии до базы, UI и трейсеров.
+        self.redactor = redactor or DEFAULT_REDACTOR
         self.budget = budget
         self.store = store
         self.tools = tools or ToolRegistry()
@@ -331,6 +339,7 @@ class Agent:
 
         async def emit(ev: Event) -> None:
             nonlocal steps
+            ev.data = self.redactor.deep(ev.data)
             ev.run_id = ev.run_id or run.id
             ev.session_id = ev.session_id or session_id
             if ev.type not in EPHEMERAL:
@@ -642,6 +651,13 @@ class Agent:
                 args = tool.validate(hooked.updated_args)
             except ToolArgsError as e:
                 return await done(ToolResult.error(f"хук передал неверные аргументы: {e}"))
+        if not tool.read_only and contains_marker(args):
+            # Модель видит маркер вместо секрета и норовит переписать файл целиком — вместе с маркером:
+            # .env или конфиг остались бы без настоящего ключа. Такой вызов не выполняется ни в каком режиме.
+            return await done(ToolResult.error(
+                f"в аргументах есть «{MARKER}…]» — это метка, а не значение: настоящий секрет от тебя скрыт. "
+                "Вызов не выполнен, чтобы не записать метку вместо секрета. Правь точечно (edit_file) строки "
+                "без секрета; если нужно вписать или перенести сам секрет — попроси об этом человека."))
         verdict = perms.check(tool, args, ctx)
         decision, reason = verdict.decision, verdict.reason
         if hooked.decision == Decision.DENY:
@@ -696,6 +712,16 @@ class Agent:
             result.content = hooked.updated_result
         if hooked.add_context:
             result.content += f"\n\n[Контекст] {hooked.add_context}"
+        # До обрезки и blob: иначе read_output отдал бы полный текст с секретом.
+        masked = self.redactor.text(result.content)
+        if masked != result.content:
+            # Пояснение — здесь, только когда секрет и правда скрыт, а не строкой в CORE_RULES: промпт
+            # остаётся одинаковым у всех прогонов (кэш), а модель узнаёт о метке ровно там, где её видит.
+            # Без пояснения write_file переписывал файл вместе с меткой и упирался в отказ.
+            masked += REDACTED_NOTE
+        result.content = masked
+        result.ui = self.redactor.deep(result.ui)
+        result.data = self.redactor.deep(result.data)
         limit = tool.max_output_chars or self.config.max_output_chars
         text, cut = truncate_text(result.content, limit)
         if cut:
@@ -708,6 +734,8 @@ class Agent:
         return result
 
     async def _record_result(self, session_id, run_id, emit, call_id: str, name: str, result: ToolResult) -> None:
+        # Ещё раз — для результатов мимо _invoke (отказы, ошибки аргументов с текстом модели).
+        result.content = self.redactor.text(result.content)
         await self.store.append_message(session_id, Message.tool(call_id, name, result.content,
                                                                  is_error=result.is_error, ui=result.ui,
                                                                  elapsed_ms=result.elapsed_ms), run_id)
@@ -761,7 +789,7 @@ class Agent:
             permissions=self.permissions if spec.mode is None else self.permissions.with_mode(spec.mode),
             hooks=self.hooks, skills=self.skills, mcp_instructions=self.mcp_instructions, config=self.config,
             deps=self.deps, workspace=self._workspace, rules=self.rules, memory_scopes=self.memory_scopes,
-            tracers=self.tracers, can_ask=False, budget=self.budget,
+            tracers=self.tracers, can_ask=False, budget=self.budget, redactor=self.redactor,
         )
         child.context_providers = self.context_providers
         child.vision_for = self.vision_for

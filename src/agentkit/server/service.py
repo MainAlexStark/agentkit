@@ -34,6 +34,8 @@ from agentkit.messages import Usage
 from agentkit.oauth import OAuthBroker
 from agentkit.permissions import Mode, Permissions
 from agentkit.projects import ProjectLibrary, project_tools
+from agentkit.redact import DEFAULT as REDACT
+from agentkit.redact import Redactor, install_log_redaction
 from agentkit.runs import Busy, RunManager
 from agentkit.scheduler import Scheduler
 from agentkit.server.auth import Auth
@@ -437,6 +439,11 @@ def assemble_agent(
     if s.reasoning_effort and not spec.reasoning_effort:
         spec.reasoning_effort = s.reasoning_effort
     ws_root = s.workspace_dir or (s.data_dir / "workspaces")
+    # Ключи из .env pydantic читает сам, мимо os.environ — без этого они не были бы «известными».
+    REDACT.add_env(s.secret_env())
+    REDACT.add_url(s.database_url, "пароль базы")
+    REDACT.add_url(s.redis_url, "пароль Redis")
+    install_log_redaction(REDACT)
     tracers: list[Any] = [LogTracer()]
     if s.trace_dir:
         tracers.append(JSONLTracer(s.trace_dir))
@@ -469,4 +476,5 @@ def assemble_agent(
         workspace=workspace if s.enable_files or s.enable_shell else None,
         rules=domain.rules,
         tracers=tracers,
+        redactor=Redactor(patterns=s.redact_patterns, base=REDACT),
     )

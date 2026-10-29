@@ -106,6 +106,14 @@ class Settings(BaseSettings):
     # агента, run_python и так пишет туда без вопросов, а откат к сообщению возвращает файлы.
     workspace_edits: bool = True
     max_output_chars: int = 30_000
+    # Секреты сервиса (ключи, токены, пароли из этих настроек и окружения) скрываются всегда. Это — ещё и
+    # типовые форматы в данных (sk-…, ghp_…, PASSWORD=…, JWT, PEM): чужой ключ из .env пользователя тоже
+    # не уходит провайдеру модели и в журнал. false — если агент по делу работает с такими данными.
+    redact_patterns: bool = True
+
+    def secret_env(self) -> dict[str, str]:
+        """Настройки в виде переменных окружения — для redact.Redactor.add_env (берёт KEY/TOKEN/SECRET)."""
+        return {f"AGENT_{k.upper()}": v for k, v in self.model_dump().items() if isinstance(v, str) and v}
 
     def model_list(self) -> list[str]:
         items = [m.strip() for m in self.models.split(",") if m.strip()]
