@@ -559,3 +559,40 @@ def test_period_starts_use_service_tz():
     s = Settings(tz="Europe/Moscow")
     day, month = AgentService(s, build_domain(s)).period_starts(1_767_301_200 + 60)  # 02.01.2026 00:01 МСК
     assert day == 1_767_301_200 and month == 1_767_214_800
+
+
+def test_replay_view_and_eval_admin_only(client):
+    """Ход прогона и «в eval» у ответа: по журналу, через подтверждение — одним ходом; только admin."""
+    import yaml
+
+    client.fake.push({"tool_calls": [("notes_add", {"text": "Позвонить"})]}, "Записал #1.")
+    sid = client.post("/api/sessions", json={}, headers=H).json()["id"]
+    client.post(f"/api/sessions/{sid}/messages", json={"text": "запиши: позвонить"}, headers=H)
+    wait_idle(client, sid)
+    ap = client.get(f"/api/sessions/{sid}", headers=H).json()["approvals"][0]
+    client.post(f"/api/approvals/{ap['id']}", json={"approve": True}, headers=H)
+    wait_idle(client, sid)
+    seq = client.get(f"/api/sessions/{sid}", headers=H).json()["messages"][-1]["seq"]
+
+    r = client.get(f"/api/sessions/{sid}/replay?seq={seq}", headers=H)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert [x["trigger"] for x in data["runs"]] == ["user", "approval"]  # продолжение — в том же ходе
+    assert data["runs"][0]["input"] == "запиши: позвонить"
+    kinds = [it["kind"] for x in data["runs"] for it in x["items"]]
+    assert "call" in kinds and "wait" in kinds and "end" in kinds
+    assert "notes_add" in data["text"] and "Записал #1." in data["text"]
+
+    r = client.post(f"/api/sessions/{sid}/replay/eval", json={"seq": seq, "judge": "подтверждает запись", "case_id": "note"},
+                    headers=H)
+    assert r.status_code == 200, r.text
+    ev = r.json()
+    assert ev["filename"] == "note.yaml"
+    wiring, live = yaml.safe_load(ev["yaml"])
+    assert wiring["id"] == "note-wiring" and wiring["approve"] == "all" and wiring["input"] == "запиши: позвонить"
+    assert live["expect"]["judge"] == "подтверждает запись" and live["expect"]["tools_called"] == ["notes_add"]
+
+    bob = {"Authorization": "Bearer t-bob"}
+    bsid = client.post("/api/sessions", json={}, headers=bob).json()["id"]
+    assert client.get(f"/api/sessions/{bsid}/replay", headers=bob).status_code == 403  # не admin — даже свой
+    assert client.get(f"/api/sessions/{sid}/replay?seq=999999", headers=H).status_code == 404

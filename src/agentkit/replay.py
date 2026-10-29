@@ -46,7 +46,7 @@ async def load(source: str, ident: str | None = None) -> tuple[list[dict[str, An
         url = source if "://" in source else f"sqlite:///{source}"
         store = await SQLStore(url).init()
         try:
-            session_id = run_id = None
+            session_id = None
             if ident and ident.startswith("s_"):
                 session_id = ident
             elif ident:
@@ -54,16 +54,7 @@ async def load(source: str, ident: str | None = None) -> tuple[list[dict[str, An
                 if run is None:
                     raise SystemExit(f"в базе нет прогона {ident}")
                 session_id = run.session_id
-            evs: list[dict[str, Any]] = []
-            after = 0
-            while True:
-                page = await store.list_events(session_id=session_id, run_id=run_id, after_seq=after, limit=1000)
-                evs += [e.to_dict() for e in page]
-                if len(page) < 1000:
-                    break
-                after = page[-1].seq
-            msgs = await store.list_messages(session_id) if session_id else []
-            return evs, msgs
+            return await from_store(store, session_id)
         finally:
             await store.close()
     p = Path(source)
@@ -82,6 +73,20 @@ async def load(source: str, ident: str | None = None) -> tuple[list[dict[str, An
         sid = ident if ident.startswith("s_") else next((e["session_id"] for e in evs if e.get("run_id") == ident), None)
         evs = [e for e in evs if e.get("session_id") == sid or (e.get("agent") and _parent_known(e, evs, sid))]
     return evs, []
+
+
+async def from_store(store: Any, session_id: str | None) -> tuple[list[dict[str, Any]], list[tuple[int, Message]]]:
+    """События и сообщения сессии из открытого Store (CLI и окно «Ход прогона» в сервисе)."""
+    evs: list[dict[str, Any]] = []
+    after = 0
+    while True:
+        page = await store.list_events(session_id=session_id, after_seq=after, limit=1000)
+        evs += [e.to_dict() for e in page]
+        if len(page) < 1000:
+            break
+        after = page[-1].seq
+    msgs = await store.list_messages(session_id) if session_id else []
+    return evs, msgs
 
 
 def _parent_known(e: dict, evs: list[dict], sid: str | None) -> bool:
@@ -151,6 +156,60 @@ def run_list(rs: list[dict[str, Any]], limit: int = 30) -> str:
     return "\n".join(lines) or "прогонов нет"
 
 
+def describe(e: dict[str, Any], r: dict[str, Any], *, full: bool = False) -> tuple[str, str] | None:
+    """Событие → (вид, строка) для хода прогона; None — событие в ходе не показывается.
+
+    Общее для CLI (`timeline`) и интерфейса (`structured`): иначе текст хода в
+    терминале и в окне админа разъезжались бы при каждом новом событии.
+    """
+    d, ty = e.get("data") or {}, e["type"]
+    t0 = r["ts"]
+    if ty == "usage":
+        return "step", (f"шаг {d.get('step', 0) + 1} · {d.get('input_tokens', 0)}→{d.get('output_tokens', 0)} ток."
+                        f"{' (кэш ' + str(d['cached_tokens']) + ')' if d.get('cached_tokens') else ''}"
+                        f" · ${float(d.get('cost') or 0):.4f} · {d.get('model', '')}")
+    if ty == "message" and d.get("content"):
+        return "agent", "агент: " + (d["content"] if full else _short(d["content"], 300))
+    if ty == "tool_call":
+        return "call", f"→ {d.get('name')}({_args(d.get('args'), full)})"
+    if ty == "tool_result":
+        mark = "✗" if d.get("is_error") else "←"
+        body = d.get("content") or ""
+        return ("error" if d.get("is_error") else "result"), (
+            f"{mark} {d.get('name')} · {d.get('elapsed_ms', 0)} мс · {len(body)} симв.: "
+            + (body if full else _short(body, 200)))
+    if ty == "approval_required":
+        return "wait", f"⏸ ждёт подтверждения: {d.get('tool')} {d.get('reason') or ''}".rstrip()
+    if ty == "approval_resolved":
+        return "wait", "⏵ " + ("истекло" if d.get("expired") else "разрешено" if d.get("approved") else "отклонено")
+    if ty == "ask_user":
+        return "wait", f"? вопрос человеку: {d.get('question')}"
+    if ty == "user_message":
+        return "human", f"человек (на ходу): {_short(d.get('content'), 200)}"
+    if ty == "todo":
+        todos = d.get("todos") or []
+        done = sum(1 for x in todos if x.get("status") == "completed")
+        return "plan", f"☰ план {done}/{len(todos)}: " + "; ".join(_short(x.get("content", ""), 40) for x in todos)
+    if ty == "subagent_started":
+        return "sub", f"⤷ субагент {d.get('type')}: {_short(d.get('description', ''), 120)}"
+    if ty == "subagent_finished":
+        return "sub", f"⤶ субагент: {d.get('status')}"
+    if ty == "compacted":
+        return "note", f"⇣ история сжата (было ~{d.get('tokens_before')} ток.)"
+    if ty in ("notice", "error"):
+        return ("error" if ty == "error" else "note"), ("! " if ty == "error" else "· ") + str(d.get("message"))
+    if ty == "memory_updated":
+        facts = [x if isinstance(x, str) else x.get("text", "") for x in (d.get("added") or []) + (d.get("updated") or [])]
+        return "note", "✎ фоновая память: " + "; ".join(_short(x, 60) for x in facts)
+    if ty == "run_finished" and not e.get("agent"):
+        u = d.get("usage") or {}
+        dur = (e.get("ts", t0) - t0)
+        return "end", (f"■ {d.get('status')} · {r['steps']} шаг. · {u.get('input_tokens', 0)}→{u.get('output_tokens', 0)}"
+                       f" ток. · ${float(u.get('cost') or 0):.4f} · {dur:.1f} с"
+                       + (f" · {d['error']}" if d.get("error") else ""))
+    return None
+
+
 def timeline(rs: list[dict[str, Any]], *, full: bool = False) -> str:
     """Ход прогонов: шаги, реплики, вызовы с аргументами, результаты, решения человека, итог."""
     out: list[str] = []
@@ -161,54 +220,47 @@ def timeline(rs: list[dict[str, Any]], *, full: bool = False) -> str:
         if r["input"]:
             out.append(f"  человек: {r['input'] if full else _short(r['input'], 300)}")
         for e in r["events"]:
-            d, ty = e.get("data") or {}, e["type"]
+            got = describe(e, r, full=full)
+            if got is None:
+                continue
             pad = "    │ " if e.get("agent") else "  "
             t = f"{e.get('ts', t0) - t0:+7.1f}s"
-            line = None
-            if ty == "usage":
-                line = (f"шаг {d.get('step', 0) + 1} · {d.get('input_tokens', 0)}→{d.get('output_tokens', 0)} ток."
-                        f"{' (кэш ' + str(d['cached_tokens']) + ')' if d.get('cached_tokens') else ''}"
-                        f" · ${float(d.get('cost') or 0):.4f} · {d.get('model', '')}")
-            elif ty == "message" and d.get("content"):
-                line = "агент: " + (d["content"] if full else _short(d["content"], 300))
-            elif ty == "tool_call":
-                line = f"→ {d.get('name')}({_args(d.get('args'), full)})"
-            elif ty == "tool_result":
-                mark = "✗" if d.get("is_error") else "←"
-                body = d.get("content") or ""
-                line = (f"{mark} {d.get('name')} · {d.get('elapsed_ms', 0)} мс · {len(body)} симв.: "
-                        + (body if full else _short(body, 200)))
-            elif ty == "approval_required":
-                line = f"⏸ ждёт подтверждения: {d.get('tool')} {d.get('reason') or ''}".rstrip()
-            elif ty == "approval_resolved":
-                line = "⏵ " + ("истекло" if d.get("expired") else "разрешено" if d.get("approved") else "отклонено")
-            elif ty == "ask_user":
-                line = f"? вопрос человеку: {d.get('question')}"
-            elif ty == "user_message":
-                line = f"человек (на ходу): {_short(d.get('content'), 200)}"
-            elif ty == "todo":
-                todos = d.get("todos") or []
-                done = sum(1 for x in todos if x.get("status") == "completed")
-                line = f"☰ план {done}/{len(todos)}: " + "; ".join(_short(x.get("content", ""), 40) for x in todos)
-            elif ty == "subagent_started":
-                line = f"⤷ субагент {d.get('type')}: {_short(d.get('description', ''), 120)}"
-            elif ty == "subagent_finished":
-                line = f"⤶ субагент: {d.get('status')}"
-            elif ty == "compacted":
-                line = f"⇣ история сжата (было ~{d.get('tokens_before')} ток.)"
-            elif ty in ("notice", "error"):
-                line = ("! " if ty == "error" else "· ") + str(d.get("message"))
-            elif ty == "run_finished" and not e.get("agent"):
-                u = d.get("usage") or {}
-                dur = (e.get("ts", t0) - t0)
-                line = (f"■ {d.get('status')} · {r['steps']} шаг. · {u.get('input_tokens', 0)}→{u.get('output_tokens', 0)}"
-                        f" ток. · ${float(u.get('cost') or 0):.4f} · {dur:.1f} с"
-                        + (f" · {d['error']}" if d.get("error") else ""))
-            if line:
-                for i, part in enumerate(line.splitlines() or [""]):
-                    out.append(f"{t if i == 0 else ' ' * 8} {pad}{part}")
+            for i, part in enumerate(got[1].splitlines() or [""]):
+                out.append(f"{t if i == 0 else ' ' * 8} {pad}{part}")
         out.append("")
     return "\n".join(out)
+
+
+def structured(rs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ход прогонов для интерфейса: строки коротко и целиком (раскрываются по клику)."""
+    out = []
+    for r in rs:
+        items = []
+        for e in r["events"]:
+            short = describe(e, r)
+            if short is None:
+                continue
+            whole = describe(e, r, full=True)
+            items.append({"t": round(e.get("ts", r["ts"]) - r["ts"], 1), "kind": short[0], "sub": bool(e.get("agent")),
+                          "text": short[1], "full": whole[1] if whole and whole[1] != short[1] else None})
+        out.append({k: r.get(k) for k in ("id", "session_id", "ts", "trigger", "model", "input", "status", "steps",
+                                         "cost", "finished")} | {"items": items})
+    return out
+
+
+def turn_of(rs: list[dict[str, Any]], *, run_id: str | None = None, seq: int | None = None) -> list[dict[str, Any]]:
+    """Ход человека, в который входит прогон run_id или сообщение seq; без них — последний."""
+    ts = turns(rs)
+    for t in ts:
+        for r in t:
+            if run_id and r["id"] == run_id:
+                return t
+            if seq is not None and any(e["type"] == "message" and (e.get("data") or {}).get("seq") == seq
+                                       and not e.get("agent") for e in r["events"]):
+                return t
+    if run_id or seq is not None:
+        return []
+    return ts[-1] if ts else []
 
 
 # ── в eval-кейс ───────────────────────────────────────────────────────

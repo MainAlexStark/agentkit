@@ -1221,3 +1221,34 @@ a.link-card .fc-open { opacity: 1; }
   .bulk-row { padding-left: 14px; }
   .tool-row .tr-tags { align-self: flex-start; }
 }
+
+/* ── replay: ход прогона (admin) ── */
+.msg-actions .admin-act { color: var(--faint); }
+.msg-actions .admin-act:hover { color: var(--text); }
+.pv-replay { padding: 12px 14px 32px; display: grid; gap: 12px; align-content: start; }
+.rp-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.rp-bar .grow { flex: 1; }
+.rp-eval { display: grid; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface-2); }
+.rp-eval[hidden] { display: none; }
+.rp-eval .help, .rp-yaml .help { font-size: 12px; color: var(--muted); margin: 0; }
+.rp-eval .err { color: var(--err); font-size: 12.5px; margin: 0; }
+.rp-yaml { display: grid; gap: 8px; }
+.rp-yaml .pv-code { max-height: 360px; overflow: auto; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); }
+.rp-list { display: grid; font-size: 12.5px; }
+.rp-run { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; padding: 10px 0 6px; border-bottom: 1px solid var(--line); margin-bottom: 4px; }
+.rp-run code { font: 11.5px var(--mono); color: var(--muted); }
+.rp-run small { color: var(--muted); margin-left: auto; }
+.rp-item { display: grid; grid-template-columns: 56px 1fr; gap: 8px; padding: 3px 4px; border-radius: 6px; }
+.rp-item.can { cursor: pointer; }
+.rp-item.can:hover { background: var(--surface-2); }
+.rp-item.sub .rp-text { border-left: 2px solid var(--line-2); padding-left: 8px; margin-left: 6px; }
+.rp-t { font: 11px/1.7 var(--mono); color: var(--faint); text-align: right; font-variant-numeric: tabular-nums; }
+.rp-text { white-space: pre-wrap; word-break: break-word; line-height: 1.55; min-width: 0; }
+.rp-item.open .rp-text { font-family: var(--mono); font-size: 11.5px; }
+.rp-item.k-step .rp-text { color: var(--muted); }
+.rp-item.k-call .rp-text { color: var(--accent); }
+.rp-item.k-error .rp-text { color: var(--err); }
+.rp-item.k-wait .rp-text, .rp-item.k-plan .rp-text { color: var(--warn); }
+.rp-item.k-human .rp-text { font-weight: 500; }
+.rp-item.k-end .rp-text { font-weight: 600; padding-top: 4px; }
+.rp-item.k-note .rp-text, .rp-item.k-sub .rp-text { color: var(--text-2); }

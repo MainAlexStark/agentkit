@@ -376,12 +376,20 @@ async function blobURL(path) {
   return u;
 }
 
-function finishBubble(b, text, intermediate = false) {
+function finishBubble(b, text, intermediate = false, seq = null) {
   b.classList.remove("streaming");
   if (intermediate) return; // «Проверю по реестру.» перед действиями — копировать нечего
   const msg = b.parentElement;
   msg.querySelector(".msg-actions")?.remove();
-  msg.append(h("div", { class: "msg-actions" }, copyBtn(() => text), timeEl(b._ts)));
+  // Админу — разбор ответа: ход прогона по журналу и «в eval» (провал из прода → регрессионный кейс).
+  const admin = S.config?.is_admin && seq != null && S.sessionId ? [
+    replayBtn("chart", "Ход прогона", () => openReplay(S.sessionId, seq)),
+    replayBtn("bolt", "В eval-кейс", () => openReplay(S.sessionId, seq, true)),
+  ] : [];
+  msg.append(h("div", { class: "msg-actions" }, copyBtn(() => text), ...admin, timeEl(b._ts)));
+}
+function replayBtn(ic, title, fn) {
+  return h("button", { class: "icon-btn admin-act", title, "aria-label": title, type: "button", onclick: e => { e.stopPropagation(); fn(); } }, icon(ic));
 }
 function assistantBubble(ts = nowTs()) {
   const b = h("div", { class: "md streaming" });
@@ -598,7 +606,7 @@ function onEvent(ev) {
       if (d.content && isNarration(calls)) { S.bubble?.parentElement.remove(); narrate(d.content); }
       else if (d.content) {
         if (!S.bubble) S.bubble = assistantBubble(ev.ts);
-        renderMd(S.bubble, d.content); finishBubble(S.bubble, d.content, !!calls.length);
+        renderMd(S.bubble, d.content); finishBubble(S.bubble, d.content, !!calls.length, d.seq);
       } else S.bubble?.parentElement.remove();
       S.bubble = null; S.bubbleText = "";
       thoughtEnd(S.trace);
@@ -918,7 +926,7 @@ async function openSession(id) {
     if (m.role === "user") userMsg(m.content, m.seq, { ts });
     else if (m.role === "assistant") {
       if (m.content && isNarration(m.tool_calls || [])) narrate(m.content);
-      else if (m.content) { const b = assistantBubble(ts); renderMd(b, m.content); finishBubble(b, m.content, !!m.tool_calls?.length); }
+      else if (m.content) { const b = assistantBubble(ts); renderMd(b, m.content); finishBubble(b, m.content, !!m.tool_calls?.length, m.seq); }
       for (const tc of m.tool_calls || []) stepRow(tc.id, tc.function.name, safeJSON(tc.function.arguments));
     } else if (m.role === "tool") stepResult(m.tool_call_id, m.content, m.meta?.is_error, m.meta?.ui, m.meta?.elapsed_ms);
   }
@@ -2400,6 +2408,86 @@ async function openPreview(f) {
 function closePreview() {
   $("#preview").hidden = true; S.preview = null;
   if (innerWidth <= 960 && $("#tasks").hidden && !$("#sidebar").classList.contains("open")) $("#scrim").hidden = true;
+}
+
+// ── replay: ход прогона и «в eval» (только admin) ───────────────────
+// Панель предпросмотра, а не окно: ход читают рядом с ответом, который разбирают.
+function textDownload(name, text) {
+  const u = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
+  const a = h("a", { href: u, download: name }); document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(u), 1000);
+}
+function pvShow(title, meta, tile) {
+  S.preview = { replay: true };
+  toggleTasks(false);
+  $("#preview").hidden = false;
+  if (innerWidth <= 960) $("#scrim").hidden = false;
+  $("#pv-icon").replaceChildren(h("span", { class: "ftile ft-code" }, tile));
+  $("#pv-name").textContent = title;
+  $("#pv-meta").textContent = meta;
+  const body = $("#pv-body");
+  body.className = "pv-body pv-replay";
+  body.replaceChildren(h("div", { class: "pv-loading" }, h("span", { class: "spin" }), "Открываю…"));
+  return body;
+}
+async function openReplay(sid, seq, toEval = false) {
+  const body = pvShow("Ход прогона", "", "RUN");
+  let data;
+  try { data = await api(`/api/sessions/${sid}/replay?seq=${seq}`); }
+  catch (e) { body.replaceChildren(h("div", { class: "pv-empty" }, h("b", {}, "Не получилось открыть ход"), h("p", {}, e.message))); return; }
+  const runs = data.runs, last = runs[runs.length - 1];
+  const steps = runs.reduce((n, r) => n + r.steps, 0), cost = runs.reduce((n, r) => n + r.cost, 0);
+  $("#pv-meta").textContent = [last.status, `${steps} ${plural(steps, "шаг", "шага", "шагов")}`, `$${cost.toFixed(4)}`, runs[0].model].filter(Boolean).join(" · ");
+  $("#pv-download").onclick = () => textDownload(`${runs[0].id}.txt`, data.text);
+  const evalBox = h("div", { class: "rp-eval", hidden: !toEval });
+  const bar = h("div", { class: "rp-bar" },
+    h("button", { class: "btn sm", type: "button", onclick: e => navigator.clipboard?.writeText(data.text).then(() => { e.target.closest("button").textContent = "Скопировано"; }) }, icon("copy"), "Текстом"),
+    h("button", { class: "btn sm", type: "button", onclick: () => { evalBox.hidden = !evalBox.hidden; if (!evalBox.hidden) evalBox.querySelector("textarea")?.focus(); } }, icon("bolt"), "В eval-кейс"));
+  evalBox.append(...replayEvalForm(sid, seq));
+  const list = h("div", { class: "rp-list" });
+  for (const r of runs) {
+    const when = new Date(r.ts * 1000).toLocaleString();
+    list.append(h("div", { class: "rp-run" },
+      h("b", {}, r.trigger === "approval" ? "Продолжение после подтверждения" : "Прогон"), h("code", {}, r.id),
+      h("small", {}, [when, r.model].filter(Boolean).join(" · "))));
+    if (r.input) list.append(h("div", { class: "rp-item k-human" }, h("span", { class: "rp-t" }, ""), h("div", { class: "rp-text" }, "человек: " + r.input)));
+    for (const it of r.items) {
+      const text = h("div", { class: "rp-text" }, it.text);
+      const row = h("div", { class: `rp-item k-${it.kind}${it.sub ? " sub" : ""}${it.full ? " can" : ""}` },
+        h("span", { class: "rp-t" }, `${it.t >= 0 ? "+" : ""}${it.t.toFixed(1)}s`), text);
+      // Коротко по умолчанию; по клику — аргументы и вывод целиком (как --full в CLI).
+      if (it.full) row.addEventListener("click", () => { const open = row.classList.toggle("open"); text.textContent = open ? it.full : it.text; });
+      list.append(row);
+    }
+  }
+  body.replaceChildren(bar, evalBox, list);
+}
+function replayEvalForm(sid, seq) {
+  const judge = h("textarea", { rows: 3, placeholder: "Каким должен быть правильный ответ. Например: «называет остаток A-15 из реестра, не выдумывает число»" });
+  const cid = h("input", { placeholder: "необязательно, например stock-a15" });
+  const out = h("div", { class: "rp-yaml" });
+  const go = h("button", { class: "btn sm primary", type: "button" }, "Сделать кейсы");
+  go.addEventListener("click", async () => {
+    go.disabled = true;
+    try {
+      const r = await api(`/api/sessions/${sid}/replay/eval`, { method: "POST", body: { seq, judge: judge.value.trim(), case_id: cid.value.trim() } });
+      out.replaceChildren(
+        h("div", { class: "rp-bar" },
+          h("small", { class: "muted" }, `${r.cases.length} ${plural(r.cases.length, "кейс", "кейса", "кейсов")}: проводка (офлайн) и живой`),
+          h("span", { class: "grow" }),
+          h("button", { class: "btn sm", type: "button", onclick: e => navigator.clipboard?.writeText(r.yaml).then(() => { e.target.closest("button").textContent = "Скопировано"; }) }, icon("copy"), "Копировать"),
+          h("button", { class: "btn sm", type: "button", onclick: () => textDownload(r.filename, r.yaml) }, icon("download"), r.filename)),
+        h("pre", { class: "pv-code" }, r.yaml),
+        h("p", { class: "help" }, "Допишите в набор (evals/…yaml) и запустите: agentkit eval … --offline — проводка; живой — на дешёвой модели с --budget."));
+    } catch (e) { out.replaceChildren(h("p", { class: "err" }, e.message)); }
+    go.disabled = false;
+  });
+  return [
+    h("div", { class: "field-row" }, h("label", {}, "Критерий для живого кейса"), judge,
+      h("span", { class: "help" }, "Без критерия живой кейс проверит только вызванные инструменты.")),
+    h("div", { class: "field-row" }, h("label", {}, "Имя кейса"), cid),
+    h("div", {}, go), out,
+  ];
 }
 
 async function previewContent(f, kind) {

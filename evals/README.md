@@ -28,3 +28,4 @@ agentkit eval evals/harness --app agentkit.bench:make_agent --budget 0.5 --basel
 * Кейс проверяет одно свойство харнесса; если упал — по id должно быть понятно, куда смотреть.
 * Ответ должен однозначно проверяться: точные числа, уникальные маркеры (`E-4471`, `DONE-7731`).
 * Провал из прода → `agentkit replay data/agent.db r_… --to-eval evals/harness/regress.yaml --judge "…"`.
+  То же из интерфейса: у ответа (для admin) — «В eval-кейс»: YAML проводки и живого кейса, дописать в набор.

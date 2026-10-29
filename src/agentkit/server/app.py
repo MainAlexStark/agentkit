@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Streamin
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from agentkit import replay as rp
 from agentkit.attachments import UPLOADS, save_upload
 from agentkit.events import EventType
 from agentkit.mcp import MCPAuthRequired, MCPClient, MCPServerConfig
@@ -47,6 +48,13 @@ class NewSession(BaseModel):
     model: str | None = None
     mode: str | None = None
     project_id: str | None = None
+
+
+class ReplayEval(BaseModel):
+    seq: int | None = None
+    run_id: str | None = None
+    judge: str = ""  # критерий живого кейса — каким должен быть правильный ответ
+    case_id: str = ""
 
 
 class PatchSession(BaseModel):
@@ -597,6 +605,38 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
     async def usage(days: int = 30, user: User = Depends(auth)):
         since = time.time() - days * 86400
         return await svc.store.usage_summary(user_id=None if user.has_role("admin") else user.id, since=since)
+
+    # ── replay: ход прогона и «в eval» (только admin) ────────────────
+    # Ход виден по журналу ak_events — то же, что `agentkit replay`, но из ответа в чате: разбирать
+    # «почему агент так сделал» не нужно лезть на сервер за базой. Только admin: в журнале —
+    # полные аргументы и результаты инструментов, в т. ч. чужих разговоров.
+    async def _turn(session_id: str, user: User, seq: int | None, run_id: str | None):
+        require_admin(user)
+        await own_session(session_id, user)
+        evs, msgs = await rp.from_store(svc.store, session_id)
+        turn = rp.turn_of(rp.runs(evs), run_id=run_id, seq=seq)
+        if not turn:
+            raise HTTPException(404, "в журнале нет прогона с этим ответом — возможно, история сжата или откачена")
+        return turn, msgs
+
+    @api.get("/sessions/{session_id}/replay")
+    async def replay_view(session_id: str, seq: int | None = None, run_id: str | None = None,
+                          user: User = Depends(auth)):
+        turn, _ = await _turn(session_id, user, seq, run_id)
+        return {"session_id": session_id, "runs": rp.structured(turn), "text": rp.timeline(turn, full=True)}
+
+    @api.post("/sessions/{session_id}/replay/eval")
+    async def replay_eval(session_id: str, body: ReplayEval, user: User = Depends(auth)):
+        turn, msgs = await _turn(session_id, user, body.seq, body.run_id)
+        ws = svc.agent.workspace_for(session_id) if svc.agent else None
+        try:
+            cases = rp.to_cases(turn, case_id=body.case_id or None, judge=body.judge or None, messages=msgs,
+                                workspace=ws if ws and ws.is_dir() else None)
+        except SystemExit as e:  # to_cases пишет для CLI: ошибка — текст для человека
+            raise HTTPException(400, str(e)) from None
+        name = f"{cases[0]['id'].removesuffix('-wiring')}.yaml"
+        return {"cases": cases, "yaml": rp.dump_cases(cases, f"{svc.settings.name}, разговор {session_id}"),
+                "filename": name}
 
     # ── расписание ───────────────────────────────────────────────────
     @api.get("/schedules")
