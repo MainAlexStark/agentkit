@@ -59,14 +59,31 @@ class Egress:
         self.token = token
         self.log = log or (lambda m: print(f"egress: {m}", file=sys.stderr, flush=True))
 
-    async def _resolve(self, host: str, port: int) -> str:
+    async def _resolve(self, host: str, port: int) -> list[str]:
         infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        ips = [i[4][0] for i in infos]
+        ips = list(dict.fromkeys(i[4][0] for i in infos))
         if not ips:
             raise OSError("адрес не найден")
         if self.block_private and not all(public(ip) for ip in ips):
             raise PermissionError(f"{host} ведёт во внутреннюю сеть")
-        return ips[0]
+        return ips
+
+    async def _connect(self, ips: list[str], port: int, timeout: float = 20):
+        """По очереди ко всем проверенным адресам, а не только к первому.
+
+        Первым часто приходит IPv6 (localhost → ::1, у pypi.org есть AAAA), а в контейнере
+        без IPv6 или у сервера только на 127.0.0.1 он не отвечает — и egress отдавал 502, хотя
+        IPv4-адрес рядом рабочий (так падал CI: test_egress_proxy_forwards_allowed_and_blocks_rest).
+        Подключаемся только к адресам из той же проверки — DNS-rebinding по-прежнему закрыт.
+        """
+        last: Exception | None = None
+        for ip in ips:
+            try:
+                return await asyncio.wait_for(asyncio.open_connection(ip, port), timeout)
+            except (TimeoutError, OSError) as e:
+                last = e
+        assert last is not None
+        raise last
 
     async def _deny(self, w: asyncio.StreamWriter, code: int, text: str) -> None:
         body = (text + "\n").encode()
@@ -105,8 +122,7 @@ class Egress:
         if port not in self.ports:
             return await self._deny(w, 403, f"egress: порт {port} закрыт (разрешены {sorted(self.ports)})")
         try:
-            ip = await self._resolve(host, port)
-            ur, uw = await asyncio.wait_for(asyncio.open_connection(ip, port), 20)
+            ur, uw = await self._connect(await self._resolve(host, port), port)
         except PermissionError as e:
             self.log(f"запрещено {e}")
             return await self._deny(w, 403, f"egress: {e}")

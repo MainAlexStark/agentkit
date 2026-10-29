@@ -477,3 +477,26 @@ def test_installer_caches_not_listed_as_results(tmp_path):
     r = execute(tmp_path, "s_1", "bash", code, 30)
     assert sorted(f["path"] for f in r["files"]) == ["cache.txt", "result.txt"]
     assert (tmp_path / "s_1" / "cache.txt").read_text().strip().endswith(".cache/pip")
+
+
+async def test_egress_tries_next_address_when_first_refuses():
+    async def upstream(r, w):
+        await r.readuntil(b"\r\n\r\n")
+        w.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        await w.drain()
+        w.close()
+
+    up = await asyncio.start_server(upstream, "127.0.0.1", 0)
+    up_port = up.sockets[0].getsockname()[1]
+    eg = Egress(["localhost"], ports={up_port}, block_private=False, log=lambda m: None)
+
+    async def resolve(host, port):  # как на раннере GitHub: сначала ::1, где никто не слушает
+        return ["::1", "127.0.0.1"]
+
+    eg._resolve = resolve
+    srv = await asyncio.start_server(eg.handle, "127.0.0.1", 0)
+    port = srv.sockets[0].getsockname()[1]
+    ok = await _http_get(port, f"http://localhost:{up_port}/", f"localhost:{up_port}")
+    assert ok.startswith(b"HTTP/1.1 200") and ok.endswith(b"ok")
+    srv.close()
+    up.close()
