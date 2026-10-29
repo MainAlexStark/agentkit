@@ -45,7 +45,7 @@ from agentkit.memory_auto import extract as auto_memory_extract
 from agentkit.messages import Message, ToolCall, Usage, new_id
 from agentkit.permissions import Decision, Mode, Permissions
 from agentkit.redact import DEFAULT as DEFAULT_REDACTOR
-from agentkit.redact import MARKER, Redactor, contains_marker
+from agentkit.redact import MARKER, Redactor, StreamRedactor, contains_marker
 from agentkit.skills import SkillLibrary
 from agentkit.store.base import ApprovalRec, Store
 from agentkit.tools.base import Tool, ToolArgsError, ToolContext, ToolDenied, ToolResult, User
@@ -552,15 +552,28 @@ class Agent:
                 await emit(Event(EventType.NOTICE, {"message": text}))
 
             resp = None
+            # Куски маскируются потоком: секрет, разрезанный между кусками, по отдельности ни один
+            # шаблон не узнаёт — в живом UI он мелькал, хотя в базе был скрыт (см. StreamRedactor).
+            streams = {EventType.TEXT_DELTA: StreamRedactor(self.redactor),
+                       EventType.THINKING_DELTA: StreamRedactor(self.redactor)}
+
+            async def delta(kind: EventType, text: str, *, final: bool = False, streams=streams) -> None:
+                out = streams[kind].flush() if final else streams[kind].push(text)
+                if out:
+                    await emit(Event(kind, {"text": out}))
+
             async for ch in self.router.stream(req, on_notice=notice):
                 if cancel.is_set():
                     break
                 if ch.kind == "text":
-                    await emit(Event(EventType.TEXT_DELTA, {"text": ch.text}))
+                    await delta(EventType.THINKING_DELTA, "", final=True)  # рассуждение кончилось — его хвост раньше ответа
+                    await delta(EventType.TEXT_DELTA, ch.text)
                 elif ch.kind == "thinking":
-                    await emit(Event(EventType.THINKING_DELTA, {"text": ch.text}))
+                    await delta(EventType.THINKING_DELTA, ch.text)
                 elif ch.kind == "done":
                     resp = ch.response
+            for kind in streams:
+                await delta(kind, "", final=True)
             if resp is None:
                 return RunStatus.CANCELLED
 

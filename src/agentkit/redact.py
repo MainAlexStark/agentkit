@@ -191,6 +191,72 @@ class Redactor:
         return v
 
 
+_PEM_END = re.compile(r"-----END [A-Z0-9 ]*-----")
+
+
+class StreamRedactor:
+    """Маскирование потока кусков текста (`text_delta`), где секрет может прийти по частям.
+
+    Каждый кусок по отдельности не маскируется: «sk-or-v1-» в одном куске и остаток
+    ключа в следующем ни один шаблон не узнаёт — в живом UI ключ мелькал целиком,
+    хотя в базе и итоговом сообщении был скрыт. Поэтому придерживается хвост, который
+    ещё может оказаться началом секрета: последнее «слово» без пробелов (ключи, токены,
+    пароль в URL — без пробелов) и незакрытый блок PEM. Пробел или перевод строки
+    завершают слово — тогда шаблоны решают окончательно, и текст уходит дальше.
+
+    Шаблоны с префиксом («PASSWORD = …», «Bearer …») видят начало строки: маскируется
+    кусок вместе с контекстом — хвостом уже отданной строки, — а наружу уходит только
+    новая часть.
+    """
+
+    CONTEXT = 200   # сколько уже отданного текста строки видят шаблоны с префиксом
+    HOLD_MAX = 400  # слово длиннее — не секрет (base64-картинка, длинный код): отдаём, чтобы стрим не вставал
+    PEM_MAX = 8000
+
+    def __init__(self, redactor: Redactor):
+        self.r = redactor
+        self._pending = ""  # пришло, но ещё не отдано
+        self._ctx = ""      # хвост отданной строки (сырой) — контекст для шаблонов
+
+    def push(self, chunk: str) -> str:
+        """Добавить кусок; вернуть то, что уже можно показать (может быть пусто)."""
+        self._pending += chunk
+        return self._settle(self._cut())
+
+    def flush(self) -> str:
+        """Конец потока: отдать всё, что придерживалось."""
+        return self._settle(len(self._pending))
+
+    def _cut(self) -> int:
+        p = self._pending
+        ws = max(p.rfind(" "), p.rfind("\n"), p.rfind("\t"))
+        cut = ws + 1
+        if len(p) - cut > self.HOLD_MAX:
+            cut = len(p)
+        pem = p.rfind("-----BEGIN ")
+        if pem != -1 and len(p) - pem < self.PEM_MAX:
+            # Ключ PEM многострочный: держим весь блок до END, и END целиком — в одном куске с BEGIN.
+            end = _PEM_END.search(p, pem)
+            cut = pem if end is None else max(cut, end.end())
+        return cut
+
+    def _settle(self, cut: int) -> str:
+        if cut <= 0:
+            return ""
+        part, self._pending = self._pending[:cut], self._pending[cut:]
+        ctx = self._ctx
+        whole, ctx_red = self.r.text(ctx + part), self.r.text(ctx)
+        # Контекст уже отдан; если его маскирование не изменилось — отдаём только новое.
+        out = whole[len(ctx_red):] if whole.startswith(ctx_red) else self.r.text(part)
+        tail = (ctx + part).rsplit("\n", 1)[-1]
+        if len(tail) > self.CONTEXT:
+            tail = tail[-self.CONTEXT:]
+            sp = tail.find(" ")
+            tail = tail[sp + 1:] if sp != -1 else ""  # не начинать контекст с середины слова
+        self._ctx = tail
+        return out
+
+
 def contains_marker(v: Any) -> bool:
     if isinstance(v, str):
         return MARKER in v

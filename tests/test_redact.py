@@ -128,3 +128,45 @@ def test_settings_secret_env():
     r = Redactor(patterns=False, env=s.secret_env())
     assert MARKER in r.text("or-key-123456789") and MARKER in r.text("tok-abcdef123456")
     assert r.text("Агент alex admin") == "Агент alex admin"
+
+
+def test_stream_redactor_secret_split_between_chunks():
+    """Секрет, разрезанный между кусками стрима, не показывается ни в одном куске."""
+    from agentkit.redact import StreamRedactor
+
+    r = Redactor(env={"SERVICE_KEY": "svc-key-0000-1111"})
+    text = (f"ключ {OR_KEY}, PASSWORD = Xy7secretValue99, Bearer abcdefghijklmnop1234, svc-key-0000-1111.\n"
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----\n"
+            f"url https://u:pa55word@h/x и {GH}")
+    for size in (1, 2, 5, 16, 1000):
+        s, out = StreamRedactor(r), ""
+        for i in range(0, len(text), size):
+            piece = s.push(text[i:i + size])
+            for bad in ("3f9a3f9a", "Xy7secret", "MIIabc", "svc-key-0000", "pa55", "Ab3Ab3Ab3"):
+                assert bad not in piece, (size, piece)
+            out += piece
+        out += s.flush()
+        assert out == r.text(text)  # склеенный поток = маскирование целого текста
+
+
+def test_stream_redactor_does_not_stall():
+    """Обычный текст идёт сразу по словам; длинное «слово» без пробелов (base64) стрим не останавливает."""
+    from agentkit.redact import StreamRedactor
+
+    s = StreamRedactor(Redactor(env={}))
+    assert s.push("Привет, как ") == "Привет, как "
+    assert s.push("дела") == ""  # слово ещё может продолжиться
+    assert s.push("?\n") == "дела?\n"
+    assert s.push("x" * 1000) == "x" * 1000
+
+
+async def test_streamed_deltas_hide_split_secret(store, user):
+    fake = FakeLLM([f"Ваш ключ: {OR_KEY} — не публикуйте его."])  # FakeLLM режет текст по 16 символов
+    agent = make_agent(store, fake)
+    s = await store.create_session(user.id)
+    evs = await collect(agent.run(s.id, user, "покажи ключ"))
+    deltas = [e.data["text"] for e in evs if str(e.type) == "text_delta"]
+    assert len(deltas) > 1
+    for d in deltas:
+        assert "3f9a3f9a" not in d and "sk-or-v1-" not in d
+    assert "".join(deltas) == f"Ваш ключ: {MARKER}: openrouter-key] — не публикуйте его."
