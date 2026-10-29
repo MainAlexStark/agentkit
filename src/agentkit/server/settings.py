@@ -19,7 +19,12 @@ class Settings(BaseSettings):
     # Подписка по умолчанию (меню пользователя → «Подписка»). Настоящий биллинг —
     # Domain.plan в проекте (ЮKassa и т. п., как в OpenSeller).
     plan_name: str = ""
-    monthly_budget_usd: float = 0  # 0 — без лимита; иначе полоса расхода в «Подписке»
+    # Лимиты расходов на пользователя, $ (0 — без лимита). Месяц — календарный, день — с 00:00
+    # по AGENT_TZ. Исчерпан — новые сообщения не принимаются (402), идущий прогон останавливается
+    # перед следующим запросом к модели. Domain.plan может задать свои limit_usd / daily_limit_usd.
+    monthly_budget_usd: float = 0
+    daily_budget_usd: float = 0
+    budget_exempt_roles: str = "admin"  # кого лимиты не касаются, через запятую; пусто — всех касаются
     billing_url: str = ""  # «Управлять подпиской» — страница оплаты хост-приложения
     help_url: str = ""  # пункт «Помощь» в меню пользователя
     public_url: str = "http://localhost:8080"

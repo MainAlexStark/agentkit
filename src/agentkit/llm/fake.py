@@ -1,7 +1,7 @@
 """Сценарная модель для тестов и офлайн-evals.
 
 Отвечает заранее заданными ответами по очереди. Ответ — строка (просто текст)
-или dict {"text": …, "tool_calls": [(имя, аргументы), …]}, или функция от
+или dict {"text": …, "tool_calls": [(имя, аргументы), …], "cost": $}, или функция от
 запроса — для ответов, зависящих от истории.
 """
 
@@ -18,8 +18,10 @@ Script = str | dict[str, Any] | Callable[[LLMRequest], "str | dict[str, Any]"]
 
 
 class FakeLLM:
-    def __init__(self, script: list[Script] | None = None, name: str = "fake", default: str | None = "Готово."):
+    def __init__(self, script: list[Script] | None = None, name: str = "fake", default: str | None = "Готово.",
+                 cost: float = 0.0):
         self.name = name
+        self.cost = cost  # $ за каждый ответ (у ответа-словаря — свой "cost"): тесты лимитов расходов
         self.script = list(script or [])
         self.default = default
         self.requests: list[LLMRequest] = []
@@ -49,7 +51,8 @@ class FakeLLM:
         calls = [
             ToolCall(id=new_id("call_"), name=n, arguments=a) for n, a in item.get("tool_calls", [])
         ]
-        usage = Usage(input_tokens=sum(len(m.text) for m in req.messages) // 4, output_tokens=len(text) // 4)
+        usage = Usage(input_tokens=sum(len(m.text) for m in req.messages) // 4, output_tokens=len(text) // 4,
+                      cost=float(item.get("cost", self.cost)))
         yield StreamChunk(
             "done",
             response=LLMResponse(

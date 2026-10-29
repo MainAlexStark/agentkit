@@ -32,7 +32,7 @@ from agentkit.scheduler import next_run, validate_cron
 from agentkit.server.auth import require_admin
 from agentkit.server.platform_api import register as register_platform
 from agentkit.server.preview import register as register_preview
-from agentkit.server.service import MCP_NAME, AgentService
+from agentkit.server.service import MCP_NAME, AgentService, BudgetExceeded
 from agentkit.skills import skill_problem
 from agentkit.store.base import ScheduleRec
 from agentkit.tools.base import User
@@ -202,19 +202,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
 
     @api.get("/plan")
     async def plan(user: User = Depends(auth)):
-        now = time.localtime()
-        month_start = time.mktime((now.tm_year, now.tm_mon, 1, 0, 0, 0, 0, 0, -1))
-        usage = await svc.store.usage_summary(user_id=user.id, since=month_start)
-        s = svc.settings
-        info: dict[str, Any] = {"name": s.plan_name or "Без ограничений", "status": "active",
-                                "limit_usd": s.monthly_budget_usd or None, "manage_url": s.billing_url or None,
-                                "features": []}
-        if svc.domain.plan is not None:
-            res = svc.domain.plan(user, usage)
-            if hasattr(res, "__await__"):
-                res = await res
-            info.update(res or {})
-        return {**info, "usage": usage, "period_start": month_start}
+        return {**await svc.plan_info(user), "blocked": await svc.over_budget(user)}
 
     @api.get("/config")
     async def config(user: User = Depends(auth)):
@@ -329,6 +317,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         content = _content(session_id, body)
         if not content:
             raise HTTPException(400, "пустое сообщение")
+        await svc.check_budget(user)
         return await svc.send(session_id, user, content, model=model, mode=mode)
 
     @api.post("/sessions/{session_id}/cancel")
@@ -392,6 +381,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
             sid = (await svc.store.create_session(user.id, title=body.text[:80])).id
         mode = _check_mode(body.mode, user)
         model = await svc.check_model(body.model)
+        await svc.check_budget(user)
         try:
             # Через RunManager, а не напрямую: прогон виден в веб-чате, его можно
             # остановить, и второй запрос в ту же сессию получит 409, а не гонку.
@@ -873,6 +863,12 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         return HTMLResponse(text, headers={"Cache-Control": "no-cache"})
 
     app.mount("/static", _RevalidatedStatic(directory=static), name="static")
+
+    @app.exception_handler(BudgetExceeded)
+    async def budget_exceeded(_, exc: BudgetExceeded):
+        # 402, а не 400/429: это не ошибка запроса и не «повторите через секунду» — хост-приложение
+        # по этому коду может сразу показать оплату.
+        return JSONResponse({"detail": str(exc)}, status_code=402)
 
     @app.exception_handler(ValueError)
     async def value_error(_, exc: ValueError):

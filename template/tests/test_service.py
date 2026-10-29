@@ -476,3 +476,54 @@ def test_skills_crud(client):
     assert client.delete("/api/skills/weekly-review", headers=H).status_code == 409
     assert client.delete("/api/skills/mail-sum", headers=H).status_code == 200
     assert [k["name"] for k in client.get("/api/skills", headers=H).json()["skills"]] == ["weekly-review"]
+
+
+@pytest.fixture
+def limited(tmp_path):
+    # Дневной лимит $1, каждый ответ модели — $0.6; admin (alex) лимитом не ограничен.
+    fake = FakeLLM(default="ok", cost=0.6)
+    settings = Settings(data_dir=tmp_path, database_url=f"sqlite:///{tmp_path}/a.db", tokens="alex:t-alex:admin,bob:t-bob:",
+                        mcp_config=tmp_path / "none.json", scheduler=False, daily_budget_usd=1.0, monthly_budget_usd=50)
+    router = ModelRouter(providers={"fake": fake}, roles={"main": "fake:m", "small": "fake:s"},
+                         retry=RetryPolicy(attempts=1))
+    svc = AgentService(settings, build_domain(settings), router=router)
+    with TestClient(build_app(svc)) as c:
+        c.fake = fake
+        yield c
+
+
+def test_daily_budget(limited):
+    c, bob = limited, {"Authorization": "Bearer t-bob"}
+    sid = c.post("/api/sessions", json={}, headers=bob).json()["id"]
+    c.post(f"/api/sessions/{sid}/messages", json={"text": "раз"}, headers=bob)
+    wait_idle(c, sid, bob)
+    plan = c.get("/api/plan", headers=bob).json()
+    assert plan["usage_today"]["cost"] == 0.6 and plan["daily_limit_usd"] == 1.0 and plan["blocked"] is None
+
+    # $0.6 < $1 — сообщение принято; первый шаг доводит до $1.2, второй уже не начинается.
+    c.fake.push({"tool_calls": [("notes_search", {"query": "x"})]}, "не должно дойти")
+    c.post(f"/api/sessions/{sid}/messages", json={"text": "два"}, headers=bob)
+    wait_idle(c, sid, bob)
+    evs = c.get(f"/api/sessions/{sid}/poll?after=0", headers=bob).json()["events"]
+    assert [e["data"]["status"] for e in evs if e["type"] == "run_finished"][-1] == "budget"
+    assert any(e["type"] == "error" and "Дневной лимит" in e["data"]["message"] for e in evs)
+    assert c.fake.script == ["не должно дойти"]
+
+    r = c.post(f"/api/sessions/{sid}/messages", json={"text": "три"}, headers=bob)
+    assert r.status_code == 402 and "Дневной лимит расходов исчерпан: $1.20 из $1.00" in r.json()["detail"]
+    assert c.post("/api/run", json={"text": "фоном"}, headers=bob).status_code == 402
+    assert "Дневной лимит" in c.get("/api/plan", headers=bob).json()["blocked"]
+
+    # Лимит — на человека: admin работает дальше.
+    sid2 = c.post("/api/sessions", json={}, headers=H).json()["id"]
+    c.fake.script.clear()
+    assert c.post(f"/api/sessions/{sid2}/messages", json={"text": "можно?"}, headers=H).status_code == 200
+    wait_idle(c, sid2)
+    assert c.get("/api/plan", headers=H).json()["exempt"] is True
+
+
+def test_period_starts_use_service_tz():
+    # День и месяц — по AGENT_TZ, а не по часам контейнера (там UTC).
+    s = Settings(tz="Europe/Moscow")
+    day, month = AgentService(s, build_domain(s)).period_starts(1_767_301_200 + 60)  # 02.01.2026 00:01 МСК
+    assert day == 1_767_301_200 and month == 1_767_214_800

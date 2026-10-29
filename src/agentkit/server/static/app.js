@@ -623,6 +623,7 @@ function onEvent(ev) {
       if (st !== "waiting_approval") flushFiles({ open: st === "done" });
       if (st === "max_steps") note("Достигнут лимит шагов — напишите «продолжай»");
       else if (st === "cancelled") note("Остановлено");
+      // budget: причину уже показало событие error (сколько потрачено и когда можно продолжить)
       else if (st === "error" && d.error) alertMsg(d.error);
       loadSessions();
       break;
@@ -2667,8 +2668,15 @@ const tabs = {
     const p = await api("/api/plan");
     const spent = p.usage?.cost || 0;
     const limit = p.limit_usd;
-    const pct = limit ? Math.min(100, (spent / limit) * 100) : 0;
     const month = new Date(p.period_start * 1000).toLocaleDateString("ru-RU", { month: "long" });
+    // Полоса расхода: до 80% — обычная, дальше — предупреждение, на лимите — красная.
+    const meter = (spent, limit) => {
+      const pct = Math.min(100, (spent / limit) * 100);
+      return h("div", { class: "meter" + (pct >= 100 ? " over" : pct >= 80 ? " warn" : "") }, h("i", { style: `width:${pct}%` }));
+    };
+    const amount = (spent, limit) => h("div", { style: "display:flex;justify-content:space-between;font-size:13px" },
+      h("span", {}, `$${spent.toFixed(2)}`), h("span", { class: "muted" }, limit ? `из $${Number(limit).toFixed(2)}` : "без лимита"));
+    const today = p.usage_today?.cost || 0;
     body.append(
       h("div", { class: "plan-card" },
         h("div", { class: "muted", style: "font-size:12px" }, "Текущий тариф"),
@@ -2676,11 +2684,11 @@ const tabs = {
         p.renews_at ? h("div", { class: "muted" }, "Продлится " + new Date(p.renews_at * 1000).toLocaleDateString("ru-RU")) : null,
         p.features?.length ? h("ul", {}, p.features.map(f => h("li", {}, f))) : null,
         p.manage_url ? h("div", {}, h("a", { class: "btn primary", href: p.manage_url, target: "_blank", rel: "noopener" }, "Управлять подпиской")) : null),
-      group(`Расход за ${month}`, null,
-        h("div", { style: "display:flex;justify-content:space-between;font-size:13px" }, h("span", {}, `$${spent.toFixed(2)}`),
-          h("span", { class: "muted" }, limit ? `из $${Number(limit).toFixed(2)}` : "без лимита")),
-        limit ? h("div", { class: "meter" + (pct >= 100 ? " over" : pct >= 80 ? " warn" : "") }, h("i", { style: `width:${pct}%` })) : null,
-        h("div", { class: "muted", style: "font-size:12.5px" }, `${p.usage?.runs || 0} ${plural(p.usage?.runs || 0, "запуск", "запуска", "запусков")} агента`)));
+      p.blocked ? h("div", { class: "alert" }, p.blocked) : null,
+      group(`Расход за ${month}`, null, amount(spent, limit), limit ? meter(spent, limit) : null,
+        h("div", { class: "muted", style: "font-size:12.5px" }, `${p.usage?.runs || 0} ${plural(p.usage?.runs || 0, "запуск", "запуска", "запусков")} агента`)),
+      p.daily_limit_usd ? group("Расход сегодня", null, amount(today, p.daily_limit_usd), meter(today, p.daily_limit_usd)) : null,
+      p.exempt && (limit || p.daily_limit_usd) ? h("div", { class: "muted", style: "font-size:12.5px" }, "Лимиты на вас не действуют (роль администратора)") : null);
   },
   async account(body) {
     const sessions = S.sessions.length;

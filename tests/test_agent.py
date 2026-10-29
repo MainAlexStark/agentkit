@@ -403,3 +403,58 @@ async def test_subagent_sees_parent_workspace(store, user, tmp_path):
     (ws(s.id) / "http.py").write_text("TIMEOUT = 17.5\n")
     evs = await collect(agent.run(s.id, user, "найди"))
     assert "нашёл: http.py" in [e.data.get("content") for e in evs if str(e.type) == "message"][-1]
+
+
+async def test_budget_stops_before_next_model_call(store, user):
+    # Лимит — между шагами: вызов уже сделан и закрыт результатом, следующий запрос к модели не идёт.
+    CALLS.clear()
+    spent = {"n": 0}
+
+    async def budget(u):
+        return "лимит исчерпан" if spent["n"] >= 1 else None
+
+    fake = FakeLLM([{"tool_calls": [("lookup", {"key": "a"})], "cost": 0.5}, "не должно дойти"])
+    agent = make_agent(store, fake, tools=ToolRegistry([lookup]), budget=budget)
+    s = await store.create_session(user.id)
+
+    orig = agent.store.update_run
+
+    async def track(run_id, **f):  # расход в базе — на каждом шаге, а не только в конце
+        if "usage" in f and f["usage"]["cost"]:
+            spent["n"] += 1
+        await orig(run_id, **f)
+
+    agent.store.update_run = track
+    evs = await collect(agent.run(s.id, user, "посмотри"))
+    assert status(evs) == "budget"
+    assert len(fake.requests) == 1
+    assert "tool_result" in types(evs)
+    assert any(e.data.get("message") == "лимит исчерпан" for e in evs if str(e.type) == "error")
+    run = await store.get_run(evs[0].run_id)
+    assert run.usage["cost"] == 0.5
+
+
+async def test_budget_check_failure_does_not_stop_run(store, user):
+    async def broken(u):
+        raise RuntimeError("база недоступна")
+
+    agent = make_agent(store, FakeLLM(["ок"]), budget=broken)
+    s = await store.create_session(user.id)
+    assert status(await collect(agent.run(s.id, user, "привет"))) == "done"
+
+
+async def test_usage_summary_counts_subagent_once(store, user):
+    # Расход субагента входит в прогон родителя; его собственный прогон в сводке — второй раз.
+    from agentkit import DEFAULT_SUBAGENTS, standard_tools, task_tool
+
+    fake = FakeLLM([
+        {"tool_calls": [("task", {"agent_type": "general", "description": "x", "prompt": "сделай"})], "cost": 1.0},
+        {"text": "сделал", "cost": 2.0},
+        {"text": "готово", "cost": 4.0},
+    ])
+    agent = make_agent(store, fake, tools=standard_tools(subagents=False, extra=[task_tool(DEFAULT_SUBAGENTS)]),
+                       subagents=DEFAULT_SUBAGENTS)
+    s = await store.create_session(user.id)
+    assert status(await collect(agent.run(s.id, user, "поручи"))) == "done"
+    assert (await store.usage_summary(user_id=user.id))["cost"] == 7.0
+    assert (await store.usage_summary())["cost"] == 7.0

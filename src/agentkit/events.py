@@ -42,6 +42,7 @@ class RunStatus(StrEnum):
     CANCELLED = "cancelled"
     ERROR = "error"
     MAX_STEPS = "max_steps"
+    BUDGET = "budget"  # лимит расходов пользователя исчерпан — новые шаги не начинаются
 
 
 @dataclass

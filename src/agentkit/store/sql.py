@@ -659,9 +659,12 @@ class SQLStore(Store):
             await c.execute(delete(schedules).where(schedules.c.id == schedule_id))
 
     async def usage_summary(self, *, user_id=None, since=0):
-        q = select(runs.c.usage, runs.c.model).where(runs.c.started_at >= since)
+        # Без прогонов субагентов: их расход уже входит в прогон родителя (события usage
+        # пробрасываются наверх), и с ними сводка и лимит считали субагента дважды.
+        q = (select(runs.c.usage, runs.c.model).join(sessions, sessions.c.id == runs.c.session_id)
+             .where(runs.c.started_at >= since, sessions.c.parent_id.is_(None)))
         if user_id:
-            q = q.join(sessions, sessions.c.id == runs.c.session_id).where(sessions.c.user_id == user_id)
+            q = q.where(sessions.c.user_id == user_id)
         total: dict[str, float] = {"runs": 0, "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "cost": 0.0}
         by_model: dict[str, float] = {}
         async with self._connect() as c:

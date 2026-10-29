@@ -13,10 +13,13 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from agentkit.agent import Agent, AgentConfig, AgentSpec, RunOutcome
 from agentkit.builder import make_router, standard_tools
@@ -98,10 +101,15 @@ class Domain:
     description: str = ""
     suggestions: list[str] = field(default_factory=list)
     # Подписка пользователя: (user, расход за месяц) → {"name", "status", "renews_at", "limit_usd",
-    # "features": [...], "manage_url"}. None — из настроек AGENT_PLAN_NAME / AGENT_MONTHLY_BUDGET_USD.
+    # "daily_limit_usd", "features": [...], "manage_url"}. None — из настроек AGENT_PLAN_NAME /
+    # AGENT_MONTHLY_BUDGET_USD / AGENT_DAILY_BUDGET_USD. Лимиты отсюда же и применяются (0/None — без лимита).
     plan: Callable[[User, dict[str, Any]], Any] | None = None
     # Вызывается после старта: подключить БД хоста, прогреть кэш и т. п.
     on_start: Callable[[AgentService], Any] | None = None
+
+
+class BudgetExceeded(Exception):
+    """Лимит расходов пользователя исчерпан — новое сообщение не принимается (HTTP 402)."""
 
 
 class AgentService:
@@ -199,6 +207,7 @@ class AgentService:
         else:
             self.catalog.router = self.agent.router
         self.agent.vision_for = self.catalog.vision
+        self.agent.budget = self.over_budget
         log.info("агент готов: %d инструментов (MCP: %s)", len(self.registry),
                  ", ".join(f"{k}={'ok' if v.ok else 'ошибка'}" for k, v in self.mcp.status.items()) or "нет")
 
@@ -323,6 +332,59 @@ class AgentService:
         if provider not in self.agent.router.providers or not self.model_allowed(mid, await self.model_policy()):
             raise ValueError(f"модель {model} недоступна — выберите другую в списке моделей")
         return model
+
+    # ── подписка и лимиты расходов ───────────────────────────────────
+    def period_starts(self, now: float | None = None) -> tuple[float, float]:
+        """Начало дня и месяца в часовом поясе сервиса (AGENT_TZ), а не машины: в контейнере
+        локальное время — UTC, и «день» москвича кончался бы в 03:00."""
+        t = datetime.fromtimestamp(now if now is not None else time.time(), ZoneInfo(self.settings.tz))
+        day = t.replace(hour=0, minute=0, second=0, microsecond=0)
+        return day.timestamp(), day.replace(day=1).timestamp()
+
+    async def plan_info(self, user: User) -> dict[str, Any]:
+        """Тариф, лимиты и расход за месяц и за сегодня — для «Подписки» и проверки лимита."""
+        s = self.settings
+        day_start, month_start = self.period_starts()
+        usage = await self.store.usage_summary(user_id=user.id, since=month_start)
+        today = await self.store.usage_summary(user_id=user.id, since=day_start)
+        info: dict[str, Any] = {"name": s.plan_name or "Без ограничений", "status": "active",
+                                "limit_usd": s.monthly_budget_usd or None,
+                                "daily_limit_usd": s.daily_budget_usd or None,
+                                "manage_url": s.billing_url or None, "features": []}
+        if self.domain.plan is not None:
+            res = self.domain.plan(user, usage)
+            if hasattr(res, "__await__"):
+                res = await res
+            info.update(res or {})
+        exempt = {r.strip() for r in s.budget_exempt_roles.split(",") if r.strip()}
+        return {**info, "usage": usage, "usage_today": today, "period_start": month_start, "day_start": day_start,
+                "exempt": any(user.has_role(r) for r in exempt)}
+
+    async def over_budget(self, user: User) -> str | None:
+        """Почему пользователю больше нельзя тратить, или None.
+
+        Проверяется до прогона (сообщение не принимается) и перед каждым шагом модели. Два
+        прогона одного человека могут оба пройти проверку и сделать ещё по шагу — перерасход
+        не больше шага на прогон; ради точной отсечки пришлось бы резервировать деньги до ответа
+        модели, а его цену заранее не знает никто.
+        """
+        p = await self.plan_info(user)
+        if p["exempt"]:
+            return None
+        month, day = p["usage"]["cost"], p["usage_today"]["cost"]
+        if (lim := p.get("limit_usd")) and month >= lim:
+            tail = f" или продлите подписку: {p['manage_url']}" if p.get("manage_url") else \
+                " или попросите администратора поднять лимит (AGENT_MONTHLY_BUDGET_USD)"
+            return f"Месячный лимит расходов исчерпан: ${month:.2f} из ${lim:.2f}. Продолжить можно с 1-го числа{tail}."
+        if (lim := p.get("daily_limit_usd")) and day >= lim:
+            return (f"Дневной лимит расходов исчерпан: ${day:.2f} из ${lim:.2f}. Продолжить можно завтра "
+                    f"(после 00:00, {self.settings.tz}) или попросите администратора поднять лимит "
+                    "(AGENT_DAILY_BUDGET_USD).")
+        return None
+
+    async def check_budget(self, user: User) -> None:
+        if why := await self.over_budget(user):
+            raise BudgetExceeded(why)
 
     def user_for(self, user_id: str) -> User:
         for u in self.auth.users.values():

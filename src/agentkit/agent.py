@@ -97,6 +97,9 @@ class TurnContext:
 
 
 ContextProvider = Callable[[User, str], Awaitable["TurnContext | str | None"]]
+# Лимит расходов: None — можно тратить дальше, строка — почему нельзя (её увидит человек).
+# Сам лимит и расход считает хост (у сервиса — по базе): ядро не знает ни тарифов, ни периодов.
+BudgetCheck = Callable[[User], Awaitable["str | None"]]
 
 
 @dataclass
@@ -128,8 +131,10 @@ class Agent:
         memory_scopes: Callable[[User], list[str]] | None = None,
         tracers: list[Any] | None = None,
         can_ask: bool = True,
+        budget: BudgetCheck | None = None,
     ):
         self.router = router
+        self.budget = budget
         self.store = store
         self.tools = tools or ToolRegistry()
         self.spec = spec or AgentSpec()
@@ -334,6 +339,10 @@ class Agent:
                 # Расход субагентов входит в стоимость прогона, шаги — только свои.
                 usage.add(Usage(**{k: v for k, v in ev.data.items() if k in Usage.__dataclass_fields__}))
                 steps += 0 if ev.agent else 1
+                # Расход — в базу на каждом шаге, а не только в конце: иначе лимит не видел бы
+                # идущих прогонов (часовая задача или пять параллельных разговоров тратили бы
+                # «бесплатно» до самого конца), а упавший процесс терял бы потраченное.
+                await self.store.update_run(run.id, usage=usage.to_dict(), steps=steps)
             for t in self.tracers:
                 try:
                     t.on_event(ev)
@@ -446,6 +455,12 @@ class Agent:
             # вызовы предыдущего шага уже закрыты результатами, и сообщение
             # пользователя не разорвёт пару «вызов — результат».
             await self._take_inbox(session_id, run_id, emit)
+            # Лимит — перед каждым запросом к модели, после очереди входящих: если остановиться
+            # до неё, сообщения остались бы в очереди, on_idle запускал бы по ним новый прогон,
+            # тот снова упирался бы в лимит — и так по кругу.
+            if why := await self._over_budget(user):
+                await emit(Event(EventType.ERROR, {"message": why, "budget": True}))
+                return RunStatus.BUDGET
             # Выбор пользователя по инструментам (Всегда / Спрашивать / Заблокирован) — каждый шаг:
             # переключил в настройках посреди долгой задачи — действует со следующего вызова.
             perms = perms.with_mode(mode, await self.store.kv_get("tool_policy", user.id) or {})
@@ -530,6 +545,15 @@ class Agent:
             if stop == "waiting_input":
                 return RunStatus.WAITING_INPUT
         return RunStatus.MAX_STEPS
+
+    async def _over_budget(self, user: User) -> str | None:
+        if self.budget is None:
+            return None
+        try:
+            return await self.budget(user)
+        except Exception:  # noqa: BLE001 — сбой учёта не должен останавливать работу
+            log.exception("budget check failed")
+            return None
 
     def _prepare(self, history: list[tuple[int, Message]], session_id: str, model: str) -> list[Message]:
         msgs = _for_model(history)
@@ -737,7 +761,7 @@ class Agent:
             permissions=self.permissions if spec.mode is None else self.permissions.with_mode(spec.mode),
             hooks=self.hooks, skills=self.skills, mcp_instructions=self.mcp_instructions, config=self.config,
             deps=self.deps, workspace=self._workspace, rules=self.rules, memory_scopes=self.memory_scopes,
-            tracers=self.tracers, can_ask=False,
+            tracers=self.tracers, can_ask=False, budget=self.budget,
         )
         child.context_providers = self.context_providers
         child.vision_for = self.vision_for
