@@ -596,3 +596,119 @@ def test_replay_view_and_eval_admin_only(client):
     bsid = client.post("/api/sessions", json={}, headers=bob).json()["id"]
     assert client.get(f"/api/sessions/{bsid}/replay", headers=bob).status_code == 403  # не admin — даже свой
     assert client.get(f"/api/sessions/{sid}/replay?seq=999999", headers=H).status_code == 404
+
+
+class _TinyMCP:
+    """MCP-сервер в потоке на 127.0.0.1: initialize, tools/list, tools/call (whoami по заголовку)."""
+
+    def __init__(self):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if "id" not in body:
+                    self.send_response(202)
+                    self.end_headers()
+                    return
+                who = self.headers.get("X-User", "?")
+                result = {"initialize": {"protocolVersion": "2025-06-18", "serverInfo": {"name": "tiny"},
+                                         "instructions": "tiny: личный сервер"},
+                          "tools/list": {"tools": [{"name": "whoami", "inputSchema": {"type": "object"},
+                                                    "annotations": {"readOnlyHint": True}}]},
+                          "tools/call": {"content": [{"type": "text", "text": f"вы — {who}"}]}}[body["method"]]
+                out = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": result}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/mcp"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+
+
+def test_personal_mcp_servers(tmp_path):
+    srv = _TinyMCP()
+    bob = {"Authorization": "Bearer t-bob"}
+    tc, fake = make_client(tmp_path, user_mcp_private=True, user_mcp_max=2)
+    try:
+        with tc as c:
+            body = {"name": "mycrm", "url": srv.url, "personal": True, "headers": {"X-User": "bob"}}
+            assert c.post("/api/mcp/test", json=body, headers=bob).json()["count"] == 1
+            r = c.post("/api/mcp/servers", json=body, headers=bob)
+            assert r.status_code == 200 and r.json()["status"]["ok"]
+
+            mine = {s["name"]: s for s in c.get("/api/tools", headers=bob).json()["mcp"]}
+            assert mine["mycrm"]["personal"] and mine["mycrm"]["can_manage"] and mine["mycrm"]["address"] == srv.url
+            assert "mcp__mycrm__whoami" in [t["name"] for t in c.get("/api/tools", headers=bob).json()["tools"]]
+            # у другого пользователя — ни сервера, ни инструментов
+            other = c.get("/api/tools", headers=H).json()
+            assert other["mcp"] == [] and "mcp__mycrm__whoami" not in [t["name"] for t in other["tools"]]
+
+            # прогон Боба вызывает свой сервер; у Алекса такого инструмента нет
+            fake.push({"tool_calls": [("mcp__mycrm__whoami", {})]}, "Вы — bob.")
+            sid = c.post("/api/sessions", json={}, headers=bob).json()["id"]
+            c.post(f"/api/sessions/{sid}/messages", json={"text": "кто я?"}, headers=bob)
+            wait_idle(c, sid, headers=bob)
+            tool_msg = [m for m in c.get(f"/api/sessions/{sid}", headers=bob).json()["messages"] if m["role"] == "tool"]
+            assert "вы — bob" in json.dumps(tool_msg, ensure_ascii=False)
+            assert "tiny: личный сервер" in fake.requests[0].messages[0].text
+
+            fake.push({"tool_calls": [("mcp__mycrm__whoami", {})]}, "Нет.")
+            sid2 = c.post("/api/sessions", json={}, headers=H).json()["id"]
+            c.post(f"/api/sessions/{sid2}/messages", json={"text": "кто я?"}, headers=H)
+            wait_idle(c, sid2)
+            assert "нет инструмента" in json.dumps(c.get(f"/api/sessions/{sid2}", headers=H).json()["messages"],
+                                                   ensure_ascii=False)
+            assert "tiny" not in fake.requests[-1].messages[0].text
+
+            # чужое не правится: личный список у каждого свой, общий — только admin
+            assert c.delete("/api/mcp/servers/mycrm?personal=true", headers=H).status_code == 404
+            assert c.patch("/api/mcp/servers/mycrm", json={"enabled": False}, headers=bob).status_code == 403
+            # лимит и имя, занятое общим сервером
+            assert c.post("/api/mcp/servers", json={**body, "name": "two"}, headers=bob).status_code == 200
+            assert c.post("/api/mcp/servers", json={**body, "name": "three"}, headers=bob).status_code == 400
+            shared = {"name": "shop", "url": "https://shop.example.com/mcp", "auth": "oauth", "per_user": True}
+            assert c.post("/api/mcp/servers", json=shared, headers=H).status_code == 200
+            assert c.post("/api/mcp/servers", json={**body, "name": "shop", "original_name": "two"},
+                          headers=bob).status_code == 409
+            # per_user: войти может любой (свой токен), общий вход — только admin
+            views = {s["name"]: s for s in c.get("/api/tools", headers=bob).json()["mcp"]}
+            assert views["shop"]["per_user"] and views["shop"]["can_connect"] and not views["shop"]["can_manage"]
+            assert c.post("/api/mcp/shop/connect", headers=bob).status_code == 400  # не 403: сервер просто недоступен
+            c.post("/api/mcp/servers", json={**shared, "per_user": False, "original_name": "shop"}, headers=H)
+            assert c.post("/api/mcp/shop/connect", headers=bob).status_code == 403
+
+            # выключил — инструменты пропали у него сразу
+            assert c.patch("/api/mcp/servers/mycrm?personal=true", json={"enabled": False}, headers=bob).status_code == 200
+            assert "mcp__mycrm__whoami" not in [t["name"] for t in c.get("/api/tools", headers=bob).json()["tools"]]
+            assert c.delete("/api/mcp/servers/mycrm?personal=true", headers=bob).status_code == 200
+    finally:
+        srv.close()
+
+
+def test_personal_mcp_guarded(tmp_path):
+    bob = {"Authorization": "Bearer t-bob"}
+    tc, _ = make_client(tmp_path)
+    with tc as c:
+        body = {"name": "evil", "url": "http://127.0.0.1:6379/mcp", "personal": True}
+        assert c.post("/api/mcp/servers", json=body, headers=bob).status_code == 400  # только https
+        # https, но во внутреннюю сеть — сервис туда не пойдёт, даже чтобы «проверить»
+        r = c.post("/api/mcp/test", json={**body, "url": "https://127.0.0.1:6379/mcp"}, headers=bob).json()
+        assert not r["ok"] and "внутреннюю сеть" in r["error"]
+        assert c.post("/api/mcp/servers", json={**body, "url": "https://localhost/mcp"}, headers=bob).status_code == 200
+        st = {s["name"]: s for s in c.get("/api/tools", headers=bob).json()["mcp"]}["evil"]
+        assert not st["ok"] and "внутреннюю сеть" in st["error"]
+    tc, _ = make_client(tmp_path / "off", user_mcp=False)
+    with tc as c:
+        assert c.post("/api/mcp/servers", json={"name": "x", "url": "https://a.example/mcp", "personal": True},
+                      headers=bob).status_code == 403

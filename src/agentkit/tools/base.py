@@ -66,6 +66,9 @@ class ToolContext:
     # Номер сообщения, после которого сделан вызов — для чекпоинтов файлов.
     message_seq: int = 0
     agent_name: str | None = None
+    # Реестр этого прогона: общие инструменты + личные пользователя (его MCP-серверы).
+    # None — только agent.tools (прогон без личных инструментов, тесты).
+    tools: Any = None
 
 
 Handler = Callable[..., Awaitable[Any]]

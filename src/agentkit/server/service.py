@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from agentkit.agent import Agent, AgentConfig, AgentSpec, RunOutcome
+from agentkit.agent import Agent, AgentConfig, AgentSpec, RunOutcome, UserTools
 from agentkit.builder import make_router, standard_tools
 from agentkit.bus import Bus, make_bus
 from agentkit.devices import DeviceHub, device_tools
@@ -70,7 +70,14 @@ def load_mcp_config(path: Path) -> list[MCPServerConfig]:
 MCP_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 
 
-def mcp_from_dict(name: str, d: dict[str, Any]) -> MCPServerConfig:
+# Личный сервер, который не ответил, пробуем подключить снова не раньше чем через столько секунд:
+# иначе каждый шаг каждого прогона ждал бы мёртвый сервер, а без повтора он не ожил бы до перезапуска.
+USER_MCP_RETRY = 120
+USER_MCP_CONNECT_TIMEOUT = 20
+USER_MCP_CACHE = 500  # подключений пользователей в памяти процесса; самое старое закрывается
+
+
+def mcp_from_dict(name: str, d: dict[str, Any], *, public_only: bool = False) -> MCPServerConfig:
     """Сервер, добавленный в настройках чата (хранится в базе, не в mcp.json).
 
     Из интерфейса — только HTTP: stdio-сервер — это запуск команды на машине
@@ -78,6 +85,8 @@ def mcp_from_dict(name: str, d: dict[str, Any]) -> MCPServerConfig:
     """
     auth = d.get("auth", "none")
     return MCPServerConfig(
+        per_user=bool(d.get("per_user")) and auth == "oauth",
+        public_only=public_only,
         name=name,
         url=d["url"],
         token=(d.get("token") or None) if auth == "token" else None,
@@ -110,6 +119,15 @@ class Domain:
     on_start: Callable[[AgentService], Any] | None = None
 
 
+@dataclass
+class _UserMCP:
+    """Подключения одного пользователя: его личные серверы и общие с per_user (его вход)."""
+
+    manager: MCPManager | None
+    tools: list[Tool]
+    expires: float  # time.monotonic(); inf — пока не придёт reload_user
+
+
 class BudgetExceeded(Exception):
     """Лимит расходов пользователя исчерпан — новое сообщение не принимается (HTTP 402)."""
 
@@ -134,6 +152,11 @@ class AgentService:
         self.mcp_all: list[MCPServerConfig] = []  # вместе с выключенными — для списка в настройках
         self.mcp_file_names: set[str] = set()
         self.preview: Any = None  # SandboxPreview — ссылки на серверы, поднятые агентом в песочнице
+        self._user_mcp: dict[str, _UserMCP] = {}
+        self._user_locks: dict[str, asyncio.Lock] = {}
+        # Номер «поколения» на пользователя: reload_user, пришедший во время подключения, не даёт
+        # положить в кэш уже устаревший результат (сервер удалили, пока ждали его ответа).
+        self._user_gen: dict[str, int] = {}
 
     async def start(self) -> None:
         s = self.settings
@@ -186,13 +209,19 @@ class AgentService:
     async def _on_broadcast(self, msg: dict[str, Any]) -> None:
         if msg.get("cmd") == "reload":
             await self._build_agent()
+        elif msg.get("cmd") == "reload_user" and msg.get("user"):
+            await self._drop_user_mcp(msg["user"])
 
     async def _build_agent(self) -> None:
         if self.mcp:
             await self.mcp.close()
         self.mcp_all = await self.mcp_configs()
-        self.mcp = MCPManager(self.mcp_all, oauth=self.oauth)
+        # Серверы с per_user общий процесс не подключает: токена «на всех» у них нет — у каждого свой.
+        self.mcp = MCPManager([c for c in self.mcp_all if not c.per_user], oauth=self.oauth)
         mcp_tools = await self.mcp.connect()
+        # Общие серверы могли поменяться (в том числе per_user) — подключения пользователей собираются заново.
+        for uid in list(self._user_mcp):
+            await self._drop_user_mcp(uid)
         self.agent = assemble_agent(self.settings, self.domain, self.store, router=self._router,
                                     mcp_tools=mcp_tools, mcp_instructions=self.mcp.instructions,
                                     extra_tools=self._platform_tools())
@@ -210,6 +239,7 @@ class AgentService:
             self.catalog.router = self.agent.router
         self.agent.vision_for = self.catalog.vision
         self.agent.budget = self.over_budget
+        self.agent.user_tools = self.user_tools
         log.info("агент готов: %d инструментов (MCP: %s)", len(self.registry),
                  ", ".join(f"{k}={'ok' if v.ok else 'ошибка'}" for k, v in self.mcp.status.items()) or "нет")
 
@@ -243,6 +273,81 @@ class AgentService:
     async def reload(self) -> None:
         """Перечитать mcp.json и skills без перезапуска — во всех процессах сервиса."""
         await self.bus.broadcast({"cmd": "reload"})
+
+    # ── личные MCP-серверы пользователя ─────────────────────────────
+    def shared_mcp_names(self) -> set[str]:
+        return {c.name for c in self.mcp_all}
+
+    async def mcp_personal(self, user_id: str) -> dict[str, dict[str, Any]]:
+        return await self.store.kv_get("mcp_servers", user_id) or {}
+
+    def personal_config(self, name: str, d: dict[str, Any]) -> MCPServerConfig:
+        return mcp_from_dict(name, {**d, "per_user": False}, public_only=not self.settings.user_mcp_private)
+
+    async def save_mcp_personal(self, user_id: str, servers: dict[str, dict[str, Any]]) -> None:
+        await self.store.kv_set("mcp_servers", user_id, servers)
+        await self.reload_user(user_id)
+
+    async def reload_user(self, user_id: str) -> None:
+        """Пересобрать подключения одного пользователя во всех процессах (сохранил сервер, вошёл, вышел)."""
+        await self.bus.broadcast({"cmd": "reload_user", "user": user_id})
+
+    async def user_mcp_configs(self, user_id: str) -> list[MCPServerConfig]:
+        shared = self.shared_mcp_names()
+        per_user = [c for c in self.mcp_all if c.per_user]
+        personal = []
+        if self.settings.user_mcp:
+            # Имя занято общим сервером — личный не подключается: его инструменты назывались бы так же
+            # (mcp__<имя>__…), и человек не знал бы, в какой из двух серверов на деле ушёл вызов.
+            personal = [self.personal_config(n, d) for n, d in (await self.mcp_personal(user_id)).items()
+                        if n not in shared]
+        return [*per_user, *personal]
+
+    async def user_mcp(self, user: User) -> _UserMCP | None:
+        """Подключения пользователя — лениво, при первом прогоне или открытии «Инструментов», и в кэше."""
+        entry = self._user_mcp.get(user.id)
+        if entry and time.monotonic() < entry.expires:
+            return entry
+        lock = self._user_locks.setdefault(user.id, asyncio.Lock())
+        async with lock:  # два разговора одного человека не подключаются к его серверам дважды
+            entry = self._user_mcp.get(user.id)
+            if entry and time.monotonic() < entry.expires:
+                return entry
+            gen = self._user_gen.get(user.id, 0)
+            configs = [c for c in await self.user_mcp_configs(user.id) if c.enabled]
+            mgr, tools, expires = None, [], float("inf")
+            if configs:
+                mgr = MCPManager(configs, oauth=self.oauth, owner=user.id, connect_timeout=USER_MCP_CONNECT_TIMEOUT)
+                tools = await mgr.connect()
+                if any(not st.ok and not st.needs_auth for st in mgr.status.values()):
+                    expires = time.monotonic() + USER_MCP_RETRY
+            new = _UserMCP(mgr, tools, expires)
+            if self._user_gen.get(user.id, 0) != gen:
+                return new  # пока подключались, настройки поменялись — в кэш не кладём
+            old = self._user_mcp.pop(user.id, None)
+            if old and old.manager:
+                await old.manager.close()
+            self._user_mcp[user.id] = new
+            while len(self._user_mcp) > USER_MCP_CACHE:
+                uid = next(iter(self._user_mcp))
+                await self._drop_user_mcp(uid)
+            return new
+
+    async def _drop_user_mcp(self, user_id: str) -> None:
+        self._user_gen[user_id] = self._user_gen.get(user_id, 0) + 1
+        entry = self._user_mcp.pop(user_id, None)
+        if entry and entry.manager:
+            await entry.manager.close()
+
+    async def user_tools(self, user: User) -> UserTools | None:
+        """Agent.user_tools: личные инструменты пользователя подмешиваются в каждый шаг его прогона."""
+        entry = await self.user_mcp(user)
+        if entry is None or entry.manager is None:
+            return None
+        return UserTools(tools=entry.tools, instructions=entry.manager.instructions())
+
+    async def registry_for(self, user: User) -> ToolRegistry:
+        return (await self.agent.tools_for(user))[0]
 
     # ── сообщения ────────────────────────────────────────────────────
     async def send(self, session_id: str, user: User, content: Any, *, model: str | None = None,
@@ -401,6 +506,8 @@ class AgentService:
             await self.runs.shutdown()
         if self.mcp:
             await self.mcp.close()
+        for uid in list(self._user_mcp):
+            await self._drop_user_mcp(uid)
         if self.bus:
             await self.bus.close()
         if self.store:

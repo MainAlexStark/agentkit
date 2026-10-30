@@ -69,7 +69,7 @@ def task_tool(specs: dict[str, AgentSpec]) -> Tool:
             ctx.user.id, title=description, agent=spec.name, parent_id=ctx.session_id,
             state={"model": (parent.state or {}).get("model")} if parent and spec.model == "main" else {},
         )
-        child = ctx.agent.child(spec)
+        child = ctx.agent.child(spec, ctx.tools)
         if ctx.workspace is not None:
             # Папка — родительская: папки по id сессии давали субагенту пустую свою, и explore
             # отвечал «в проекте ничего нет» (evals/harness agent/explore-subagent). Правки general

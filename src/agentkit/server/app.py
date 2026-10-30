@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
@@ -135,6 +136,8 @@ class MCPServerIn(BaseModel):
     enabled: bool = True
     deferred: bool | None = None
     original_name: str | None = None  # правка существующего (в том числе переименование)
+    personal: bool = False  # личный сервер: виден и работает только у того, кто добавил
+    per_user: bool = False  # общий сервер с OAuth: у каждого пользователя свой вход
 
 
 class ToolPolicyIn(BaseModel):
@@ -159,6 +162,7 @@ class MCPTestIn(BaseModel):
     token: str | None = None
     headers: dict[str, str] | None = None
     name: str | None = None  # для правки: взять сохранённый токен
+    personal: bool = False
 
 
 class MCPToggle(BaseModel):
@@ -233,7 +237,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
                 "default_mode": s.default_mode, "is_admin": user.has_role("admin"),
                 "description": svc.domain.description or s.description,
                 "suggestions": svc.domain.suggestions or [x.strip() for x in s.suggestions.split("|") if x.strip()],
-                "titles": {t.name: t.title for t in svc.registry.all() if t.title},
+                "titles": {t.name: t.title for t in (await svc.registry_for(user)).all() if t.title},
                 "help_url": s.help_url or None, "plan_name": s.plan_name or None}
 
     # ── сессии ───────────────────────────────────────────────────────
@@ -268,6 +272,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         msgs = await svc.store.list_messages(session_id)
         times = await svc.store.message_times(session_id)
         pending = await svc.store.list_approvals(session_id, status="pending")
+        reg = await svc.registry_for(user) if pending else svc.registry
         project = None
         if s.project_id and svc.projects is not None:
             p, role = await svc.store.project_role(s.project_id, user.id)
@@ -275,7 +280,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         return {
             "id": s.id, "title": s.title, "state": s.state, "project": project,
             "messages": [{"seq": seq, "ts": times.get(seq), **m.to_dict()} for seq, m in msgs],
-            "approvals": [{**a.__dict__, "destructive": bool((t := svc.registry.get(a.tool_name)) and t.destructive),
+            "approvals": [{**a.__dict__, "destructive": bool((t := reg.get(a.tool_name)) and t.destructive),
                            "title": t.title if t else ""} for a in pending],
             "running_run": await svc.runs.active_run(session_id),
             "queued": await svc.store.inbox_count(session_id),
@@ -462,12 +467,21 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
     @api.get("/tools")
     async def tools(user: User = Depends(auth)):
         custom = await svc.mcp_custom()
+        admin = user.has_role("admin")
+        entry = await svc.user_mcp(user)
+        mine = entry.manager.status if entry and entry.manager else {}
+        shared = svc.shared_mcp_names()
+        views = [_mcp_view(c, (mine if c.per_user else svc.mcp.status).get(c.name), custom.get(c.name), admin,
+                           c.name not in svc.mcp_file_names) for c in svc.mcp_all]
+        if svc.settings.user_mcp:
+            for name, d in (await svc.mcp_personal(user.id)).items():
+                views.append(_personal_view(svc.personal_config(name, d), mine.get(name), d, name in shared))
         return {
             "tools": [{"name": t.name, "title": t.title, "description": t.description.split("\n")[0], "read_only": t.read_only,
                        "destructive": t.destructive, "deferred": t.deferred, "group": t.group, "source": t.source}
-                      for t in svc.registry.all()],
-            "mcp": [_mcp_view(c, svc.mcp.status.get(c.name), custom.get(c.name), user.has_role("admin"),
-                              c.name not in svc.mcp_file_names) for c in svc.mcp_all],
+                      for t in (await svc.registry_for(user)).all()],
+            "mcp": views,
+            "user_mcp": svc.settings.user_mcp, "user_mcp_max": svc.settings.user_mcp_max,
             "skills": [{"name": k.name, "description": k.description}
                        for k in (await svc.agent.skills_for(user)).skills.values()],
             "policy": await svc.store.kv_get("tool_policy", user.id) or {},
@@ -478,7 +492,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         """Свой выбор по инструментам: «Всегда разрешать», «Спрашивать», «Заблокирован».
 
         У каждого пользователя свой: правила сервиса (AGENT_DENY_RULES/ASK_RULES) всё равно сильнее."""
-        known = {t.name for t in svc.registry.all()}
+        known = {t.name for t in (await svc.registry_for(user)).all()}
         policy = dict(await svc.store.kv_get("tool_policy", user.id) or {})
         for name, v in body.tools.items():
             if v is None:
@@ -597,9 +611,12 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
 
     @api.post("/reload")
     async def reload(user: User = Depends(auth)):
-        require_admin(user)
-        await svc.reload()
-        return {"ok": True, "tools": len(svc.registry)}
+        # Админ перечитывает всё (mcp.json, навыки); остальные — свои личные серверы и входы.
+        if user.has_role("admin"):
+            await svc.reload()
+        else:
+            await svc.reload_user(user.id)
+        return {"ok": True, "tools": len(await svc.registry_for(user))}
 
     @api.get("/usage")
     async def usage(days: int = 30, user: User = Depends(auth)):
@@ -783,59 +800,126 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
             raise HTTPException(404, "нет такого файла")
         return FileResponse(target, filename=target.name)
 
-    # ── OAuth MCP-серверов ───────────────────────────────────────────
-    @api.post("/mcp/{name}/connect")
-    async def mcp_connect(name: str, user: User = Depends(auth)):
+    # ── MCP-серверы: общие (admin) и личные (каждый свои) ───────────
+    # Общие — kv config/mcp_servers и mcp.json, правит только admin. Личные — kv mcp_servers/<id>:
+    # видны и работают только у владельца; адрес вводит не админ, поэтому только публичный https
+    # (netguard), а OAuth-токены — под владельцем. Какой из двух списков правится, говорит флаг
+    # personal: имена в них могут совпасть (общий добавили позже личного), угадывать по имени нельзя.
+    def personal_on() -> None:
+        if not svc.settings.user_mcp:
+            raise HTTPException(403, "личные MCP-серверы выключены (AGENT_USER_MCP=false) — попросите администратора")
+
+    def check_url(url: str, personal: bool) -> str:
+        url = _check_mcp_url(url)
+        if personal and not svc.settings.user_mcp_private and not url.startswith("https://"):
+            raise HTTPException(400, "личный сервер — только https://… (http и внутренние адреса включает "
+                                     "администратор: AGENT_USER_MCP_PRIVATE=true, для разработки)")
+        return url
+
+    async def server_list(user: User, personal: bool) -> dict[str, dict[str, Any]]:
+        if personal:
+            personal_on()
+            return await svc.mcp_personal(user.id)
         require_admin(user)
-        cfg = svc.mcp.config(name)
+        return await svc.mcp_custom()
+
+    async def save_list(user: User, personal: bool, servers: dict[str, dict[str, Any]]) -> None:
+        if personal:
+            await svc.save_mcp_personal(user.id, servers)
+        else:
+            await svc.save_mcp_custom(servers)
+
+    async def oauth_target(name: str, personal: bool, user: User) -> tuple[MCPServerConfig, str]:
+        """Конфиг сервера и чей вход (owner): личный и per_user — свой, общий — admin за всех."""
+        if personal:
+            personal_on()
+            d = (await svc.mcp_personal(user.id)).get(name)
+            if d is None:
+                raise HTTPException(404, f"нет личного сервера {name}")
+            return svc.personal_config(name, d), user.id
+        cfg = next((c for c in svc.mcp_all if c.name == name), None)
+        if cfg is None or not cfg.per_user:
+            require_admin(user)  # общий токен на всех — решает только admin
         if cfg is None or not cfg.url:
             raise HTTPException(404, f"нет HTTP MCP-сервера {name}")
+        return cfg, user.id if cfg.per_user else ""
+
+    async def forget_oauth(name: str, owner: str = "") -> None:
         try:
-            url = await svc.oauth.start(name, cfg.url, OAuthOptions.from_config(cfg.oauth), user_id=user.id)
+            await svc.oauth.forget(name, owner)
+        except Exception:  # noqa: BLE001 — входа могло и не быть
+            pass
+
+    async def reload_for(owner: str) -> None:
+        if owner:
+            await svc.reload_user(owner)
+        else:
+            await svc.reload()
+
+    @api.post("/mcp/{name}/connect")
+    async def mcp_connect(name: str, personal: bool = False, user: User = Depends(auth)):
+        cfg, owner = await oauth_target(name, personal, user)
+        try:
+            url = await svc.oauth.start(name, cfg.url, OAuthOptions.from_config(cfg.oauth), user_id=user.id,
+                                        owner=owner, public_only=cfg.public_only)
         except OAuthError as e:
             raise HTTPException(400, str(e)) from None
+        except httpx.HTTPError as e:  # личный сервер во внутренней сети и т. п. — текст для человека
+            raise HTTPException(400, f"сервер {name} недоступен: {e}") from None
         return {"url": url, "redirect_uri": svc.oauth.redirect_uri}
 
     @api.post("/mcp/servers")
     async def mcp_save(body: MCPServerIn, user: User = Depends(auth)):
-        """Добавить или изменить свой MCP-сервер (из mcp.json — только правкой файла)."""
-        require_admin(user)
-        servers = await svc.mcp_custom()
+        """Добавить или изменить сервер: общий (admin; из mcp.json — только правкой файла) или свой личный."""
+        servers = await server_list(user, body.personal)
         old_name = body.original_name or body.name
         if not MCP_NAME.match(body.name):
             raise HTTPException(400, "имя — латиница в нижнем регистре, цифры, «-» и «_», до 32 символов")
         if body.name in svc.mcp_file_names:
             raise HTTPException(409, f"сервер {body.name} уже задан в mcp.json — выберите другое имя")
+        if body.personal and body.name in svc.shared_mcp_names():
+            raise HTTPException(409, f"имя {body.name} занято общим сервером — выберите другое")
         if body.name != old_name and body.name in servers:
             raise HTTPException(409, f"сервер {body.name} уже есть")
         if not body.original_name and body.name in servers:
             raise HTTPException(409, f"сервер {body.name} уже есть")
+        if body.personal and not body.original_name and len(servers) >= svc.settings.user_mcp_max:
+            raise HTTPException(400, f"личных серверов не больше {svc.settings.user_mcp_max} — удалите ненужный "
+                                     "(лимит — AGENT_USER_MCP_MAX)")
         prev = servers.pop(old_name, {}) if body.original_name else {}
         token = prev.get("token", "") if body.token is None else body.token.strip()
         if body.auth == "token" and not token:
             raise HTTPException(400, "укажите токен или выберите другой способ входа")
         servers[body.name] = {
-            "url": _check_mcp_url(body.url), "auth": body.auth, "token": token if body.auth == "token" else "",
+            "url": check_url(body.url, body.personal), "auth": body.auth, "token": token if body.auth == "token" else "",
             "headers": prev.get("headers", {}) if body.headers is None else _check_headers(body.headers),
             "enabled": body.enabled, "deferred": body.deferred,
+            # per_user — только у общего и только с OAuth: личный и так у одного человека.
+            "per_user": bool(body.per_user and body.auth == "oauth" and not body.personal),
             "added_by": prev.get("added_by") or user.id, "created_at": prev.get("created_at") or time.time(),
         }
         if body.original_name and old_name != body.name:
-            await _forget_oauth(old_name)
-        await svc.save_mcp_custom(servers)
-        st = svc.mcp.status.get(body.name)
+            # Входы пользователей в per_user-сервер под старым именем не переносятся — войдут заново.
+            await forget_oauth(old_name, user.id if body.personal else "")
+        await save_list(user, body.personal, servers)
+        if body.personal:
+            entry = await svc.user_mcp(user)
+            st = entry.manager.status.get(body.name) if entry and entry.manager else None
+        else:
+            st = svc.mcp.status.get(body.name)
         return {"ok": True, "status": st.__dict__ if st else None}
 
     @api.post("/mcp/test")
     async def mcp_test(body: MCPTestIn, user: User = Depends(auth)):
         """Проверить сервер до сохранения: отвечает ли, сколько инструментов, нужен ли вход."""
-        require_admin(user)
+        saved = await server_list(user, body.personal)
         token = body.token
         if token is None and body.name:
-            token = (await svc.mcp_custom()).get(body.name, {}).get("token", "")
-        cfg = MCPServerConfig(name=body.name or "test", url=_check_mcp_url(body.url),
+            token = saved.get(body.name, {}).get("token", "")
+        cfg = MCPServerConfig(name=body.name or "test", url=check_url(body.url, body.personal),
                               token=(token or None) if body.auth == "token" else None,
-                              headers=_check_headers(body.headers or {}), timeout=20)
+                              headers=_check_headers(body.headers or {}), timeout=20,
+                              public_only=body.personal and not svc.settings.user_mcp_private)
         client = MCPClient(cfg)
         try:
             raw = await asyncio.wait_for(client.list_tools(), 20)
@@ -850,51 +934,44 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
                 "server": client.server_info.get("name") or "", "version": client.server_info.get("version") or ""}
 
     @api.patch("/mcp/servers/{name}")
-    async def mcp_toggle(name: str, body: MCPToggle, user: User = Depends(auth)):
-        require_admin(user)
-        servers = await svc.mcp_custom()
+    async def mcp_toggle(name: str, body: MCPToggle, personal: bool = False, user: User = Depends(auth)):
+        servers = await server_list(user, personal)
         if name not in servers:
             raise HTTPException(404, "такого сервера нет среди добавленных в настройках")
         servers[name]["enabled"] = body.enabled
-        await svc.save_mcp_custom(servers)
+        await save_list(user, personal, servers)
         return {"ok": True}
 
     @api.delete("/mcp/servers/{name}")
-    async def mcp_delete(name: str, user: User = Depends(auth)):
-        require_admin(user)
-        servers = await svc.mcp_custom()
+    async def mcp_delete(name: str, personal: bool = False, user: User = Depends(auth)):
+        servers = await server_list(user, personal)
         if name not in servers:
             raise HTTPException(404, "такого сервера нет среди добавленных в настройках")
         servers.pop(name)
-        await _forget_oauth(name)
-        await svc.save_mcp_custom(servers)
+        await forget_oauth(name, user.id if personal else "")
+        await save_list(user, personal, servers)
         return {"ok": True}
 
-    async def _forget_oauth(name: str) -> None:
-        try:
-            await svc.oauth.disconnect(name)
-        except Exception:  # noqa: BLE001 — входа могло и не быть
-            pass
-
     @api.delete("/mcp/{name}/connect")
-    async def mcp_disconnect(name: str, user: User = Depends(auth)):
-        require_admin(user)
-        await svc.oauth.disconnect(name)
-        await svc.reload()
+    async def mcp_disconnect(name: str, personal: bool = False, user: User = Depends(auth)):
+        _, owner = await oauth_target(name, personal, user)
+        await svc.oauth.disconnect(name, owner)
+        await reload_for(owner)
         return {"ok": True}
 
     @app.get("/oauth/callback", response_class=HTMLResponse)
     async def oauth_callback(state: str = "", code: str = "", error: str = "", error_description: str = ""):
-        # Без авторизации по токену: сюда возвращает браузер с сервера OAuth.
-        # Защита — одноразовый state, выданный только администратору.
+        # Без авторизации по токену: сюда возвращает браузер с сервера OAuth. Защита — одноразовый
+        # state, выданный тому, кто нажал «Подключить»; владелец токена берётся из state, а не из
+        # запроса. Подсунуть чужую ссылку согласия бесполезно: токен ляжет к тому, кто её начал.
         if error:
             return _oauth_page(False, f"{error}: {error_description}")
         try:
-            server = await svc.oauth.finish(state, code)
+            done = await svc.oauth.complete(state, code)
         except OAuthError as e:
             return _oauth_page(False, str(e))
-        await svc.reload()
-        return _oauth_page(True, f"{server} подключён")
+        await reload_for(done.owner)
+        return _oauth_page(True, f"{done.server} подключён")
 
     register_platform(api, app, svc, auth)
     register_preview(app, svc)
@@ -978,12 +1055,27 @@ def _mcp_view(c: Any, st: Any, d: dict[str, Any] | None, admin: bool, custom: bo
         "needs_auth": bool(st and st.needs_auth), "oauth": bool(st and st.oauth),
         "server": (st.server_info.get("name") or "") if st else "", "version": (st.server_info.get("version") or "") if st else "",
         "transport": "http" if c.url else "stdio",
+        "personal": False, "per_user": bool(getattr(c, "per_user", False)),
+        "can_manage": admin and custom,
+        # Войти может admin (общий токен) и каждый — в per_user-сервер (свой токен).
+        "can_connect": c.enabled and bool(c.url) and (admin or bool(getattr(c, "per_user", False))),
     }
     if admin:  # адрес — только админу: в нём бывают внутренние хосты
         view["address"] = c.url or c.command or ""
         if custom and d:
             view.update(auth=d.get("auth", "none"), has_token=bool(d.get("token")), header_names=sorted(d.get("headers") or {}),
                         deferred=d.get("deferred"), added_by=d.get("added_by", ""))
+    elif custom and d:
+        view["auth"] = d.get("auth", "none")
+    return view
+
+
+def _personal_view(c: Any, st: Any, d: dict[str, Any], shadowed: bool) -> dict[str, Any]:
+    """Личный сервер — для владельца: адрес и способ входа свои, их видно; токены — нет."""
+    view = _mcp_view(c, st, d, True, True)
+    view.update(personal=True, can_manage=True, can_connect=c.enabled and not shadowed)
+    if shadowed:
+        view.update(ok=False, needs_auth=False, tools=0, error="имя занято общим сервером — переименуйте, чтобы он заработал")
     return view
 
 

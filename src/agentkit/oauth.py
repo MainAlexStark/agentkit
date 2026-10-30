@@ -15,6 +15,12 @@ RFC 8414 + OpenID Discovery (метаданные сервера авториз�
 верификатор PKCE — там же по state, поэтому callback может прийти в любой
 процесс сервиса. Обновление токена — под общей блокировкой Bus: refresh
 ротируется, и два одновременных обновления оставили бы один процесс без токена.
+
+Владелец (owner). Пустой — токен общий на сервер, подключает admin. Непустой
+(id пользователя) — у каждого свой вход: личный MCP-сервер пользователя или
+общий сервер с per_user (магазин Ozon у каждого продавца свой, как в OpenSeller).
+Запись хранится под ключом «сервер@владелец» — токен одного пользователя
+никогда не отдаётся в прогон другого.
 """
 
 from __future__ import annotations
@@ -71,6 +77,9 @@ class OAuthRecord:
     scope: str = ""
     connected_by: str = ""
     connected_at: float = 0
+    # Адрес сервера ввёл не админ: discover, DCR, token и отзыв — только к публичным адресам
+    # (метаданные отдаёт сам сервер и могли бы направить запрос с токеном во внутреннюю сеть).
+    public_only: bool = False
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> OAuthRecord:
@@ -196,40 +205,65 @@ class OAuthOptions:
         return cls(**{k: x for k, x in dict(v).items() if k in cls.__dataclass_fields__})
 
 
+def record_key(server: str, owner: str = "") -> str:
+    # «@» не бывает в имени сервера (MCP_NAME), поэтому «crm@bob» не совпадёт с общим сервером.
+    return f"{server}@{owner}" if owner else server
+
+
+@dataclass
+class Completed:
+    server: str
+    owner: str = ""
+
+
 class OAuthBroker:
-    """Подключения к MCP-серверам по OAuth для всего сервиса (токен общий на сервер)."""
+    """Подключения к MCP-серверам по OAuth: общий токен на сервер или свой у каждого владельца."""
 
     def __init__(self, store: Store, redirect_uri: str, *, bus: Bus | None = None,
-                 http: httpx.AsyncClient | None = None, client_name: str = "agentkit"):
+                 http: httpx.AsyncClient | None = None, client_name: str = "agentkit",
+                 public_http: httpx.AsyncClient | None = None):
         self.store = store
         self.redirect_uri = redirect_uri
         self.bus = bus or LocalBus()
         self.http = http or httpx.AsyncClient(timeout=30, follow_redirects=True)
+        # Для записей public_only. Не задан — создаётся при первой нужде; в тестах можно подменить.
+        self._public_http = public_http
         self.client_name = client_name
 
-    async def record(self, server: str) -> OAuthRecord:
-        return OAuthRecord.from_dict(await self.store.kv_get(NS, server))
+    def _client(self, public_only: bool) -> httpx.AsyncClient:
+        if not public_only:
+            return self.http
+        if self._public_http is None:
+            from agentkit.netguard import public_client  # noqa: PLC0415
 
-    async def _save(self, server: str, rec: OAuthRecord) -> None:
-        await self.store.kv_set(NS, server, rec.to_dict())
+            self._public_http = public_client(timeout=30, follow_redirects=True)
+        return self._public_http
 
-    async def start(self, server: str, url: str, opts: OAuthOptions | None = None, *, user_id: str = "") -> str:
+    async def record(self, server: str, owner: str = "") -> OAuthRecord:
+        return OAuthRecord.from_dict(await self.store.kv_get(NS, record_key(server, owner)))
+
+    async def _save(self, server: str, rec: OAuthRecord, owner: str = "") -> None:
+        await self.store.kv_set(NS, record_key(server, owner), rec.to_dict())
+
+    async def start(self, server: str, url: str, opts: OAuthOptions | None = None, *, user_id: str = "",
+                    owner: str = "", public_only: bool = False) -> str:
         """Адрес экрана согласия. Каждый «Подключить» заново ищет метаданные — сервер мог переехать."""
         opts = opts or OAuthOptions()
-        rec = await self.record(server)
-        ep, needs = await discover(self.http, url)
+        rec = await self.record(server, owner)
+        ep, needs = await discover(self._client(public_only), url)
         if not needs:
             raise OAuthError(f"сервер {server} не требует входа — OAuth не нужен")
         if rec.server_url != url or rec.endpoints.authorization != ep.authorization:
             # Другой сервер авторизации — прежняя регистрация клиента там не существует.
             rec = OAuthRecord()
-        rec.server_url, rec.endpoints = url, ep
+        rec.server_url, rec.endpoints, rec.public_only = url, ep, public_only
         await self._ensure_client(rec, opts)
         verifier, challenge = _pkce()
         state = secrets.token_urlsafe(24)
         await self.store.kv_set(NS + ":pending", state, {
-            "server": server, "verifier": verifier, "user_id": user_id, "expires": time.time() + PENDING_TTL})
-        await self._save(server, rec)
+            "server": server, "owner": owner, "verifier": verifier, "user_id": user_id,
+            "expires": time.time() + PENDING_TTL})
+        await self._save(server, rec, owner)
         params = {
             "response_type": "code", "client_id": rec.client_id, "redirect_uri": self.redirect_uri,
             "code_challenge": challenge, "code_challenge_method": "S256", "state": state,
@@ -260,7 +294,7 @@ class OAuthBroker:
         }
         if opts.scope:
             meta["scope"] = opts.scope
-        r = await self.http.post(rec.endpoints.registration, json=meta)
+        r = await self._client(rec.public_only).post(rec.endpoints.registration, json=meta)
         if r.status_code not in (200, 201):
             raise OAuthError(f"регистрация клиента отклонена: HTTP {r.status_code} {r.text[:300]}")
         out = r.json()
@@ -273,26 +307,31 @@ class OAuthBroker:
 
     async def finish(self, state: str, code: str) -> str:
         """Обмен кода на токены. Возвращает имя сервера."""
+        return (await self.complete(state, code)).server
+
+    async def complete(self, state: str, code: str) -> Completed:
+        """Как finish, но ещё и чей это вход: сервису нужно перечитать MCP только у этого владельца."""
         pending = await self.store.kv_get(NS + ":pending", state)
         await self.store.kv_delete(NS + ":pending", state)  # state одноразовый
         if not pending or pending.get("expires", 0) < time.time():
             raise OAuthError("ссылка подключения устарела или уже использована — начните заново")
-        server = pending["server"]
-        rec = await self.record(server)
+        server, owner = pending["server"], pending.get("owner", "")
+        rec = await self.record(server, owner)
         form = {"grant_type": "authorization_code", "code": code, "client_id": rec.client_id,
                 "redirect_uri": self.redirect_uri, "code_verifier": pending["verifier"]}
         tok = await self._token_request(rec, form)
         self._apply(rec, tok)
         rec.connected_by, rec.connected_at = pending.get("user_id", ""), time.time()
-        await self._save(server, rec)
-        return server
+        await self._save(server, rec, owner)
+        return Completed(server, owner)
 
     async def _token_request(self, rec: OAuthRecord, form: dict[str, str]) -> dict[str, Any]:
         if rec.client_secret:
             form["client_secret"] = rec.client_secret
         if rec.endpoints.resource:
             form["resource"] = rec.endpoints.resource
-        r = await self.http.post(rec.endpoints.token, data=form, headers={"Accept": "application/json"})
+        r = await self._client(rec.public_only).post(rec.endpoints.token, data=form,
+                                                     headers={"Accept": "application/json"})
         if r.status_code != 200:
             raise OAuthError(f"token_endpoint: HTTP {r.status_code} {r.text[:300]}")
         out = r.json()
@@ -309,16 +348,16 @@ class OAuthBroker:
         rec.scope = tok.get("scope") or rec.scope
         _remember(rec)
 
-    async def token(self, server: str) -> str | None:
+    async def token(self, server: str, owner: str = "") -> str | None:
         """Действующий access-токен, при необходимости обновлённый. None — сервер не подключён."""
-        rec = await self.record(server)
+        rec = await self.record(server, owner)
         if not rec.access_token:
             return None
         _remember(rec)  # после перезапуска токен приходит из базы, а не из _apply
         if not rec.expires_at or rec.expires_at - time.time() > 300:
             return rec.access_token
-        async with self.bus.lock(f"oauth:{server}", ttl=30):
-            rec = await self.record(server)  # пока ждали блокировку, мог обновить другой процесс
+        async with self.bus.lock(f"oauth:{record_key(server, owner)}", ttl=30):
+            rec = await self.record(server, owner)  # пока ждали блокировку, мог обновить другой процесс
             if rec.expires_at - time.time() > 300:
                 return rec.access_token
             if not rec.refresh_token:
@@ -329,34 +368,39 @@ class OAuthBroker:
             except OAuthError:
                 return None  # refresh отозван — нужно подключить заново
             self._apply(rec, tok)
-            await self._save(server, rec)
+            await self._save(server, rec, owner)
             return rec.access_token
 
-    async def force_refresh(self, server: str) -> str | None:
+    async def force_refresh(self, server: str, owner: str = "") -> str | None:
         """После 401 от сервера: токен могли отозвать раньше срока."""
-        rec = await self.record(server)
+        rec = await self.record(server, owner)
         if rec.access_token:
             rec.expires_at = 1
-            await self._save(server, rec)
-        return await self.token(server)
+            await self._save(server, rec, owner)
+        return await self.token(server, owner)
 
-    async def disconnect(self, server: str) -> None:
-        rec = await self.record(server)
+    async def disconnect(self, server: str, owner: str = "") -> None:
+        rec = await self.record(server, owner)
         tok = rec.refresh_token or rec.access_token
         if tok and rec.endpoints.revocation:
             form = {"token": tok, "client_id": rec.client_id}
             if rec.client_secret:
                 form["client_secret"] = rec.client_secret
             try:
-                await self.http.post(rec.endpoints.revocation, data=form)
+                await self._client(rec.public_only).post(rec.endpoints.revocation, data=form)
             except httpx.HTTPError:
                 pass  # отзыв — вежливость; локально токены забываем в любом случае
         rec.access_token = rec.refresh_token = ""
         rec.expires_at = 0
-        await self._save(server, rec)
+        await self._save(server, rec, owner)
 
-    async def status(self, server: str) -> dict[str, Any]:
-        rec = await self.record(server)
+    async def forget(self, server: str, owner: str = "") -> None:
+        """Отключить и стереть запись целиком (сервер удалён): иначе регистрация клиента копилась бы в базе."""
+        await self.disconnect(server, owner)
+        await self.store.kv_delete(NS, record_key(server, owner))
+
+    async def status(self, server: str, owner: str = "") -> dict[str, Any]:
+        rec = await self.record(server, owner)
         return {"connected": bool(rec.access_token), "scope": rec.scope, "connected_by": rec.connected_by,
                 "connected_at": rec.connected_at or None, "expires_at": rec.expires_at or None}
 

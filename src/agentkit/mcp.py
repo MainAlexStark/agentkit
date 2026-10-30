@@ -67,6 +67,11 @@ class MCPServerConfig:
     # OAuth 2.1: true или {"scope": …, "client_id": …, "client_secret": …, "auth_params": {…}}.
     # Без этого поля OAuth всё равно предложится, если сервер ответил 401.
     oauth: Any = None
+    # Вход по OAuth у каждого пользователя свой (магазин у каждого продавца свой): общий процесс
+    # такой сервер не подключает, его инструменты появляются в прогонах пользователя после его входа.
+    per_user: bool = False
+    # Адрес ввёл не админ (личный сервер): подключаться только к публичным адресам — netguard.
+    public_only: bool = False
 
 
 class _HTTPTransport:
@@ -76,7 +81,13 @@ class _HTTPTransport:
         self.token_provider = token_provider
         self.on_unauthorized = on_unauthorized
         self._own = client is None
-        self.client = client or httpx.AsyncClient(timeout=httpx.Timeout(cfg.timeout, connect=10.0))
+        timeout = httpx.Timeout(cfg.timeout, connect=10.0)
+        if client is None and cfg.public_only:
+            from agentkit.netguard import public_client  # noqa: PLC0415
+
+            client = public_client(timeout=timeout)
+        # Явно переданный клиент главнее public_only — так тесты подставляют MockTransport.
+        self.client = client or httpx.AsyncClient(timeout=timeout)
         self.session_id: str | None = None
         self.protocol: str | None = None
 
@@ -308,10 +319,15 @@ class MCPManager:
     AUTO_DEFER_THRESHOLD = 15  # больше инструментов на сервере — отложенные
 
     def __init__(self, configs: list[MCPServerConfig], http_client: httpx.AsyncClient | None = None,
-                 oauth: Any = None):
+                 oauth: Any = None, *, owner: str = "", connect_timeout: float | None = None):
         self.configs = [c for c in configs if c.enabled]
         self.http_client = http_client
         self.oauth = oauth  # OAuthBroker: токены серверов, подключённых через вход
+        # Чьи OAuth-токены брать: "" — общие (подключал admin), id пользователя — его личные.
+        self.owner = owner
+        # Ожидание списка инструментов при подключении. Личные серверы подключаются на первом шаге
+        # прогона — мёртвый сервер не должен держать ответ человеку cfg.timeout (120 с).
+        self.connect_timeout = connect_timeout
         self.clients: dict[str, MCPClient] = {}
         self.status: dict[str, ServerStatus] = {}
 
@@ -328,13 +344,13 @@ class MCPManager:
         provider = refresh = None
         use_oauth = False
         if self.oauth is not None and cfg.url and not cfg.token:
-            use_oauth = bool(await self.oauth.token(cfg.name)) or bool(cfg.oauth)
+            use_oauth = bool(await self.oauth.token(cfg.name, self.owner)) or bool(cfg.oauth)
             if use_oauth:
                 async def provider(name=cfg.name):
-                    return await self.oauth.token(name)
+                    return await self.oauth.token(name, self.owner)
 
                 async def refresh(name=cfg.name):
-                    return await self.oauth.force_refresh(name)
+                    return await self.oauth.force_refresh(name, self.owner)
 
                 if not await provider():
                     self.status[cfg.name] = ServerStatus(cfg.name, ok=False, needs_auth=True,
@@ -342,7 +358,7 @@ class MCPManager:
                     return []
         try:
             client = MCPClient(cfg, self.http_client, provider, refresh)
-            raw = await asyncio.wait_for(client.list_tools(), cfg.timeout)
+            raw = await asyncio.wait_for(client.list_tools(), self.connect_timeout or cfg.timeout)
         except MCPAuthRequired as e:
             log.warning("MCP %s: %s", cfg.name, e)
             self.status[cfg.name] = ServerStatus(cfg.name, ok=False, error=str(e),
@@ -350,7 +366,9 @@ class MCPManager:
             return []
         except Exception as e:  # noqa: BLE001 — один упавший сервер не должен ронять агента
             log.warning("MCP %s: %s", cfg.name, e)
-            self.status[cfg.name] = ServerStatus(cfg.name, ok=False, error=str(e))
+            # У TimeoutError текст пустой — в UI стояло бы «ошибка» без объяснения.
+            why = f"не ответил за {self.connect_timeout or cfg.timeout:.0f} с" if isinstance(e, TimeoutError) else str(e)
+            self.status[cfg.name] = ServerStatus(cfg.name, ok=False, error=why or type(e).__name__)
             return []
         self.clients[cfg.name] = client
         raw = [t for t in raw if (not cfg.include or match_any(t["name"], cfg.include))

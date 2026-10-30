@@ -1354,9 +1354,12 @@ function parseHeaders(text) {
   }
   return out;
 }
-function mcpEditor(srv, onClose) {
+function mcpEditor(srv, onClose, { canShare = false } = {}) {
   const editing = !!srv;
   let auth = srv?.auth || "none", deferred = srv?.deferred ?? null, nameTouched = editing;
+  // Личный — только у того, кто добавил; общий — у всех, добавляет admin. У существующего не меняется:
+  // это два разных списка, «перенос» был бы удалением и созданием заново.
+  let personal = editing ? !!srv.personal : !canShare, perUser = !!srv?.per_user;
   const name = h("input", { value: srv?.name || "", placeholder: "crm", spellcheck: "false", autocomplete: "off" });
   const url = h("input", { value: srv?.address || "", placeholder: "https://example.com/mcp", spellcheck: "false", autocomplete: "off", inputmode: "url" });
   const token = h("input", { type: "password", autocomplete: "new-password",
@@ -1367,9 +1370,15 @@ function mcpEditor(srv, onClose) {
   name.addEventListener("input", () => { nameTouched = true; });
   url.addEventListener("input", () => { if (!nameTouched) name.value = nameFromUrl(url.value.trim()); result.hidden = true; });
   const tokenRow = fieldRow("Токен", token, "Хранится в базе сервиса и никому не показывается");
-  const syncAuth = () => { tokenRow.hidden = auth !== "token"; };
+  const perUserRow = h("div", { class: "field-row" }, h("label", {}, "Аккаунт"),
+    segmented([[false, "Один на всех — входит администратор"], [true, "У каждого свой"]], perUser, v => { perUser = v; }),
+    h("div", { class: "help" }, "«У каждого свой» — каждый пользователь сам нажимает «Подключить» и входит в свой аккаунт (магазин, CRM)."));
+  const syncAuth = () => { tokenRow.hidden = auth !== "token"; perUserRow.hidden = personal || auth !== "oauth"; };
+  const scopeRow = canShare && !editing ? h("div", { class: "field-row" }, h("label", {}, "Кому"),
+    segmented([[true, "Только мне"], [false, "Всем пользователям"]], personal, v => { personal = v; syncAuth(); result.hidden = true; }),
+    h("div", { class: "help" }, "Личный сервер видите и используете только вы; общий — все, кто работает с агентом.")) : null;
   const payload = () => ({
-    url: url.value.trim(), auth,
+    url: url.value.trim(), auth, personal, per_user: !personal && auth === "oauth" && perUser,
     token: auth === "token" ? (token.value.trim() || (editing && srv.has_token ? null : "")) : "",
     headers: headers.value.trim() ? parseHeaders(headers.value) : (editing ? null : {}),
   });
@@ -1392,19 +1401,21 @@ function mcpEditor(srv, onClose) {
       const r = await api("/api/mcp/servers", { method: "POST", body: { ...payload(), name: slug(name.value), deferred, enabled: srv?.enabled ?? true,
         original_name: editing ? srv.name : null } });
       const st = r.status;
+      const p = payload();
       toast(st?.ok ? `«${slug(name.value)}» подключён: ${st.tools} ${plural(st.tools, "инструмент", "инструмента", "инструментов")}`
-        : st?.needs_auth ? "Сохранено — нажмите «Подключить», чтобы войти" : `Сохранено, но сервер не отвечает${st?.error ? `: ${st.error}` : ""}`);
-      openSources.add("mcp:" + slug(name.value));
+        : st?.needs_auth || p.per_user ? "Сохранено — нажмите «Подключить», чтобы войти" : `Сохранено, но сервер не отвечает${st?.error ? `: ${st.error}` : ""}`);
+      openSources.add((personal ? "my:" : "mcp:") + slug(name.value));
       onClose(true);
     } catch (e) { toast(e.message); save.disabled = false; }
   } }, editing ? "Сохранить" : "Добавить");
   const el = h("div", { class: "sch-editor mcp-editor" },
-    h("div", { class: "ed-head" }, h("b", {}, editing ? `Сервер ${srv.name}` : "Новый MCP-сервер"),
+    h("div", { class: "ed-head" }, h("b", {}, editing ? `Сервер ${srv.name}` : personal && !canShare ? "Мой MCP-сервер" : "Новый MCP-сервер"),
       h("button", { class: "icon-btn", type: "button", "aria-label": "Закрыть", onclick: () => onClose(false) }, icon("x"))),
+    scopeRow,
     h("div", { class: "two" }, fieldRow("Адрес", url, "Streamable HTTP, обычно оканчивается на /mcp"), fieldRow("Имя", name, "Латиницей — так инструменты будут подписаны у агента")),
     h("div", { class: "field-row" }, h("label", {}, "Вход"),
       segmented([["none", "Без входа"], ["token", "Токен"], ["oauth", "OAuth — войти в браузере"]], auth, v => { auth = v; syncAuth(); result.hidden = true; })),
-    tokenRow,
+    tokenRow, perUserRow,
     h("details", { class: "more-opts" }, h("summary", {}, "Дополнительно"),
       fieldRow("Заголовки", headers, "По одному на строку: «Имя: значение»"),
       h("div", { class: "field-row" }, h("label", {}, "Описания инструментов"),
@@ -1442,6 +1453,7 @@ function policyPicker(value, onPick, { implicit = false, label = "" } = {}) {
 async function toolsTab(body) {
   const d = await api("/api/tools");
   const admin = S.config.is_admin;
+  const canAdd = admin || d.user_mcp;
   let q = "";
   const policyOf = t => d.policy[t.name] || defaultPolicy(t);
   const setPolicy = async (names, v) => {
@@ -1491,42 +1503,51 @@ async function toolsTab(body) {
     // Заголовок и пояснение — всем: без роли admin блок раньше пропадал целиком, и было
     // непонятно, есть ли MCP вообще и кого просить подключить сервер.
     out.push(h("div", { class: "src-label" }, h("span", {}, "MCP-серверы"),
-      admin ? h("button", { class: "btn ghost sm", type: "button", onclick: () => openEditor(null) }, icon("plus"), "Добавить сервер")
+      canAdd ? h("button", { class: "btn ghost sm", type: "button", onclick: () => openEditor(null) }, icon("plus"), admin ? "Добавить сервер" : "Подключить свой")
         : h("span", { class: "muted", title: "Роль задаётся в AGENT_TOKENS: id:токен:admin" }, "добавляет администратор")));
     for (const s of d.mcp) {
-      const tools = d.tools.filter(t => t.group === `mcp:${s.name}`);
+      // У личного свой ключ: общий и личный сервер с одним именем — две разные карточки.
+      const key = (s.personal ? "my:" : "mcp:") + s.name;
+      const qs = s.personal ? "?personal=true" : "";
+      const enc = encodeURIComponent(s.name);
+      const tools = s.personal && s.error && !s.ok ? [] : d.tools.filter(t => t.group === `mcp:${s.name}`);
       const acts = [];
-      if (admin && s.enabled && s.needs_auth) acts.push(h("button", { class: "btn primary sm", onclick: () => mcpConnect(s.name) }, icon("plug"), "Подключить"));
-      if (admin && s.custom) {
+      if (s.can_connect && s.needs_auth) acts.push(h("button", { class: "btn primary sm", onclick: () => mcpConnect(s.name, s.personal) }, icon("plug"), "Подключить"));
+      const logout = s.oauth && s.can_connect ? ["logout", s.per_user || s.personal ? "Выйти из своего аккаунта" : "Выйти из аккаунта", async () => {
+        await api(`/api/mcp/${enc}/connect${qs}`, { method: "DELETE" }); openSettings("tools"); }] : null;
+      if (s.can_manage) {
         const more = h("button", { class: "icon-btn", title: "Ещё", "aria-label": "Действия", "aria-haspopup": "menu" }, icon("dots"));
         more.addEventListener("click", e => { e.stopPropagation(); popMenu(more, [
           ["pen", "Изменить", () => openEditor(s)],
-          s.oauth ? ["logout", "Выйти из аккаунта", async () => { await api(`/api/mcp/${encodeURIComponent(s.name)}/connect`, { method: "DELETE" }); openSettings("tools"); }] : null,
+          logout,
           [s.enabled ? "pause" : "play", s.enabled ? "Выключить" : "Включить", async () => {
-            await api(`/api/mcp/servers/${encodeURIComponent(s.name)}`, { method: "PATCH", body: { enabled: !s.enabled } }); openSettings("tools"); }],
+            await api(`/api/mcp/servers/${enc}${qs}`, { method: "PATCH", body: { enabled: !s.enabled } }); openSettings("tools"); }],
           ["trash", "Удалить", async () => {
-            if (!confirm(`Удалить сервер ${s.name}? Его инструменты пропадут у агента.`)) return;
-            await api(`/api/mcp/servers/${encodeURIComponent(s.name)}`, { method: "DELETE" }); openSettings("tools"); }, true],
+            if (!confirm(`Удалить сервер ${s.name}? Его инструменты пропадут у агента${s.personal ? "" : " у всех"}.`)) return;
+            await api(`/api/mcp/servers/${enc}${qs}`, { method: "DELETE" }); openSettings("tools"); }, true],
         ].filter(Boolean)); });
         acts.push(more);
-      } else if (admin && s.oauth) acts.push(h("button", { class: "btn ghost sm", onclick: async () => {
+      } else if (logout) acts.push(h("button", { class: "btn ghost sm", onclick: async () => {
         if (!confirm(`Отключить ${s.name}? Токены будут отозваны.`)) return;
-        await api(`/api/mcp/${encodeURIComponent(s.name)}/connect`, { method: "DELETE" }); openSettings("tools"); } }, "Отключить"));
+        await logout[2](); } }, "Отключить"));
+      const who = s.personal ? "личный" : s.per_user ? "вход у каждого свой" : "";
       const sub = !s.enabled ? "Выключен — агент его не видит"
-        : s.ok ? [count(s.tools), s.server && s.server !== s.name ? s.server : "", s.version ? `v${s.version}` : "", s.oauth ? "OAuth" : ""].filter(Boolean).join(" · ")
-        : s.needs_auth ? "Нужно войти — подключение по OAuth" : (s.error || "нет связи");
-      const c = card({ key: "mcp:" + s.name, ic: s.transport === "stdio" ? "tools" : "server", title: s.name, sub, tools,
+        : s.ok ? [count(s.tools), s.server && s.server !== s.name ? s.server : "", s.version ? `v${s.version}` : "", s.oauth ? "OAuth" : "", who].filter(Boolean).join(" · ")
+        : s.needs_auth ? (s.can_connect ? (s.per_user ? "Войдите в свой аккаунт" : "Нужно войти — подключение по OAuth")
+          : "Нужен вход — подключает администратор") : (s.error || "нет связи");
+      const c = card({ key, ic: s.transport === "stdio" ? "tools" : s.personal ? "user" : "server", title: s.name, sub, tools,
         actions: acts.length ? acts : null,
         status: !s.enabled ? pill("", "выключен") : s.ok ? pill("ok", "на связи") : s.needs_auth ? pill("warn", "нужен вход") : pill("err", "ошибка"),
-        extra: admin && s.address ? h("div", { class: "src-addr" }, h("code", {}, s.address)) : null });
+        extra: s.address ? h("div", { class: "src-addr" }, h("code", {}, s.address)) : null });
       c?.classList.toggle("disabled", !s.enabled);
       out.push(c);
     }
-    if (!admin && !d.mcp.length && !q) out.push(h("p", { class: "muted" },
-      "Серверов пока нет. Подключить свой MCP-сервер может пользователь с ролью admin — попросите администратора."));
-    if (admin && !d.mcp.length && !q) out.push(h("button", { class: "add-card", type: "button", onclick: () => openEditor(null) },
+    if (!canAdd && !d.mcp.length && !q) out.push(h("p", { class: "muted" },
+      "Серверов пока нет. Подключить MCP-сервер может пользователь с ролью admin — попросите администратора."));
+    if (canAdd && !d.mcp.length && !q) out.push(h("button", { class: "add-card", type: "button", onclick: () => openEditor(null) },
       h("span", { class: "src-icon" }, icon("plus")), h("span", { class: "src-title" }, h("b", {}, "Подключить MCP-сервер"),
-        h("span", { class: "src-sub" }, "CRM, склад, почта, база знаний — всё, что умеет MCP, станет инструментами агента"))));
+        h("span", { class: "src-sub" }, admin ? "CRM, склад, почта, база знаний — всё, что умеет MCP, станет инструментами агента"
+          : "Свой CRM, почта, магазин — инструменты будут только у вас"))));
     if (builtin.length) {
       const groups = [...new Set(builtin.map(t => t.group || "core"))];
       out.push(card({ key: "builtin", ic: "gear", title: "Встроенные", sub: `${count(builtin.length)} · ${groups.map(g => TOOL_GROUPS[g] || g).join(", ")}`, tools: builtin }));
@@ -1537,7 +1558,7 @@ async function toolsTab(body) {
   const okMcp = d.mcp.filter(s => s.ok).length;
   const slot = h("div");
   const openEditor = srv => {
-    slot.replaceChildren(mcpEditor(srv, saved => { slot.replaceChildren(); if (saved) openSettings("tools"); }));
+    slot.replaceChildren(mcpEditor(srv, saved => { slot.replaceChildren(); if (saved) openSettings("tools"); }, { canShare: admin }));
     slot.scrollIntoView({ block: "nearest", behavior: "smooth" });
   };
   const [search] = searchBox(`Найти среди ${d.tools.length} инструментов`, v => { q = v; draw(); });
@@ -1546,7 +1567,7 @@ async function toolsTab(body) {
       h("div", { class: "tile" }, h("b", {}, d.tools.length), h("span", {}, plural(d.tools.length, "инструмент", "инструмента", "инструментов"))),
       h("div", { class: "tile" }, h("b", {}, d.mcp.length ? `${okMcp}/${d.mcp.length}` : "0"), h("span", {}, "MCP-серверов на связи")),
       h("div", { class: "tile" }, blockedNum, h("span", {}, "заблокировано"))),
-    h("div", { class: "toolbar" }, search, admin ? h("button", { class: "btn sm", title: "Перечитать mcp.json и папку навыков без перезапуска", onclick: async e => {
+    h("div", { class: "toolbar" }, search, canAdd ? h("button", { class: "btn sm", title: admin ? "Перечитать mcp.json и папку навыков без перезапуска" : "Переподключить свои серверы", onclick: async e => {
       e.currentTarget.disabled = true; await api("/api/reload", { method: "POST" }); openSettings("tools"); toast("Инструменты перечитаны"); } }, icon("refresh"), "Перечитать") : null),
     slot, cards);
   draw();
@@ -2948,11 +2969,11 @@ document.addEventListener("keydown", e => {
   if ((e.ctrlKey || e.metaKey) && e.key === ",") { e.preventDefault(); openSettings("general"); }
 });
 
-async function mcpConnect(name) {
+async function mcpConnect(name, personal = false) {
   // Окно открываем сразу по клику — иначе браузер сочтёт его всплывающим и заблокирует.
   const w = window.open("about:blank", "oauth", "width=520,height=720");
   try {
-    const r = await api(`/api/mcp/${encodeURIComponent(name)}/connect`, { method: "POST" });
+    const r = await api(`/api/mcp/${encodeURIComponent(name)}/connect${personal ? "?personal=true" : ""}`, { method: "POST" });
     if (w) w.location = r.url; else location.href = r.url;
   } catch (e) { w?.close(); alert(e.message); }
 }

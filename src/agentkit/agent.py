@@ -109,6 +109,21 @@ class TurnContext:
 
 
 ContextProvider = Callable[[User, str], Awaitable["TurnContext | str | None"]]
+
+
+@dataclass
+class UserTools:
+    """Инструменты, которые есть только у одного пользователя: его личные MCP-серверы и т. п.
+
+    Общий реестр агента один на процесс, а личные серверы у каждого свои — поэтому они
+    не добавляются в agent.tools, а подмешиваются в каждый шаг прогона этого пользователя.
+    """
+
+    tools: list[Tool] = field(default_factory=list)
+    instructions: str = ""  # инструкции личных MCP-серверов — в системный промпт рядом с общими
+
+
+UserToolsProvider = Callable[[User], Awaitable["UserTools | None"]]
 # Лимит расходов: None — можно тратить дальше, строка — почему нельзя (её увидит человек).
 # Сам лимит и расход считает хост (у сервиса — по базе): ядро не знает ни тарифов, ни периодов.
 BudgetCheck = Callable[[User], Awaitable["str | None"]]
@@ -145,6 +160,7 @@ class Agent:
         can_ask: bool = True,
         budget: BudgetCheck | None = None,
         redactor: Redactor | None = None,
+        user_tools: UserToolsProvider | None = None,
     ):
         self.router = router
         # Секреты (ключи сервиса из окружения, токены MCP/OAuth, типовые форматы) — маркером:
@@ -159,6 +175,7 @@ class Agent:
         self.hooks = hooks or Hooks()
         self.skills = skills
         self.mcp_instructions = mcp_instructions
+        self.user_tools = user_tools
         self.config = config or AgentConfig()
         self.deps = deps or {}
         self._workspace = workspace
@@ -175,7 +192,7 @@ class Agent:
         self._cancel: dict[str, asyncio.Event] = {}
 
         if "tool_search" not in self.tools:
-            self.tools.add(make_tool_search(lambda ctx: ctx.agent.tools))
+            self.tools.add(make_tool_search(lambda ctx: ctx.tools if ctx.tools is not None else ctx.agent.tools))
         # Инструмент skill — и при пустой папке: навыки пользователь может создать сам в настройках.
         if self.skills is not None and "skill" not in self.tools:
             self.tools.add(self.skills.tool())
@@ -186,6 +203,27 @@ class Agent:
         """Навыки, которые видит этот пользователь: из папки приложения + свои, без выключенных."""
         base = self.skills or SkillLibrary()
         return base.for_user(await self.store.kv_get("skills", user.id) or {})
+
+    async def tools_for(self, user: User) -> tuple[ToolRegistry, str]:
+        """Реестр для прогона этого пользователя (общий + личные) и инструкции его личных серверов."""
+        if self.user_tools is None:
+            return self.tools, ""
+        try:
+            extra = await self.user_tools(user)
+        except Exception:  # noqa: BLE001 — сбой личных серверов не должен ронять прогон
+            log.exception("user tools failed")
+            return self.tools, ""
+        if not extra:
+            return self.tools, ""
+        if not extra.tools:
+            return self.tools, extra.instructions
+        reg = ToolRegistry(self.tools.all())
+        for t in extra.tools:
+            # Общий главнее: личный сервер не может подменить для человека инструмент, который
+            # настроил админ (с его правилами и правами), — просто совпав с ним именем.
+            if t.name not in reg:
+                reg.add(t)
+        return reg, extra.instructions
 
     def workspace_for(self, session_id: str) -> Path | None:
         ws = self._workspace
@@ -274,7 +312,8 @@ class Agent:
         mode = Mode(self.spec.mode or state.get("mode") or self.permissions.mode)
 
         async def body(emit: Callable[[Event], Any], run_id: str) -> RunStatus:
-            tool = self.tools.get(rec.tool_name)
+            tools, _ = await self.tools_for(user)
+            tool = tools.get(rec.tool_name)
             args = edited_args if edited_args is not None else rec.args
             if not approve:
                 # Явно «не выполнено» и «не проси снова»: на голом «отклонил» haiku заново просил
@@ -289,7 +328,7 @@ class Agent:
                 try:
                     args = tool.validate(args)
                     seq = await self._last_seq(rec.session_id)
-                    ctx = self._ctx(rec.session_id, run_id, user, emit, rec.tool_call_id, seq)
+                    ctx = self._ctx(rec.session_id, run_id, user, emit, rec.tool_call_id, seq, tools)
                     result = await self._invoke(tool, args, ctx)
                     if comment:
                         result.content += f"\n\nКомментарий пользователя: {comment}"
@@ -437,8 +476,9 @@ class Agent:
 
     # ── внутреннее: цикл ──────────────────────────────────────────────
 
-    def _ctx(self, session_id: str, run_id: str, user: User, emit, call_id: str = "", seq: int = 0) -> ToolContext:
-        return ToolContext(
+    def _ctx(self, session_id: str, run_id: str, user: User, emit, call_id: str = "", seq: int = 0,
+             tools: ToolRegistry | None = None) -> ToolContext:
+        return ToolContext(tools=tools,
             session_id=session_id, run_id=run_id, user=user, agent=self, store=self.store, emit=emit,
             tool_call_id=call_id, workspace=self.workspace_for(session_id), deps=self.deps,
             cancel=self._cancel.get(run_id) or asyncio.Event(), message_seq=seq, agent_name=self.spec.name,
@@ -462,15 +502,18 @@ class Agent:
         out.text = "\n\n".join(texts)
         return out
 
-    async def _system_prompt(self, user: User, loaded: set[str], mode: Mode, extra: str = "") -> str:
+    async def _system_prompt(self, user: User, loaded: set[str], mode: Mode, extra: str = "",
+                             tools: ToolRegistry | None = None, user_mcp: str = "") -> str:
+        tools = tools if tools is not None else self.tools
+        shared_mcp = self.mcp_instructions() if self.mcp_instructions else ""
         mem = await self.store.memory_list(self.memory_scopes(user))
         rules = self.rules(user) if callable(self.rules) else self.rules
         parts = PromptParts(
             agent_prompt=self.spec.prompt,
             rules=rules,
             skills_index=(await self.skills_for(user)).index() if self.skills else "",
-            mcp_instructions=self.mcp_instructions() if self.mcp_instructions else "",
-            deferred_tools=self.tools.deferred_names(loaded),
+            mcp_instructions="\n\n".join(x for x in (shared_mcp, user_mcp) if x),
+            deferred_tools=tools.deferred_names(loaded),
             memory=[f"[{m.id}] {m.text}" for m in mem],
             user_name=user.name,
             user_roles=user.roles,
@@ -514,8 +557,10 @@ class Agent:
             loaded = set(state.get(LOADED_KEY, []))
             history = effective_history(await self.store.list_messages(session_id))
             turn = await self._turn_context(user, session_id)
-            system = await self._system_prompt(user, loaded, mode, turn.text)
-            visible = [t for t in self.tools.visible(loaded) if t.name not in turn.hide_tools and not perms.blocked(t.name)]
+            # Каждый шаг: подключил личный сервер посреди долгой задачи — инструменты есть со следующего шага.
+            tools, user_mcp = await self.tools_for(user)
+            system = await self._system_prompt(user, loaded, mode, turn.text, tools, user_mcp)
+            visible = [t for t in tools.visible(loaded) if t.name not in turn.hide_tools and not perms.blocked(t.name)]
             schemas = [t.schema() for t in visible]
             msgs = [Message.system(system), *self._prepare(history, session_id, model)]
 
@@ -598,7 +643,8 @@ class Agent:
                     continue  # пока отвечали, человек дописал — отвечаем и на это
                 return RunStatus.DONE
 
-            pending, stop = await self._execute(session_id, user, run_id, emit, msg.tool_calls, perms, seq, seen_calls)
+            pending, stop = await self._execute(session_id, user, run_id, emit, msg.tool_calls, perms, seq, seen_calls,
+                                                tools)
             if pending:
                 return RunStatus.WAITING_APPROVAL
             if stop == "waiting_input":
@@ -644,13 +690,14 @@ class Agent:
         return taken
 
     async def _execute(self, session_id, user, run_id, emit, calls: list[ToolCall], perms: Permissions,
-                       seq: int, seen: dict[str, int]) -> tuple[int, str | None]:
+                       seq: int, seen: dict[str, int], tools: ToolRegistry | None = None) -> tuple[int, str | None]:
         """Выполняет вызовы одного шага. Подряд идущие безопасные — параллельно."""
+        tools = tools if tools is not None else self.tools
         batches: list[list[ToolCall]] = []
         for c in calls:
-            t = self.tools.get(c.name)
+            t = tools.get(c.name)
             par = bool(t and t.parallel_ok)
-            if par and batches and all((self.tools.get(x.name) and self.tools.get(x.name).parallel_ok)
+            if par and batches and all((tools.get(x.name) and tools.get(x.name).parallel_ok)
                                        for x in batches[-1]):
                 batches[-1].append(c)
             else:
@@ -659,7 +706,7 @@ class Agent:
         pending = 0
         stop: str | None = None
         for batch in batches:
-            outcomes = await asyncio.gather(*(self._one(session_id, user, run_id, emit, c, perms, seq, seen)
+            outcomes = await asyncio.gather(*(self._one(session_id, user, run_id, emit, c, perms, seq, seen, tools)
                                               for c in batch))
             for kind, st in outcomes:
                 pending += kind == "pending"
@@ -667,11 +714,12 @@ class Agent:
         return pending, stop
 
     async def _one(self, session_id, user, run_id, emit, call: ToolCall, perms: Permissions, seq: int,
-                   seen: dict[str, int]) -> tuple[str, str | None]:
-        t0 = self.tools.get(call.name)
+                   seen: dict[str, int], tools: ToolRegistry | None = None) -> tuple[str, str | None]:
+        tools = tools if tools is not None else self.tools
+        t0 = tools.get(call.name)
         await emit(Event(EventType.TOOL_CALL, {"id": call.id, "name": call.name, "args": call.arguments,
                                                "title": t0.title if t0 else ""}))
-        tool = self.tools.get(call.name)
+        tool = tools.get(call.name)
 
         async def done(result: ToolResult) -> tuple[str, str | None]:
             await self._record_result(session_id, run_id, emit, call.id, call.name, result)
@@ -679,7 +727,7 @@ class Agent:
 
         if tool is None:
             hint = ""
-            if any(t.name == call.name for t in self.tools.all()):
+            if any(t.name == call.name for t in tools.all()):
                 hint = " Он отложенный — сначала загрузи его через tool_search."
             return await done(ToolResult.error(f"нет инструмента «{call.name}».{hint}"))
         state = await self.store.get_state(session_id)
@@ -693,7 +741,7 @@ class Agent:
         except ToolArgsError as e:
             return await done(ToolResult.error(f"неверные аргументы: {e}"))
 
-        ctx = self._ctx(session_id, run_id, user, emit, call.id, seq)
+        ctx = self._ctx(session_id, run_id, user, emit, call.id, seq, tools)
         hooked = fold(await self.hooks.run(HookEvent.PRE_TOOL_USE,
                                            {"tool_name": tool.name, "args": args, "session_id": session_id}, ctx))
         if hooked.updated_args is not None:
@@ -837,9 +885,12 @@ class Agent:
 
     # ── субагенты ─────────────────────────────────────────────────────
 
-    def child(self, spec: AgentSpec) -> Agent:
-        """Агент-субагент: свой промпт и инструменты, общие модель, хранилище и хуки."""
-        tools = self.tools.filtered(spec.tools, [*spec.deny_tools, "task"])
+    def child(self, spec: AgentSpec, tools: ToolRegistry | None = None) -> Agent:
+        """Агент-субагент: свой промпт и инструменты, общие модель, хранилище и хуки.
+
+        tools — реестр прогона родителя (с личными инструментами пользователя): без него
+        субагент general не видел бы личный MCP-сервер, которым пользуется главный агент."""
+        tools = (tools if tools is not None else self.tools).filtered(spec.tools, [*spec.deny_tools, "task"])
         child = Agent(
             router=self.router, store=self.store, tools=tools, spec=spec, subagents={},
             permissions=self.permissions if spec.mode is None else self.permissions.with_mode(spec.mode),

@@ -1,5 +1,5 @@
 {
-  "_comment": "MCP-серверы агента. ${ПЕРЕМЕННАЯ} берётся из окружения. Поля: url | command+args, token, headers, include/exclude (шаблоны имён), deferred (null — авто при >15 инструментах), read_only (шаблоны), trust_annotations, timeout, enabled, oauth (true или {scope, client_id, client_secret, auth_params}). Сервер, ответивший 401, можно подключить по OAuth кнопкой «Подключить» в панели «Инструменты» — даже без поля oauth.",
+  "_comment": "MCP-серверы агента. ${ПЕРЕМЕННАЯ} берётся из окружения. Поля: url | command+args, token, headers, include/exclude (шаблоны имён), deferred (null — авто при >15 инструментах), read_only (шаблоны), trust_annotations, timeout, enabled, oauth (true или {scope, client_id, client_secret, auth_params}), per_user (true — у каждого пользователя свой вход по OAuth: каждый сам жмёт «Подключить»). Сервер, ответивший 401, можно подключить по OAuth кнопкой «Подключить» в панели «Инструменты» — даже без поля oauth.",
   "servers": {
     "_example_rst": {
       "enabled": false,
@@ -14,7 +14,8 @@
       "url": "https://ozon-mcp.example.ru/mcp",
       "oauth": {
         "scope": "ozon:read ozon:write offline_access"
-      }
+      },
+      "per_user": true
     }
   }
 }

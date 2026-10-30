@@ -18,7 +18,7 @@
         print(ev.type, ev.data)
 """
 
-from agentkit.agent import Agent, AgentConfig, AgentSpec, RunOutcome
+from agentkit.agent import Agent, AgentConfig, AgentSpec, RunOutcome, UserTools
 from agentkit.builder import make_router, standard_tools
 from agentkit.events import Event, EventType, RunStatus
 from agentkit.hooks import HookEvent, HookResult, Hooks
@@ -40,6 +40,7 @@ __all__ = [
     "GENERAL",
     "PLAN",
     "Agent",
+    "UserTools",
     "AgentConfig",
     "AgentSpec",
     "Decision",

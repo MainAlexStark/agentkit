@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     enable_shell: bool = False  # только в изолированном контейнере!
     enable_web: bool = True
     mcp_config: Path = Path("mcp.json")
+    # Личные MCP-серверы: каждый пользователь подключает свои (видны и работают только у него).
+    user_mcp: bool = True
+    user_mcp_max: int = 10  # сколько личных серверов у одного пользователя
+    # Личным серверам — во внутреннюю сеть и по http. По умолчанию нельзя: адрес вводит не админ,
+    # а запрос делает сервис изнутри своей сети (SSRF: Redis, база, metadata облака). Только для разработки.
+    user_mcp_private: bool = False
     skills_dir: Path = Path("app/skills")
     workspace_dir: Path | None = None  # по умолчанию data_dir/workspaces
 
