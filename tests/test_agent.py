@@ -322,6 +322,9 @@ async def test_permission_rules():
     assert p.check(lookup, {"key": "secret1"}).decision == Decision.DENY
     assert p.check(lookup, {"key": "x"}).decision == Decision.ALLOW
     assert p.check(set_price, {"sku": "a", "price": 1}).decision == Decision.ALLOW
+    # Запрет с шаблоном аргумента — только при вызове; запрет целиком — инструмент модели не показывается.
+    assert not p.blocked("lookup")
+    assert Permissions(deny=["memory_*"]).blocked("memory_save") and not Permissions(deny=["memory_*"]).blocked("lookup")
     p2 = Permissions(mode=Mode.READONLY)
     assert p2.check(set_price, {"sku": "a", "price": 1}).decision == Decision.DENY
     p3 = Permissions(mode=Mode.BYPASS)
