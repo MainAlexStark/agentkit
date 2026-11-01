@@ -13,8 +13,9 @@ hooks = Hooks()
 @hooks.on(HookEvent.POST_TOOL_USE)
 async def audit_writes(payload, ctx):
     """Пишет в журнал каждое изменение данных: кто, что, с какими аргументами."""
-    # ctx.tools — реестр прогона: в нём и личные MCP-серверы пользователя, которых нет в ctx.agent.tools.
-    tool = (ctx.tools if ctx.tools is not None else ctx.agent.tools).get(payload["tool_name"])
+    # ctx.tools — реестр прогона: в нём и личные MCP-серверы пользователя, и инструменты MCP хоста
+    # (per_user), которых нет в ctx.agent.tools.
+    tool = (ctx.tools if ctx.tools is not None else ctx.agent.tools_in(ctx.run_id)).get(payload["tool_name"])
     if tool and not tool.read_only:
         audit.info("user=%s tool=%s args=%s error=%s", ctx.user.id, payload["tool_name"], payload["args"],
                    payload["is_error"])

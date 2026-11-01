@@ -86,7 +86,7 @@ def mcp_from_dict(name: str, d: dict[str, Any], *, public_only: bool = False) ->
     """
     auth = d.get("auth", "none")
     return MCPServerConfig(
-        per_user=bool(d.get("per_user")) and auth == "oauth",
+        personal_login=bool(d.get("per_user")) and auth == "oauth",
         public_only=public_only,
         name=name,
         url=d["url"],
@@ -122,7 +122,7 @@ class Domain:
 
 @dataclass
 class _UserMCP:
-    """Подключения одного пользователя: его личные серверы и общие с per_user (его вход)."""
+    """Подключения одного пользователя: его личные серверы и общие с personal_login (его вход)."""
 
     manager: MCPManager | None
     tools: list[Tool]
@@ -223,15 +223,18 @@ class AgentService:
         if self.mcp:
             await self.mcp.close()
         self.mcp_all = await self.mcp_configs()
-        # Серверы с per_user общий процесс не подключает: токена «на всех» у них нет — у каждого свой.
-        self.mcp = MCPManager([c for c in self.mcp_all if not c.per_user], oauth=self.oauth)
+        # Серверы с personal_login общий процесс не подключает: токена «на всех» у них нет — у каждого свой.
+        self.mcp = MCPManager([c for c in self.mcp_all if not c.personal_login], oauth=self.oauth)
         mcp_tools = await self.mcp.connect()
-        # Общие серверы могли поменяться (в том числе per_user) — подключения пользователей собираются заново.
+        # Общие серверы могли поменяться (в том числе personal_login) — подключения пользователей собираются заново.
         for uid in list(self._user_mcp):
             await self._drop_user_mcp(uid)
         self.agent = assemble_agent(self.settings, self.domain, self.store, router=self._router,
                                     mcp_tools=mcp_tools, mcp_instructions=self.mcp.instructions,
                                     extra_tools=self._platform_tools(), index=self.index)
+        if self.mcp.per_user:
+            # Через self.mcp на момент вызова: «перечитать MCP» заменяет менеджер целиком.
+            self.agent.context_providers.append(lambda user, sid: self.mcp.turn_context(user, sid))
         if self.projects:
             self.agent.context_providers.append(self.projects.context)
         if self.devices:
@@ -301,14 +304,14 @@ class AgentService:
 
     async def user_mcp_configs(self, user_id: str) -> list[MCPServerConfig]:
         shared = self.shared_mcp_names()
-        per_user = [c for c in self.mcp_all if c.per_user]
+        per_login = [c for c in self.mcp_all if c.personal_login]
         personal = []
         if self.settings.user_mcp:
             # Имя занято общим сервером — личный не подключается: его инструменты назывались бы так же
             # (mcp__<имя>__…), и человек не знал бы, в какой из двух серверов на деле ушёл вызов.
             personal = [self.personal_config(n, d) for n, d in (await self.mcp_personal(user_id)).items()
                         if n not in shared]
-        return [*per_user, *personal]
+        return [*per_login, *personal]
 
     async def user_mcp(self, user: User) -> _UserMCP | None:
         """Подключения пользователя — лениво, при первом прогоне или открытии «Инструментов», и в кэше."""

@@ -471,7 +471,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
         entry = await svc.user_mcp(user)
         mine = entry.manager.status if entry and entry.manager else {}
         shared = svc.shared_mcp_names()
-        views = [_mcp_view(c, (mine if c.per_user else svc.mcp.status).get(c.name), custom.get(c.name), admin,
+        views = [_mcp_view(c, (mine if c.personal_login else svc.mcp.status).get(c.name), custom.get(c.name), admin,
                            c.name not in svc.mcp_file_names) for c in svc.mcp_all]
         if svc.settings.user_mcp:
             for name, d in (await svc.mcp_personal(user.id)).items():
@@ -830,7 +830,7 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
             await svc.save_mcp_custom(servers)
 
     async def oauth_target(name: str, personal: bool, user: User) -> tuple[MCPServerConfig, str]:
-        """Конфиг сервера и чей вход (owner): личный и per_user — свой, общий — admin за всех."""
+        """Конфиг сервера и чей вход (owner): личный и personal_login — свой, общий — admin за всех."""
         if personal:
             personal_on()
             d = (await svc.mcp_personal(user.id)).get(name)
@@ -838,11 +838,11 @@ def build_app(svc: AgentService, *, extra_routers: list[APIRouter] | None = None
                 raise HTTPException(404, f"нет личного сервера {name}")
             return svc.personal_config(name, d), user.id
         cfg = next((c for c in svc.mcp_all if c.name == name), None)
-        if cfg is None or not cfg.per_user:
+        if cfg is None or not cfg.personal_login:
             require_admin(user)  # общий токен на всех — решает только admin
         if cfg is None or not cfg.url:
             raise HTTPException(404, f"нет HTTP MCP-сервера {name}")
-        return cfg, user.id if cfg.per_user else ""
+        return cfg, user.id if cfg.personal_login else ""
 
     async def forget_oauth(name: str, owner: str = "") -> None:
         try:
@@ -1055,10 +1055,10 @@ def _mcp_view(c: Any, st: Any, d: dict[str, Any] | None, admin: bool, custom: bo
         "needs_auth": bool(st and st.needs_auth), "oauth": bool(st and st.oauth),
         "server": (st.server_info.get("name") or "") if st else "", "version": (st.server_info.get("version") or "") if st else "",
         "transport": "http" if c.url else "stdio",
-        "personal": False, "per_user": bool(getattr(c, "per_user", False)),
+        "personal": False, "per_user": bool(getattr(c, "personal_login", False)),
         "can_manage": admin and custom,
         # Войти может admin (общий токен) и каждый — в per_user-сервер (свой токен).
-        "can_connect": c.enabled and bool(c.url) and (admin or bool(getattr(c, "per_user", False))),
+        "can_connect": c.enabled and bool(c.url) and (admin or bool(getattr(c, "personal_login", False))),
     }
     if admin:  # адрес — только админу: в нём бывают внутренние хосты
         view["address"] = c.url or c.command or ""

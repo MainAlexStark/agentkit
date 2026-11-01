@@ -91,3 +91,4 @@ async for ev in agent.run(s.id, User(id="u1"), "Сколько осталось 
 * **По HTTP** (любой язык, в т. ч. Go — OpenSeller): агент — отдельный контейнер в той же `mcp-network`; хост ходит с `AGENT_SERVICE_TOKEN` и заголовком `X-Agent-User-Id`. `POST /api/run` — задача и итог одним запросом; `POST /api/sessions/{id}/messages` + SSE — для живого чата.
 * **Библиотекой** (Python — EI_doc): `Agent` + своя реализация `Store` поверх ORM хоста, свои инструменты, свой UI на событиях.
 * **Инструменты хоста** — лучше как MCP-сервер по стандарту `mcp-server-standard`: тогда ими пользуется и этот агент, и Claude.
+* **Инструменты хоста на пользователя** (у каждого свой магазин): MCP-эндпоинт хоста с `"per_user": true` в `mcp.json` — агент берёт список у хоста на каждый разговор пользователя и передаёт `X-Agent-User-Id` с токеном сервиса ([architecture](docs/architecture.md#mcp-сервер-хоста--per_user)).

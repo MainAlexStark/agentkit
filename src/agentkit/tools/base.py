@@ -30,7 +30,8 @@ class ToolResult:
     is_error: bool = False
     data: Any = None  # структурированный результат для UI / тестов
     ui: list[dict[str, Any]] = field(default_factory=list)  # виджеты для человека (таблица, карточки, график)
-    # "waiting_input" — закончить прогон после этого шага (агент задал вопрос человеку).
+    # "waiting_input" — закончить прогон после этого шага (агент задал вопрос человеку);
+    # "done" — закончить прогон после этого шага: инструмент сам подвёл итог (finish хоста).
     stop: str | None = None
     elapsed_ms: int = 0
 

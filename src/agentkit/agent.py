@@ -50,7 +50,7 @@ from agentkit.semantic import VectorIndex, rank_memory
 from agentkit.skills import SkillLibrary
 from agentkit.store.base import ApprovalRec, Store
 from agentkit.tools.base import Tool, ToolArgsError, ToolContext, ToolDenied, ToolResult, User
-from agentkit.tools.registry import LOADED_KEY, ToolRegistry, make_tool_search
+from agentkit.tools.registry import LOADED_KEY, ToolRegistry, make_tool_search, match_any
 
 log = logging.getLogger("agentkit.agent")
 
@@ -103,14 +103,19 @@ class AgentConfig:
 
 @dataclass
 class TurnContext:
-    """Что подмешать в конкретный шаг: текст в системный промпт и инструменты, которые спрятать.
+    """Что подмешать в конкретный шаг: текст в системный промпт, инструменты этого шага и какие спрятать.
 
     Так ядро узнаёт о проекте разговора или подключённом компьютере, не зная о них
     самих: поставщик контекста решает по пользователю и сессии.
+
+    ``tools`` — инструменты, которые есть только у этого пользователя (MCP-сервер хоста
+    с ``per_user``: у каждого свой магазин и свои подключения). Имя, совпавшее с общим
+    инструментом, отбрасывается: личный список не может подменить встроенный.
     """
 
     text: str = ""
     hide_tools: set[str] = field(default_factory=set)
+    tools: list[Tool] = field(default_factory=list)
 
 
 ContextProvider = Callable[[User, str], Awaitable["TurnContext | str | None"]]
@@ -198,9 +203,16 @@ class Agent:
         # прогон было бы некому. Вместо «спросить» он получает отказ.
         self.can_ask = can_ask
         self._cancel: dict[str, asyncio.Event] = {}
+        # Реестр прогона: общие инструменты + личные из TurnContext.tools. Вызов, tool_search
+        # и решение по карточке ищут инструмент здесь, а не в self.tools, иначе личный
+        # инструмент, показанный модели, при вызове оказывался бы «нет такого инструмента».
+        self._run_tools: dict[str, ToolRegistry] = {}
+        # Субагент видит личные инструменты через тот же фильтр, что и общие (spec.tools / deny).
+        self._tool_filter: tuple[list[str] | None, list[str]] = (None, [])
 
         if "tool_search" not in self.tools:
-            self.tools.add(make_tool_search(lambda ctx: ctx.tools if ctx.tools is not None else ctx.agent.tools))
+            self.tools.add(make_tool_search(
+                lambda ctx: ctx.tools if ctx.tools is not None else ctx.agent.tools_in(ctx.run_id)))
         # Инструмент skill — и при пустой папке: навыки пользователь может создать сам в настройках.
         if self.skills is not None and "skill" not in self.tools:
             self.tools.add(self.skills.tool())
@@ -238,6 +250,28 @@ class Agent:
         if callable(ws):
             return ws(session_id)
         return ws
+
+    def tools_in(self, run_id: str) -> ToolRegistry:
+        """Инструменты прогона: общие и личные пользователя (если поставщики контекста их дали)."""
+        return self._run_tools.get(run_id, self.tools)
+
+    def _with_turn_tools(self, run_id: str, extra: list[Tool], base: ToolRegistry | None = None) -> ToolRegistry:
+        """Реестр прогона: base (общие + личные MCP-серверы пользователя, см. tools_for) и поверх —
+        инструменты хоста на этот разговор (TurnContext.tools). Запоминается на прогон: tool_search,
+        вызов и решение по карточке должны найти тот же инструмент, что видела модель."""
+        base = base if base is not None else self.tools
+        if not extra:
+            if base is self.tools:
+                self._run_tools.pop(run_id, None)
+            else:
+                self._run_tools[run_id] = base
+            return base
+        allow, deny = self._tool_filter
+        reg = ToolRegistry(base.all())
+        reg.extend(t for t in extra if t.name not in base
+                   and (allow is None or match_any(t.name, allow)) and not match_any(t.name, deny))
+        self._run_tools[run_id] = reg
+        return reg
 
     def cancel(self, run_id: str) -> bool:
         ev = self._cancel.get(run_id)
@@ -321,7 +355,9 @@ class Agent:
 
         async def body(emit: Callable[[Event], Any], run_id: str) -> RunStatus:
             tools, _ = await self.tools_for(user)
-            tool = tools.get(rec.tool_name)
+            turn = await self._turn_context(user, rec.session_id)
+            tool = self._with_turn_tools(run_id, turn.tools, tools).get(rec.tool_name)
+            tools = self.tools_in(run_id)
             args = edited_args if edited_args is not None else rec.args
             if not approve:
                 # Явно «не выполнено» и «не проси снова»: на голом «отклонил» haiku заново просил
@@ -444,6 +480,7 @@ class Agent:
                 # заблокирована — два прохода по одним сообщениям не пойдут параллельно.
                 if status == RunStatus.DONE and user is not None:
                     await self._auto_memory(session_id, user, emit)
+                self._run_tools.pop(run.id, None)
                 await q.put(None)
 
         task = asyncio.create_task(runner())
@@ -507,6 +544,7 @@ class Agent:
                 if res.text:
                     texts.append(res.text)
                 out.hide_tools |= res.hide_tools
+                out.tools.extend(res.tools)
         out.text = "\n\n".join(texts)
         return out
 
@@ -602,7 +640,9 @@ class Agent:
             history = effective_history(await self.store.list_messages(session_id))
             turn = await self._turn_context(user, session_id)
             # Каждый шаг: подключил личный сервер посреди долгой задачи — инструменты есть со следующего шага.
-            tools, user_mcp = await self.tools_for(user)
+            # Поверх — инструменты хоста на этот разговор (TurnContext.tools, MCP с per_user).
+            base, user_mcp = await self.tools_for(user)
+            tools = self._with_turn_tools(run_id, turn.tools, base)
             memory = await self.memory_view(user, _last_user_text(history))
             system = await self._system_prompt(user, loaded, mode, turn.text, tools, user_mcp, memory)
             # memory_search нужен, только когда в промпте не вся память: иначе искать там нечего,
@@ -697,6 +737,8 @@ class Agent:
                 return RunStatus.WAITING_APPROVAL
             if stop == "waiting_input":
                 return RunStatus.WAITING_INPUT
+            if stop == "done":
+                return RunStatus.DONE
         return RunStatus.MAX_STEPS
 
     async def _over_budget(self, user: User) -> str | None:
@@ -740,7 +782,7 @@ class Agent:
     async def _execute(self, session_id, user, run_id, emit, calls: list[ToolCall], perms: Permissions,
                        seq: int, seen: dict[str, int], tools: ToolRegistry | None = None) -> tuple[int, str | None]:
         """Выполняет вызовы одного шага. Подряд идущие безопасные — параллельно."""
-        tools = tools if tools is not None else self.tools
+        tools = tools if tools is not None else self.tools_in(run_id)
         batches: list[list[ToolCall]] = []
         for c in calls:
             t = tools.get(c.name)
@@ -763,11 +805,10 @@ class Agent:
 
     async def _one(self, session_id, user, run_id, emit, call: ToolCall, perms: Permissions, seq: int,
                    seen: dict[str, int], tools: ToolRegistry | None = None) -> tuple[str, str | None]:
-        tools = tools if tools is not None else self.tools
-        t0 = tools.get(call.name)
-        await emit(Event(EventType.TOOL_CALL, {"id": call.id, "name": call.name, "args": call.arguments,
-                                               "title": t0.title if t0 else ""}))
+        tools = tools if tools is not None else self.tools_in(run_id)
         tool = tools.get(call.name)
+        await emit(Event(EventType.TOOL_CALL, {"id": call.id, "name": call.name, "args": call.arguments,
+                                               "title": tool.title if tool else ""}))
 
         async def done(result: ToolResult) -> tuple[str, str | None]:
             await self._record_result(session_id, run_id, emit, call.id, call.name, result)
@@ -948,6 +989,7 @@ class Agent:
             tracers=self.tracers, can_ask=False, budget=self.budget, redactor=self.redactor, index=self.index,
         )
         child.context_providers = self.context_providers
+        child._tool_filter = (list(spec.tools) if spec.tools is not None else None, [*spec.deny_tools, "task"])
         child.vision_for = self.vision_for
         return child
 

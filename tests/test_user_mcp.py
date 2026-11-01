@@ -16,7 +16,7 @@ async def test_oauth_tokens_are_per_owner(store):
     srv = FakeOAuthServer()
     http = httpx.AsyncClient(transport=httpx.MockTransport(srv.handler))
     broker = OAuthBroker(store, "https://agent.test/oauth/callback", http=http)
-    cfg = MCPServerConfig(name="shop", url="https://srv.test/mcp", per_user=True)
+    cfg = MCPServerConfig(name="shop", url="https://srv.test/mcp", personal_login=True)
 
     for owner in ("ann", "bob"):
         url = await broker.start("shop", cfg.url, user_id=owner, owner=owner)
@@ -123,3 +123,37 @@ async def test_resolve_public_checks_every_address(monkeypatch):
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
     with pytest.raises(PrivateAddress):
         await resolve_public("mixed.test", 443)
+
+
+async def test_personal_servers_and_host_tools_together(store):
+    """Слияние веток: личные MCP-серверы (user_tools) и инструменты хоста (TurnContext.tools) в одном прогоне."""
+    from conftest import collect, make_agent
+
+    from agentkit.agent import TurnContext
+
+    @tool(read_only=True)
+    async def mcp__crm__deals(ctx) -> str:
+        """Сделки из личной CRM."""
+        return "сделок: 3"
+
+    @tool(read_only=True)
+    async def mcp__shop__sales(ctx) -> str:
+        """Продажи магазина хоста."""
+        return "продаж: 5"
+
+    async def provider(u: User) -> UserTools | None:
+        return UserTools([mcp__crm__deals])
+
+    fake = FakeLLM([{"tool_calls": [("mcp__crm__deals", {}), ("mcp__shop__sales", {})]}, "Готово"])
+    agent = make_agent(store, fake, user_tools=provider)
+
+    async def host(user, sid):
+        return TurnContext(tools=[mcp__shop__sales])
+
+    agent.context_providers.append(host)
+    s = await store.create_session("u1")
+    await collect(agent.run(s.id, User(id="u1"), "сводка"))
+    names = {t["function"]["name"] for t in fake.requests[0].tools}
+    assert {"mcp__crm__deals", "mcp__shop__sales"} <= names
+    results = [m.text for _, m in await store.list_messages(s.id) if m.role == "tool"]
+    assert results == ["сделок: 3", "продаж: 5"]

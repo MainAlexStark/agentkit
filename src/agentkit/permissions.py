@@ -225,8 +225,11 @@ class Permissions:
                            tool_policy=self.tool_policy if tool_policy is None else tool_policy)
 
     def blocked(self, name: str) -> bool:
-        """Заблокирован пользователем — такой инструмент не показываем модели вовсе."""
-        return self.tool_policy.get(name) == "deny"
+        """Не показываем модели вовсе: заблокирован пользователем или запрещён правилом сервиса
+        целиком (без шаблона аргумента). Показанный, но всегда запрещённый инструмент модель
+        вызывает снова и снова и получает отказ — это шаги и токены впустую."""
+        return self.tool_policy.get(name) == "deny" or any(
+            r.arg is None and fnmatch.fnmatchcase(name, r.name) for r in self._deny)
 
     def check(self, tool: Tool, args: dict[str, Any], ctx: ToolContext | None = None) -> Verdict:
         name = tool.name
