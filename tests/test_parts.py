@@ -370,3 +370,12 @@ async def test_stringified_list_args_are_parsed():
     assert args["todos"][0]["content"] == "a"
     # строка, которая и должна быть строкой, — не трогаем
     assert ask_user.validate({"question": "[1, 2]?"})["question"] == "[1, 2]?"
+
+
+def test_empty_trace_dir_env_means_off(monkeypatch):
+    from agentkit.server.settings import Settings
+
+    monkeypatch.setenv("AGENT_TRACE_DIR", "")
+    monkeypatch.setenv("AGENT_WORKSPACE_DIR", " ")
+    s = Settings(_env_file=None)
+    assert s.trace_dir is None and s.workspace_dir is None
