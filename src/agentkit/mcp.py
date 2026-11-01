@@ -15,7 +15,12 @@ mcp__<сервер>__<инструмент>; подсказки readOnlyHint / d
 X-Agent-User-Id / X-Agent-Roles / X-Agent-Session-Id, вызов — ещё X-Agent-Run-Id.
 Разговор, а не только пользователь — потому что хост сам решает по сессии, что
 это за разговор: общий чат магазина или работа над одним товаром, в каком
-магазине, — и отдаёт соответствующие инструменты и инструкции. Верить этим заголовкам хост может только вместе с токеном
+магазине, — и отдаёт соответствующие инструменты и инструкции.
+
+Список кэшируется (per_user_ttl) и сбрасывается после изменяющего вызова — или
+после любого, в результате которого хост поставил ``_meta["agentkit/refresh"]``:
+так хост говорит «я поменял твой контекст» про действие, которое для прав
+агента — чтение (например, «запомни» без подтверждения меняет инструкции). Верить этим заголовкам хост может только вместе с токеном
 сервера (``token``): без него любой в сети представился бы чужим пользователем.
 """
 
@@ -45,6 +50,10 @@ log = logging.getLogger("agentkit.mcp")
 
 PROTOCOL_VERSION = "2025-06-18"
 CLIENT_INFO = {"name": "agentkit", "version": "0.2.0"}
+
+
+# Ключ _meta результата tools/call: хост просит перечитать список и инструкции (см. docstring).
+REFRESH_META = "agentkit/refresh"
 
 
 class MCPError(Exception):
@@ -498,6 +507,8 @@ class MCPManager:
                     # (подключил сервис, запомнил правило) — следующий шаг возьмёт их заново.
                     self.forget_user(user_id, cfg.name)
             res = await client.call_tool(remote, args, headers)
+            if user_id is not None and (res.get("_meta") or {}).get(REFRESH_META):
+                self.forget_user(user_id, cfg.name)
             text, attachments = render_content(res)
             ui = [{"type": "attachments", "items": attachments}] if attachments else []
             return ToolResult(content=text or "(пустой ответ)", is_error=bool(res.get("isError")),

@@ -29,6 +29,8 @@ class Host:
     def tools_for(self, uid: str) -> list[dict]:
         tools = [{"name": "sales", "description": "Продажи магазина", "annotations": {"readOnlyHint": True},
                   "inputSchema": {"type": "object", "properties": {"days": {"type": "integer"}}}}]
+        tools.append({"name": "remember", "description": "Запомнить правило", "annotations": {"readOnlyHint": True},
+                      "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}})
         if uid == "u1":  # только у u1 подключён Ozon с правом менять цены
             tools.append({"name": "set_price", "description": "Поменять цену",
                           "inputSchema": {"type": "object", "properties": {"sku": {"type": "string"},
@@ -57,6 +59,8 @@ class Host:
             self.calls.append({"user": uid, "session": req.headers.get("x-agent-session-id"),
                                "run": req.headers.get("x-agent-run-id"), "name": p["name"], "args": p["arguments"]})
             res = {"content": [{"type": "text", "text": f"{p['name']} для {uid}: ок"}]}
+            if p["name"] == "remember":  # чтение для прав агента, но инструкции хоста поменялись
+                res["_meta"] = {"agentkit/refresh": True}
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": msg["id"], "result": res})
 
 
@@ -160,6 +164,18 @@ async def test_host_tools_without_prefix_cannot_shadow_builtin(store):
     agent, mgr = _setup(store, FakeLLM(["ok"]), host, prefix="")
     await mgr.connect()
     turn = await mgr.turn_context(User(id="u1"), "s")
-    assert {t.name for t in turn.tools} == {"sales", "set_price", "ask_user"}
+    assert {t.name for t in turn.tools} == {"sales", "remember", "set_price", "ask_user"}
     reg = agent._with_turn_tools("r", turn.tools)
     assert reg.get("sales").source == "mcp" and reg.get("ask_user").source == "builtin"
+
+
+async def test_host_refresh_meta_drops_cache(store):
+    host = Host()
+    fake = FakeLLM([{"tool_calls": [("mcp__shop__remember", {"text": "коротко"})]}, "Запомнил"])
+    agent, mgr = _setup(store, fake, host)
+    await mgr.connect()
+    u1 = User(id="u1")
+    s = await store.create_session(u1.id)
+    evs = await collect(agent.run(s.id, u1, "запомни"))
+    assert status(evs) == "done"  # чтение — без подтверждения
+    assert host.lists == [f"u1/{s.id}"] * 2  # но список и инструкции взяты заново
