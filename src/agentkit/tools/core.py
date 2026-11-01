@@ -132,7 +132,29 @@ def memory_tools(*, global_roles: tuple[str, ...] = ("admin",)) -> list[Tool]:
         ok = await ctx.store.memory_delete(id)
         return ToolResult(content="Удалено." if ok else "Такой записи нет.")
 
-    return [memory_save, memory_delete]
+    @tool(title="Поиск в памяти", read_only=True, group="memory", source="builtin")
+    async def memory_search(
+        ctx: ToolContext,
+        query: Annotated[str, "Что ищешь — своими словами: тема, вопрос, имя; точные слова записи знать не нужно"],
+    ) -> ToolResult:
+        """Ищет в долговременной памяти по смыслу и по словам: личной, общей и памяти проекта.
+        Нужен, когда в разделе «Память» системного промпта показана не вся память."""
+        from agentkit.semantic import rank_memory  # noqa: PLC0415
+
+        scopes = list(ctx.agent.memory_scopes(ctx.user))
+        if hasattr(ctx.store, "project_role"):
+            from agentkit.projects import session_project_id  # noqa: PLC0415
+
+            pid = await session_project_id(ctx.store, ctx.session_id)
+            if pid and (await ctx.store.project_role(pid, ctx.user.id))[1] is not None:
+                scopes.append(f"project:{pid}")
+        found = await rank_memory(ctx.store, getattr(ctx.agent, "index", None), scopes, query, k=12)
+        if not found:
+            return ToolResult(content="В памяти ничего похожего нет.")
+        return ToolResult(content="\n".join(f"- [{m.id}] {m.text}" for m in found),
+                          data=[{"id": m.id, "text": m.text, "scope": m.scope} for m in found])
+
+    return [memory_save, memory_delete, memory_search]
 
 
 def core_tools() -> list[Tool]:

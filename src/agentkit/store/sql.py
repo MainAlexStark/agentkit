@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import warnings
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -20,6 +21,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     MetaData,
     String,
     Table,
@@ -158,6 +160,24 @@ memory = Table(
     Column("source", String(20), nullable=True),
 )
 
+# Векторы для смыслового поиска (semantic.py): куски файлов проекта и записи памяти.
+# Таблица здесь, а не в semantic.py, чтобы удаление записи памяти или файла сразу удаляло и её
+# векторы — в той же транзакции: «забудь» не должно оставлять текст в индексе до следующего поиска.
+# На PostgreSQL с pgvector вектор лежит в колонке embedding (её добавляет VectorIndex.init),
+# иначе — в vec (float32 подряд) и сравнивается перебором.
+vectors = Table(
+    "ak_vectors", md,
+    Column("id", String(64), primary_key=True),
+    Column("scope", String(160), index=True, nullable=False),  # "user:<id>", "global", "project:<id>", "files:<id>"
+    Column("ref", String(80), index=True, nullable=False),  # id записи памяти или файла проекта
+    Column("start", Integer, default=0),  # с какого символа текста начинается кусок
+    Column("text", Text, nullable=False),
+    Column("digest", String(40), nullable=False),  # хэш модели и текста всего ref — понять, что устарело
+    Column("model", String(160), nullable=False),
+    Column("dim", Integer, nullable=False),
+    Column("vec", LargeBinary, nullable=True),
+)
+
 blobs = Table(
     "ak_blobs", md,
     Column("id", String(40), primary_key=True),
@@ -213,7 +233,10 @@ def _add_missing_columns(conn: Any) -> None:
 
     insp = sa_inspect(conn)
     for table in md.sorted_tables:
-        have = {c["name"] for c in insp.get_columns(table.name)}
+        with warnings.catch_warnings():
+            # ak_vectors.embedding — тип pgvector, SQLAlchemy его не знает и предупреждал на каждом старте.
+            warnings.filterwarnings("ignore", message="Did not recognize type")
+            have = {c["name"] for c in insp.get_columns(table.name)}
         for col in table.columns:
             if col.name not in have and col.nullable:
                 ddl = col.type.compile(dialect=conn.dialect)
@@ -466,10 +489,13 @@ class SQLStore(Store):
 
     async def memory_delete(self, memory_id):
         async with self._begin() as c:
+            await c.execute(delete(vectors).where(vectors.c.ref == memory_id))
             return bool((await c.execute(delete(memory).where(memory.c.id == memory_id))).rowcount)
 
     async def memory_update(self, memory_id, text):
         async with self._begin() as c:
+            # Старый текст не должен находиться поиском: вектор пересчитается при следующем поиске.
+            await c.execute(delete(vectors).where(vectors.c.ref == memory_id))
             return bool((await c.execute(update(memory).where(memory.c.id == memory_id).values(text=text))).rowcount)
 
     # ── blobs ────────────────────────────────────────────────────────
@@ -573,6 +599,8 @@ class SQLStore(Store):
             # Разговоры проекта остаются у людей — просто без проекта.
             await c.execute(update(sessions).where(sessions.c.project_id == project_id).values(project_id=None))
             await c.execute(delete(memory).where(memory.c.scope == f"project:{project_id}"))
+            await c.execute(delete(vectors).where(vectors.c.scope.in_([f"project:{project_id}",
+                                                                       f"files:{project_id}"])))
             await c.execute(delete(projects).where(projects.c.id == project_id))
 
     async def project_list_for(self, user_id):
@@ -634,6 +662,7 @@ class SQLStore(Store):
         async with self._begin() as c:
             res = await c.execute(delete(project_files).where(project_files.c.project_id == project_id,
                                                               project_files.c.id == file_id))
+            await c.execute(delete(vectors).where(vectors.c.ref == file_id))
             return res.rowcount > 0
 
     async def kv_delete(self, ns, key):

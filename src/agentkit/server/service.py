@@ -38,6 +38,7 @@ from agentkit.redact import DEFAULT as REDACT
 from agentkit.redact import Redactor, install_log_redaction
 from agentkit.runs import Busy, RunManager
 from agentkit.scheduler import Scheduler
+from agentkit.semantic import VectorIndex, make_embedder
 from agentkit.server.auth import Auth
 from agentkit.server.settings import Settings, split_rules
 from agentkit.skills import SkillLibrary
@@ -149,6 +150,7 @@ class AgentService:
         self.catalog: ModelCatalog | None = None
         self.devices: DeviceHub | None = None
         self.projects: ProjectLibrary | None = None
+        self.index: VectorIndex | None = None  # смысловой поиск; None — только по словам
         self.mcp_all: list[MCPServerConfig] = []  # вместе с выключенными — для списка в настройках
         self.mcp_file_names: set[str] = set()
         self.preview: Any = None  # SandboxPreview — ссылки на серверы, поднятые агентом в песочнице
@@ -174,7 +176,12 @@ class AgentService:
         self.oauth = OAuthBroker(self.store, s.public_url.rstrip("/") + "/oauth/callback", bus=self.bus,
                                  client_name=s.name)
         self.devices = DeviceHub(self.store, self.bus) if s.enable_devices else None
-        self.projects = (ProjectLibrary(self.store, s.data_dir / "projects", inline_limit=s.project_inline_chars)
+        embedder = make_embedder(s.embed_model, openrouter_key=s.openrouter_api_key, openai_key=s.openai_api_key,
+                                 ollama_url=s.ollama_url, dimensions=s.embed_dimensions, app_name=s.name,
+                                 app_url=s.public_url)
+        self.index = await VectorIndex(self.store, embedder).init() if embedder is not None else None
+        self.projects = (ProjectLibrary(self.store, s.data_dir / "projects", inline_limit=s.project_inline_chars,
+                                        index=self.index)
                          if s.enable_projects else None)
         self.runs = RunManager(self.store, self.bus)
         self.runs.on_idle = self._drain_inbox
@@ -224,7 +231,7 @@ class AgentService:
             await self._drop_user_mcp(uid)
         self.agent = assemble_agent(self.settings, self.domain, self.store, router=self._router,
                                     mcp_tools=mcp_tools, mcp_instructions=self.mcp.instructions,
-                                    extra_tools=self._platform_tools())
+                                    extra_tools=self._platform_tools(), index=self.index)
         if self.projects:
             self.agent.context_providers.append(self.projects.context)
         if self.devices:
@@ -510,6 +517,8 @@ class AgentService:
             await self._drop_user_mcp(uid)
         if self.bus:
             await self.bus.close()
+        if self.index is not None and hasattr(self.index.embedder, "aclose"):
+            await self.index.embedder.aclose()
         if self.store:
             await self.store.close()
 
@@ -531,6 +540,7 @@ def assemble_agent(
     mcp_tools: list[Tool] | None = None,
     mcp_instructions: Callable[[], str] | None = None,
     extra_tools: list[Tool] | None = None,
+    index: VectorIndex | None = None,
 ) -> Agent:
     """Собирает агента из настроек и домена. Один и тот же код для сервиса, evals и тестов."""
     reg = standard_tools(
@@ -578,11 +588,12 @@ def assemble_agent(
         skills=SkillLibrary.from_dirs(s.skills_dir),
         mcp_instructions=mcp_instructions,
         config=AgentConfig(context_window=s.context_window, tz=s.tz, max_output_chars=s.max_output_chars,
-                           auto_memory=s.auto_memory,
+                           auto_memory=s.auto_memory, memory_inline_chars=s.memory_inline_chars,
                            vision_models=[x.strip() for x in s.vision_models.split(",") if x.strip()] or None),
         deps=domain.deps,
         workspace=workspace if s.enable_files or s.enable_shell else None,
         rules=domain.rules,
         tracers=tracers,
         redactor=Redactor(patterns=s.redact_patterns, base=REDACT),
+        index=index,
     )

@@ -105,7 +105,10 @@ services:
       - egress
 
   postgres:
-    image: postgres:16-alpine
+    # С расширением pgvector — смысловой поиск по памяти и файлам идёт в базе (HNSW-индекс).
+    # Переход с postgres:16-alpine на уже существующем томе: образ на Debian, а не Alpine — после
+    # первого запуска выполнить REINDEX DATABASE agent; (другая библиотека сортировки строк).
+    image: pgvector/pgvector:pg16
     container_name: agent-service-postgres
     restart: unless-stopped
     # Отдельный env: базе незачем видеть ключи моделей и токены.

@@ -57,6 +57,7 @@ class PromptParts:
     mcp_instructions: str = ""
     deferred_tools: list[str] = field(default_factory=list)
     memory: list[str] = field(default_factory=list)
+    memory_note: str = ""  # «показана не вся память — ищи через memory_search»
     user_name: str = ""
     user_roles: list[str] = field(default_factory=list)
     # Профиль из настроек пользователя: как обращаться, чем занимается, как отвечать.
@@ -100,7 +101,8 @@ def build_system_prompt(p: PromptParts) -> str:
     if any(about):
         out.append("# О пользователе\n" + "\n".join(a for a in about if a))
     if p.memory:
-        out.append("# Память\nТо, что просили запомнить раньше:\n" + "\n".join(f"- {m}" for m in p.memory))
+        note = f"\n{p.memory_note}" if p.memory_note else ""
+        out.append("# Память\nТо, что просили запомнить раньше:" + note + "\n" + "\n".join(f"- {m}" for m in p.memory))
     out.extend(p.extra)
     return "\n\n".join(s for s in out if s)
 

@@ -46,6 +46,7 @@ from agentkit.messages import Message, ToolCall, Usage, new_id
 from agentkit.permissions import Decision, Mode, Permissions
 from agentkit.redact import DEFAULT as DEFAULT_REDACTOR
 from agentkit.redact import MARKER, Redactor, StreamRedactor, contains_marker
+from agentkit.semantic import VectorIndex, rank_memory
 from agentkit.skills import SkillLibrary
 from agentkit.store.base import ApprovalRec, Store
 from agentkit.tools.base import Tool, ToolArgsError, ToolContext, ToolDenied, ToolResult, User
@@ -94,6 +95,10 @@ class AgentConfig:
     auto_memory: bool = False
     auto_memory_model: str = "small"
     auto_memory_timeout: float = 60.0
+    # Сколько символов памяти идёт в промпт целиком. Больше — в промпт попадают записи, ближайшие
+    # к последнему сообщению человека (по смыслу и словам), и самые новые; остальное модель
+    # находит через memory_search. Без порога память в сотни записей съедала бы контекст каждого шага.
+    memory_inline_chars: int = 6000
 
 
 @dataclass
@@ -161,6 +166,7 @@ class Agent:
         budget: BudgetCheck | None = None,
         redactor: Redactor | None = None,
         user_tools: UserToolsProvider | None = None,
+        index: VectorIndex | None = None,
     ):
         self.router = router
         # Секреты (ключи сервиса из окружения, токены MCP/OAuth, типовые форматы) — маркером:
@@ -181,6 +187,8 @@ class Agent:
         self._workspace = workspace
         self.rules = rules
         self.memory_scopes = memory_scopes or (lambda u: ["global", f"user:{u.id}"])
+        # Смысловой поиск (semantic.py): отбор памяти в промпт и memory_search. None — только по словам.
+        self.index = index
         self.tracers = tracers or []
         # Каталог моделей знает, кто умеет картинки, точнее шаблонов; сервис подставляет его сюда.
         self.vision_for: Callable[[str], bool | None] | None = None
@@ -502,11 +510,46 @@ class Agent:
         out.text = "\n\n".join(texts)
         return out
 
+    async def memory_view(self, user: User, query: str = "") -> tuple[list[Any], str]:
+        """Записи памяти для промпта и пометка, если показана не вся память.
+
+        Помещается в memory_inline_chars — вся, как раньше (пометка пустая). Не помещается —
+        сначала ближайшие к запросу, затем самые новые, пока есть место; в промпте — по времени.
+        """
+        mem = await self.store.memory_list(self.memory_scopes(user))
+        limit = self.config.memory_inline_chars
+        if limit <= 0 or sum(len(m.text) + 20 for m in mem) <= limit:
+            return mem, ""
+        picked: dict[str, Any] = {}
+        used = 0
+
+        def take(m: Any) -> None:
+            nonlocal used
+            if m.id not in picked and used + len(m.text) + 20 <= limit:
+                picked[m.id] = m
+                used += len(m.text) + 20
+
+        if query.strip():
+            # Близкие к вопросу — не больше двух третей места: самым новым (часто «правила на
+            # сейчас») тоже должно остаться.
+            for m in await rank_memory(self.store, self.index, self.memory_scopes(user), query, mem, k=12, margin=0.12):
+                if used > limit * 2 // 3:
+                    break
+                take(m)
+        for m in reversed(mem):
+            take(m)
+        shown = [m for m in mem if m.id in picked]
+        note = (f"Показано {len(shown)} из {len(mem)} записей — ближайшие к последнему сообщению и самые новые. "
+                "Если для ответа может понадобиться что-то ещё из памяти (факты о человеке, прошлые договорённости), "
+                "ищи через memory_search.")
+        return shown, note
+
     async def _system_prompt(self, user: User, loaded: set[str], mode: Mode, extra: str = "",
-                             tools: ToolRegistry | None = None, user_mcp: str = "") -> str:
+                             tools: ToolRegistry | None = None, user_mcp: str = "",
+                             memory: tuple[list[Any], str] | None = None) -> str:
         tools = tools if tools is not None else self.tools
         shared_mcp = self.mcp_instructions() if self.mcp_instructions else ""
-        mem = await self.store.memory_list(self.memory_scopes(user))
+        mem, mem_note = memory if memory is not None else await self.memory_view(user)
         rules = self.rules(user) if callable(self.rules) else self.rules
         parts = PromptParts(
             agent_prompt=self.spec.prompt,
@@ -515,6 +558,7 @@ class Agent:
             mcp_instructions="\n\n".join(x for x in (shared_mcp, user_mcp) if x),
             deferred_tools=tools.deferred_names(loaded),
             memory=[f"[{m.id}] {m.text}" for m in mem],
+            memory_note=mem_note,
             user_name=user.name,
             user_roles=user.roles,
             profile=await self.store.kv_get("profile", user.id) or {},
@@ -559,8 +603,12 @@ class Agent:
             turn = await self._turn_context(user, session_id)
             # Каждый шаг: подключил личный сервер посреди долгой задачи — инструменты есть со следующего шага.
             tools, user_mcp = await self.tools_for(user)
-            system = await self._system_prompt(user, loaded, mode, turn.text, tools, user_mcp)
-            visible = [t for t in tools.visible(loaded) if t.name not in turn.hide_tools and not perms.blocked(t.name)]
+            memory = await self.memory_view(user, _last_user_text(history))
+            system = await self._system_prompt(user, loaded, mode, turn.text, tools, user_mcp, memory)
+            # memory_search нужен, только когда в промпте не вся память: иначе искать там нечего,
+            # а лишний инструмент — соблазн «перепроверить» то, что и так перед глазами.
+            hidden = turn.hide_tools if memory[1] else turn.hide_tools | {"memory_search"}
+            visible = [t for t in tools.visible(loaded) if t.name not in hidden and not perms.blocked(t.name)]
             schemas = [t.schema() for t in visible]
             msgs = [Message.system(system), *self._prepare(history, session_id, model)]
 
@@ -897,11 +945,19 @@ class Agent:
             hooks=self.hooks, skills=self.skills, mcp_instructions=self.mcp_instructions,
             config=replace(self.config, auto_memory=False),
             deps=self.deps, workspace=self._workspace, rules=self.rules, memory_scopes=self.memory_scopes,
-            tracers=self.tracers, can_ask=False, budget=self.budget, redactor=self.redactor,
+            tracers=self.tracers, can_ask=False, budget=self.budget, redactor=self.redactor, index=self.index,
         )
         child.context_providers = self.context_providers
         child.vision_for = self.vision_for
         return child
+
+
+def _last_user_text(history: list[tuple[int, Message]]) -> str:
+    """Последняя реплика человека — по ней отбирается память. Сводки и служебное не в счёт."""
+    for _, m in reversed(history):
+        if m.role == "user" and not m.meta.get("kind") and not m.meta.get("hidden"):
+            return m.text[:2000]
+    return ""
 
 
 def _for_model(history: list[tuple[int, Message]]) -> list[Message]:
