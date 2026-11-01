@@ -179,3 +179,45 @@ async def test_host_refresh_meta_drops_cache(store):
     evs = await collect(agent.run(s.id, u1, "запомни"))
     assert status(evs) == "done"  # чтение — без подтверждения
     assert host.lists == [f"u1/{s.id}"] * 2  # но список и инструкции взяты заново
+
+
+async def test_host_meta_serial_tools_and_finish(store):
+    """Агент карточки: изменения без подтверждения идут по одному, finish заканчивает прогон."""
+    host = Host()
+    orig = host.handler
+
+    def tools_for(uid):
+        ro = {"readOnlyHint": True}
+        return [
+            {"name": "save_listing", "annotations": ro, "_meta": {"agentkit/concurrencySafe": False},
+             "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}}}},
+            {"name": "find_category", "annotations": ro, "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "finish", "annotations": ro, "_meta": {"agentkit/concurrencySafe": False},
+             "inputSchema": {"type": "object", "properties": {"summary": {"type": "string"}}}},
+        ]
+
+    host.tools_for = tools_for
+
+    def handler(req):
+        resp = orig(req)
+        msg = json.loads(req.content)
+        if msg.get("method") == "tools/call" and msg["params"]["name"] == "finish":
+            body = json.loads(resp.content)
+            body["result"]["_meta"] = {"agentkit/stop": "done"}
+            return httpx.Response(200, json=body)
+        return resp
+
+    host.handler = handler
+    fake = FakeLLM([{"tool_calls": [("save_listing", {"title": "a"}), ("save_listing", {"title": "b"})]},
+                    {"tool_calls": [("finish", {"summary": "Карточка готова"})]},
+                    "это не должно понадобиться"])
+    agent, mgr = _setup(store, fake, host, prefix="")
+    await mgr.connect()
+    u1 = User(id="u1")
+    turn = await mgr.turn_context(u1, "s0")
+    by = {t.name: t for t in turn.tools}
+    assert not by["save_listing"].parallel_ok and by["find_category"].parallel_ok
+    s = await store.create_session(u1.id)
+    evs = await collect(agent.run(s.id, u1, "собери карточку"))
+    assert status(evs) == "done" and len(fake.requests) == 2  # finish закончил прогон без лишнего шага
+    assert [c["name"] for c in host.calls] == ["save_listing", "save_listing", "finish"]

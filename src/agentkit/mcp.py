@@ -20,7 +20,17 @@ X-Agent-User-Id / X-Agent-Roles / X-Agent-Session-Id, вызов — ещё X-Ag
 Список кэшируется (per_user_ttl) и сбрасывается после изменяющего вызова — или
 после любого, в результате которого хост поставил ``_meta["agentkit/refresh"]``:
 так хост говорит «я поменял твой контекст» про действие, которое для прав
-агента — чтение (например, «запомни» без подтверждения меняет инструкции). Верить этим заголовкам хост может только вместе с токеном
+агента — чтение (например, «запомни» без подтверждения меняет инструкции).
+
+Ещё два ключа ``_meta`` — для инструментов, которые меняют данные хоста без
+подтверждения человека (агент карточки товара: человек подтверждает только
+публикацию):
+
+* в описании инструмента ``"agentkit/concurrencySafe": false`` — не выполнять
+  параллельно с соседними вызовами, хоть он и «чтение» для прав: два изменения
+  одной карточки разом затёрли бы друг друга;
+* в результате ``"agentkit/stop": "done"`` (или ``"waiting_input"``) — прогон
+  заканчивается после этого шага: инструмент сам подвёл итог (``finish``). Верить этим заголовкам хост может только вместе с токеном
 сервера (``token``): без него любой в сети представился бы чужим пользователем.
 """
 
@@ -54,6 +64,8 @@ CLIENT_INFO = {"name": "agentkit", "version": "0.2.0"}
 
 # Ключ _meta результата tools/call: хост просит перечитать список и инструкции (см. docstring).
 REFRESH_META = "agentkit/refresh"
+CONCURRENCY_META = "agentkit/concurrencySafe"
+STOP_META = "agentkit/stop"
 
 
 class MCPError(Exception):
@@ -507,17 +519,20 @@ class MCPManager:
                     # (подключил сервис, запомнил правило) — следующий шаг возьмёт их заново.
                     self.forget_user(user_id, cfg.name)
             res = await client.call_tool(remote, args, headers)
-            if user_id is not None and (res.get("_meta") or {}).get(REFRESH_META):
+            meta = res.get("_meta") or {}
+            if user_id is not None and meta.get(REFRESH_META):
                 self.forget_user(user_id, cfg.name)
             text, attachments = render_content(res)
             ui = [{"type": "attachments", "items": attachments}] if attachments else []
+            stop = meta.get(STOP_META) if meta.get(STOP_META) in ("done", "waiting_input") else None
             return ToolResult(content=text or "(пустой ответ)", is_error=bool(res.get("isError")),
-                              data=res.get("structuredContent"), ui=ui)
+                              data=res.get("structuredContent"), ui=ui, stop=stop)
 
         schema = spec.get("inputSchema") or {"type": "object", "properties": {}}
         schema.setdefault("type", "object")
         schema.setdefault("properties", {})
         desc = spec.get("description") or spec.get("title") or remote
+        safe = (spec.get("_meta") or {}).get(CONCURRENCY_META)
         return Tool(
             title=spec.get("title") or ann.get("title") or "",
             name=mcp_tool_name(cfg.name, remote, cfg.prefix),
@@ -527,6 +542,7 @@ class MCPManager:
             read_only=read_only,
             destructive=destructive,
             deferred=deferred,
+            concurrency_safe=safe if isinstance(safe, bool) else None,
             timeout=cfg.timeout,
             group=f"mcp:{cfg.name}",
             source="mcp",

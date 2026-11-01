@@ -560,6 +560,8 @@ class Agent:
                 return RunStatus.WAITING_APPROVAL
             if stop == "waiting_input":
                 return RunStatus.WAITING_INPUT
+            if stop == "done":
+                return RunStatus.DONE
         return RunStatus.MAX_STEPS
 
     def _prepare(self, history: list[tuple[int, Message]], session_id: str, model: str) -> list[Message]:
