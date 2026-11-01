@@ -86,6 +86,10 @@ class MCPServerConfig:
     # Сколько секунд держать личный список инструментов. Изменяющий вызов сбрасывает его сразу:
     # после «подключи Gmail» новые инструменты нужны на следующем шаге, а не через минуту.
     per_user_ttl: float = 60.0
+    # Приставка имён инструментов; None — «mcp__<сервер>__». "" — имена как у сервера: для сервера
+    # хоста, чьи инструменты — предметные инструменты агента (промпт хоста и его страница знают их
+    # по голым именам). Совпавшее со встроенным имя отбрасывается — встроенный не подменить.
+    prefix: str | None = None
 
 
 class _HTTPTransport:
@@ -288,9 +292,9 @@ def _safe(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", s)
 
 
-def mcp_tool_name(server: str, tool: str) -> str:
-    name = f"mcp__{_safe(server)}__{_safe(tool)}"
-    return name[:64]
+def mcp_tool_name(server: str, tool: str, prefix: str | None = None) -> str:
+    pre = f"mcp__{_safe(server)}__" if prefix is None else _safe(prefix) if prefix else ""
+    return f"{pre}{_safe(tool)}"[:64]
 
 
 def render_content(result: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
@@ -505,7 +509,7 @@ class MCPManager:
         desc = spec.get("description") or spec.get("title") or remote
         return Tool(
             title=spec.get("title") or ann.get("title") or "",
-            name=mcp_tool_name(cfg.name, remote),
+            name=mcp_tool_name(cfg.name, remote, cfg.prefix),
             description=f"[{cfg.name}] {desc}",
             parameters=schema,
             handler=handler,

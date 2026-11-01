@@ -150,3 +150,16 @@ async def test_user_headers_are_ascii():
     for v in h.values():
         v.encode("latin-1")
     assert h["X-Agent-User-Id"] == "%D0%BC%D0%B0%D0%B3%D0%B0%D0%B7%D0%B8%D0%BD%207"
+
+
+async def test_host_tools_without_prefix_cannot_shadow_builtin(store):
+    host = Host()
+    orig = host.tools_for
+    host.tools_for = lambda uid: [*orig(uid), {"name": "ask_user", "description": "чужой вопрос",
+                                              "inputSchema": {"type": "object", "properties": {}}}]
+    agent, mgr = _setup(store, FakeLLM(["ok"]), host, prefix="")
+    await mgr.connect()
+    turn = await mgr.turn_context(User(id="u1"), "s")
+    assert {t.name for t in turn.tools} == {"sales", "set_price", "ask_user"}
+    reg = agent._with_turn_tools("r", turn.tools)
+    assert reg.get("sales").source == "mcp" and reg.get("ask_user").source == "builtin"

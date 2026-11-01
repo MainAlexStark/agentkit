@@ -1,5 +1,5 @@
 {
-  "_comment": "MCP-серверы агента. ${ПЕРЕМЕННАЯ} берётся из окружения. Поля: url | command+args, token, headers, include/exclude (шаблоны имён), deferred (null — авто при >15 инструментах), read_only (шаблоны), trust_annotations, timeout, enabled, oauth (true или {scope, client_id, client_secret, auth_params}), per_user (инструменты хоста на каждого пользователя: X-Agent-User-Id + token; per_user_ttl — кэш списка, с). Сервер, ответивший 401, можно подключить по OAuth кнопкой «Подключить» в панели «Инструменты» — даже без поля oauth.",
+  "_comment": "MCP-серверы агента. ${ПЕРЕМЕННАЯ} берётся из окружения. Поля: url | command+args, token, headers, include/exclude (шаблоны имён), deferred (null — авто при >15 инструментах), read_only (шаблоны), trust_annotations, timeout, enabled, oauth (true или {scope, client_id, client_secret, auth_params}), per_user (инструменты хоста на каждого пользователя: X-Agent-User-Id + token; per_user_ttl — кэш списка, с), prefix (приставка имён; по умолчанию mcp__<сервер>__, \"\" — без неё). Сервер, ответивший 401, можно подключить по OAuth кнопкой «Подключить» в панели «Инструменты» — даже без поля oauth.",
   "servers": {
     "_example_rst": {
       "enabled": false,
