@@ -186,6 +186,9 @@ class AgentService:
         self.agent = assemble_agent(self.settings, self.domain, self.store, router=self._router,
                                     mcp_tools=mcp_tools, mcp_instructions=self.mcp.instructions,
                                     extra_tools=self._platform_tools())
+        if self.mcp.per_user:
+            # Через self.mcp на момент вызова: «перечитать MCP» заменяет менеджер целиком.
+            self.agent.context_providers.append(lambda user, sid: self.mcp.turn_context(user, sid))
         if self.projects:
             self.agent.context_providers.append(self.projects.context)
         if self.devices:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -73,6 +74,13 @@ class Settings(BaseSettings):
     allowed_origins: str = ""
 
     trace_dir: Path | None = None
+
+    @field_validator("trace_dir", "workspace_dir", mode="before")
+    @classmethod
+    def _empty_path_is_none(cls, v: object) -> object:
+        # AGENT_TRACE_DIR= (пусто) — «выключено», а не Path("") == «.»: иначе журналы
+        # трассировки молча писались в рабочую папку и попадали в git проекта.
+        return None if isinstance(v, str) and not v.strip() else v
     # Несколько процессов (uvicorn --workers N или несколько контейнеров) — только с Redis.
     redis_url: str = ""
     workers: int = 1
